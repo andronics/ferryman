@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import signal
 from typing import Any
 
+import httpx
+
 from . import mountutil, patterns, sdnotify
 from .config import Config, Layout
-from .pool import LocalPool, PoolError, is_quota_error
+from .coordinator_pool import CoordinatorClient, CoordinatorPool
+from .pool import Lease, LocalPool, Pool, PoolError, is_quota_error
 from .rc import RcError
 from .transfer import TransferRunner
 from .unit import UnitSupervisor
@@ -20,18 +25,37 @@ log = logging.getLogger(__name__)
 
 
 class Agent:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(
+        self, cfg: Config, coordinator_transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
         self.cfg = cfg
         self.layout = Layout(cfg)
         self.job_poll_interval = 5.0
-        self.pools = {
-            name: LocalPool(name, p, self.layout.pool_state(name)) for name, p in cfg.pools.items()
-        }
+        self.coordinator = (
+            CoordinatorClient.from_token_file(
+                cfg.coordinator.url, cfg.coordinator.token_file, coordinator_transport
+            )
+            if cfg.coordinator
+            else None
+        )
+        self.pools: dict[str, Pool] = {}
+        for name, p in cfg.pools.items():
+            if p.coordinator:
+                assert self.coordinator is not None
+                self.pools[name] = CoordinatorPool(
+                    name, self.coordinator, self.layout.leased_keys(name)
+                )
+            else:
+                self.pools[name] = LocalPool(name, p, self.layout.pool_state(name))
         self.units = {
             name: UnitSupervisor(name, cfg, self.layout, self.pools.get(u.pool or ""))
             for name, u in cfg.units.items()
         }
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
+        # Transfers on coordinator pools must hold a claim before they run;
+        # name -> why a transfer may not run (absent: it may).
+        self.claim_blocks: dict[str, str] = {}
+        self._load_claims()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._stopping = asyncio.Event()
 
@@ -47,6 +71,11 @@ class Agent:
         self.cfg.paths.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         for sup in self.units.values():
             sup.start()
+        for pool in self.pools.values():
+            if isinstance(pool, CoordinatorPool):
+                self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
+        if self._claims():
+            self.spawn(self._claims_loop(), "claims")
         for tr in self.transfers.values():
             if tr.t.schedule:
                 self.spawn(tr.schedule(), f"schedule:{tr.name}")
@@ -60,6 +89,11 @@ class Agent:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await asyncio.gather(*(sup.stop() for sup in self.units.values()))
+        for pool in self.pools.values():
+            if isinstance(pool, CoordinatorPool):
+                pool.forget()
+        if self.coordinator:
+            await self.coordinator.aclose()
 
     async def run(self) -> None:
         from .api import serve
@@ -91,19 +125,78 @@ class Agent:
         a transfer job running in the process carries on under the new key,
         and an upload in flight on the old key fails once and is retried."""
         pool = self.pools[pool_name]
-        key = await pool.advance(expected)
-        path = str(pool.key_file(key))
+        lease = await pool.exhausted(expected)
+        await self.apply(pool, lease)
+        return lease.key
+
+    async def apply(self, pool: Pool, lease: Lease) -> None:
+        """Move every ready unit on `pool` to `lease`'s key. Units that are not
+        ready take the current lease when they next start."""
         for sup in self.units.values():
-            if sup.pool is not pool or not sup.ready or sup.key == key:
+            if sup.pool is not pool or not sup.ready or sup.key == lease.key:
                 continue
             try:
-                await sup.rc.backend_set(f"{sup.name}:", {"service_account_file": path})
+                await sup.rc.backend_set(f"{sup.name}:", {"service_account_file": str(lease.path)})
+                sup.key, sup.key_path = lease.key, lease.path
                 sup.write_conf()  # the runtime conf keeps saying what the process runs on
-                log.info("unit %s: switched to %s", sup.name, key)
+                log.info("unit %s: switched to %s", sup.name, lease.key)
             except RcError as e:
-                log.error("unit %s: could not switch to %s (%s); restarting", sup.name, key, e)
+                log.error(
+                    "unit %s: could not switch to %s (%s); restarting", sup.name, lease.key, e
+                )
                 self.spawn(sup.restart(), f"restart:{sup.name}")
-        return key
+
+    # ----------------------------------------------------------------- claims
+
+    def _claims(self) -> list[dict[str, str]]:
+        """Claims for every transfer whose unit's pool is on the coordinator.
+        A drive is identified by its id (or, without one, its pool)."""
+        out = []
+        for name, t in self.cfg.transfers.items():
+            u = self.cfg.units[t.unit]
+            if u.pool and isinstance(self.pools.get(u.pool), CoordinatorPool):
+                target = u.drive_id or f"pool:{u.pool}"
+                out.append({"transfer": name, "target": target, "dest": t.dest, "mode": t.mode})
+        return out
+
+    def _load_claims(self) -> None:
+        """Until the coordinator answers, a transfer may run only if it was
+        granted before (persisted), unchanged. A coordinator outage then
+        stops nothing that was already running fine."""
+        try:
+            granted = json.loads(self.layout.claims_file.read_text())
+        except (FileNotFoundError, ValueError):
+            granted = []
+        for c in self._claims():
+            if c not in granted:
+                self.claim_blocks[c["transfer"]] = "awaiting a claim from the coordinator"
+
+    async def _claims_loop(self) -> None:
+        assert self.coordinator is not None
+        wanted = self._claims()
+        while True:
+            try:
+                r = await self.coordinator.request("PUT", "/v1/claims", json=wanted)
+            except PoolError as e:
+                log.warning("claims: %s; retrying in 30s", e)
+                await asyncio.sleep(30)
+                continue
+            accepted = set(r["accepted"])
+            self.claim_blocks = {
+                c["transfer"]: f"destination overlaps {c['owner']}'s transfer "
+                f"{c['owner_transfer']} on the same drive"
+                for c in r["conflicts"]
+            }
+            for name, why in self.claim_blocks.items():
+                log.error("transfer %s will not run: %s", name, why)
+            granted = [c for c in wanted if c["transfer"] in accepted]
+            path = self.layout.claims_file
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(granted, indent=2) + "\n")
+            os.replace(tmp, path)
+            # Re-assert now and then: the coordinator may have lost its state.
+            await asyncio.sleep(600)
 
     # ----------------------------------------------------------------- health
 

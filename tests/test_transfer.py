@@ -29,7 +29,9 @@ async def agent(
     agent.job_poll_interval = 0.01
     sup = agent.units["media-tv"]
     sup.layout.runtime_dir("media-tv").mkdir(parents=True)
-    sup.write_conf()  # settles the pool on its first key
+    lease = await agent.pools["main"].lease()  # settles the pool on its first key
+    sup.key, sup.key_path = lease.key, lease.path
+    sup.write_conf()
     sup.state = State.READY
     (tmp_path / "local/media/tv").mkdir(parents=True)
     async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):

@@ -7,7 +7,10 @@ drives; uploads go through the current key until Drive answers
 single-key pool never rotates.
 
 State is per pool, not per unit: the quota is per account across every drive
-it touches, so once one consumer exhausts it, all of them move.
+it touches, so once one consumer exhausts it, all of them move. A pool is
+either local (state in a file on this host) or served by the coordinator
+(state shared by every agent leasing from it; see coordinator_pool.py). Every
+rotation bumps the pool's epoch, which is how watchers notice it.
 """
 
 from __future__ import annotations
@@ -18,8 +21,9 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .config import Pool as PoolConfig
 
@@ -48,6 +52,36 @@ class PoolExhausted(PoolError):
         )
 
 
+@dataclass(frozen=True)
+class Lease:
+    """The key a pool's consumers should use: its name, a local file rclone
+    can read it from, and the pool epoch it was current in."""
+
+    key: str
+    path: Path
+    epoch: int
+
+
+class Pool(Protocol):
+    name: str
+
+    @property
+    def size(self) -> int: ...
+
+    @property
+    def rotates(self) -> bool: ...
+
+    async def lease(self) -> Lease: ...
+
+    async def exhausted(self, expected: str | None = None) -> Lease:
+        """Report a cap hit on `expected` (or the current key) and return the
+        key to move to. Rotates at most once per key, however many callers
+        report the same hit."""
+        ...
+
+    async def info(self) -> dict[str, Any]: ...
+
+
 class LocalPool:
     """A pool whose state lives in a JSON file on this host:
     {"current": key, "exhausted": {key: epoch}, "rotated_at": epoch}"""
@@ -66,8 +100,16 @@ class LocalPool:
         self.lock = asyncio.Lock()
 
     @property
+    def size(self) -> int:
+        return len(self.cfg.keys)
+
+    @property
     def rotates(self) -> bool:
-        return len(self.cfg.keys) > 1
+        return self.size > 1
+
+    @property
+    def epoch(self) -> int:
+        return int(self._read().get("epoch", 0))
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -132,14 +174,27 @@ class LocalPool:
 
             state["current"] = nxt
             state["rotated_at"] = now
+            state["epoch"] = int(state.get("epoch", 0)) + 1
             self._write(state)
             log.warning("pool %s: rotated %s -> %s", self.name, spent or "<none>", nxt)
             return nxt
+
+    async def lease(self) -> Lease:
+        key = self.current()
+        return Lease(key, self.key_file(key), self.epoch)
+
+    async def exhausted(self, expected: str | None = None) -> Lease:
+        key = await self.advance(expected)
+        return Lease(key, self.key_file(key), self.epoch)
+
+    async def info(self) -> dict[str, Any]:
+        return self.describe()
 
     def key_file(self, key: str) -> Path:
         """Path of a key, after checking it parses as a service-account key
         for that client_email (an encrypted or wrong file fails here, before
         rclone ever sees it)."""
+        assert self.cfg.keys_dir is not None  # a local pool always has one
         path = self.cfg.keys_dir / f"{key}.json"
         try:
             data = json.loads(path.read_text())
@@ -175,6 +230,7 @@ class LocalPool:
             "pool": self.name,
             "quota_window": self.cfg.quota_window,
             "rotated_at": state.get("rotated_at"),
+            "epoch": int(state.get("epoch", 0)),
             "keys": keys,
         }
 

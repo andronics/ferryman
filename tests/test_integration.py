@@ -94,3 +94,25 @@ async def test_mount_transfer_crash_and_api(
         await server.stop()
     assert not mountutil.is_mounted(mount)
     assert not agent.layout.api_socket.exists()
+
+
+async def test_stop_while_starting_is_prompt(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    backing = tmp_path / "drive"
+    backing.mkdir()
+    cfg = make_config(
+        units={
+            "docs": {"mountpoint": "docs", "backend": "alias", "options": {"remote": str(backing)}},
+            "rcd": {"mountpoint": "rcd", "backend": "alias", "mount": False,
+                    "options": {"remote": str(backing)}},
+        },
+        transfers={},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    await agent.start()
+    await asyncio.sleep(0.2)  # rclone spawned, mount not up yet
+    async with asyncio.timeout(5):
+        await agent.stop()
+    assert all(sup.state.value == "stopped" for sup in agent.units.values())
+    assert not mountutil.is_mounted(agent.layout.mount_path("docs"))

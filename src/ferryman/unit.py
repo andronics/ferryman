@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import mountutil
@@ -22,7 +23,7 @@ from .config import Config, Layout, Unit, resolved
 from .rc import RcClient, RcError
 
 if TYPE_CHECKING:
-    from .pool import LocalPool
+    from .pool import Pool
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class State(StrEnum):
 
 
 class UnitSupervisor:
-    def __init__(self, name: str, cfg: Config, layout: Layout, pool: LocalPool | None) -> None:
+    def __init__(self, name: str, cfg: Config, layout: Layout, pool: Pool | None) -> None:
         self.name = name
         self.cfg = cfg
         self.layout = layout
@@ -53,6 +54,7 @@ class UnitSupervisor:
         self.since = time.time()
         self.pid: int | None = None
         self.key: str | None = None
+        self.key_path: Path | None = None
         self.restarts = 0
         self.last_error: str | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -82,10 +84,8 @@ class UnitSupervisor:
         u = self.unit
         opts: dict[str, str] = {"type": u.backend}
         if u.backend == "drive":
-            assert self.pool is not None
-            self.key = self.pool.current()
             opts["scope"] = "drive"
-            opts["service_account_file"] = str(self.pool.key_file(self.key))
+            opts["service_account_file"] = str(self.key_path)
             if u.drive_id:
                 opts["team_drive"] = u.drive_id
             opts["chunk_size"] = "128M"
@@ -166,12 +166,18 @@ class UnitSupervisor:
         if task is None or task.done():
             self._set(State.STOPPED)
             return
+        was_ready = self.ready
         self._set(State.STOPPING)
         proc = self._proc
         if proc and proc.returncode is None:
-            if self.unit.mount:
+            if self.unit.mount and was_ready:
                 # rclone mount exits on its own once its mountpoint is unmounted.
                 await mountutil.unmount(self.layout.mount_path(self.name))
+            else:
+                # Still starting (nothing to unmount yet) or an rcd, which
+                # never exits by itself: ask it to stop now rather than wait.
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
             await self._terminate(proc)
         try:
             await asyncio.wait_for(asyncio.shield(task), STOP_TIMEOUT)
@@ -241,6 +247,11 @@ class UnitSupervisor:
         if self.unit.mount:
             await mountutil.clear_stale(mount_path, self.cfg.health.stat_timeout)
             mount_path.mkdir(parents=True, exist_ok=True)
+        if self.pool is not None:
+            lease = await self.pool.lease()
+            self.key, self.key_path = lease.key, lease.path
+        if self._stop.is_set():
+            return
         self.write_conf()
         # A socket left by a crashed run would make the rc listener fail to bind.
         L.rc_socket(n).unlink(missing_ok=True)
@@ -266,6 +277,8 @@ class UnitSupervisor:
 
         deadline = time.monotonic() + READY_TIMEOUT
         while True:
+            if self._stop.is_set():
+                return  # stop() is terminating the process
             if proc.returncode is not None:
                 raise RuntimeError(
                     f"rclone exited with {proc.returncode} during startup (see {L.log_file(n)})"

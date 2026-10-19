@@ -43,7 +43,7 @@ ignore = ["ASYNC109"]
 
 [tool.ruff.lint.per-file-ignores]
 # Polling a condition with a deadline is what the tests want.
-"tests/*" = ["ASYNC110"]
+"tests/*" = ["ASYNC110", "ASYNC240"]
 
 [tool.mypy]
 strict = true

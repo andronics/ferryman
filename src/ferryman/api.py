@@ -81,7 +81,13 @@ def build_app(agent: Agent) -> Starlette:
         return {"started": True, "transfer": tr.name}
 
     async def pools(_: Request) -> Any:
-        return [p.describe() for p in agent.pools.values()]
+        out = []
+        for p in agent.pools.values():
+            try:
+                out.append(await p.info())
+            except PoolError as e:
+                out.append({"pool": p.name, "error": str(e)})
+        return out
 
     async def rotate(request: Request) -> Any:
         name = request.path_params["name"]

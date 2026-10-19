@@ -60,17 +60,31 @@ class UnitDefaults(_Model):
 
 
 class Pool(_Model):
-    # Keys are named by their client_email; each is <keys_dir>/<key>.json.
-    keys_dir: Path
-    keys: list[str] = Field(min_length=1)
+    # A local pool names its keys by client_email; each is <keys_dir>/<key>.json.
+    # A coordinator pool (`coordinator: true`) has neither: the coordinator
+    # owns the keys and the rotation state, and agents lease from it.
+    coordinator: bool = False
+    keys_dir: Path | None = None
+    keys: list[str] = Field(default_factory=list)
     quota_window: int = 86400
 
-    @field_validator("keys")
-    @classmethod
-    def _unique(cls, v: list[str]) -> list[str]:
-        if len(set(v)) != len(v):
+    @model_validator(mode="after")
+    def _shape(self) -> Pool:
+        if self.coordinator:
+            if self.keys or self.keys_dir:
+                raise ValueError("a coordinator pool has no keys or keys_dir of its own")
+            return self
+        if not self.keys or self.keys_dir is None:
+            raise ValueError("a local pool needs keys_dir and at least one key")
+        if len(set(self.keys)) != len(self.keys):
             raise ValueError("duplicate keys")
-        return v
+        return self
+
+
+class CoordinatorRef(_Model):
+    url: str  # e.g. https://ferryman.andronics.io (TLS terminated by Traefik)
+    token_file: Path
+    agent: str | None = None  # informational; the token identifies the agent
 
 
 class Unit(_Model):
@@ -122,6 +136,7 @@ class Transfer(_Model):
 
 
 class Config(_Model):
+    coordinator: CoordinatorRef | None = None
     paths: Paths = Paths()
     roots: Roots
     api: Api = Api()
@@ -142,6 +157,11 @@ class Config(_Model):
             for name in names:
                 if not _NAME.match(name):
                     raise ValueError(f"invalid {kind} name: {name!r}")
+        if self.coordinator is None:
+            for name, pool in self.pools.items():
+                if pool.coordinator:
+                    raise ValueError(f"pool {name} is served by the coordinator, but no "
+                                     "coordinator is configured")  # fmt: skip
         seen: dict[str, str] = {}
         for name, unit in self.units.items():
             if unit.pool and unit.pool not in self.pools:
@@ -205,8 +225,13 @@ class Layout:
             return self.local_path(t.unit)
         return t.source if t.source.is_absolute() else self.cfg.roots.local / t.source
 
-    def key_file(self, pool: str, key: str) -> Path:
-        return self.cfg.pools[pool].keys_dir / f"{key}.json"
+    def leased_keys(self, pool: str) -> Path:
+        # Keys leased from the coordinator, on the runtime (tmpfs) dir only.
+        return self.cfg.paths.runtime / "keys" / pool
+
+    @property
+    def claims_file(self) -> Path:
+        return self.cfg.paths.state / "claims.json"
 
 
 def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]:
@@ -218,3 +243,50 @@ def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]
         u.cache_max_size or d.cache_max_size,
         u.warm if u.warm is not None else d.warm,
     )
+
+
+# ---------------------------------------------------------------- coordinator
+
+
+class Listen(_Model):
+    host: str = "127.0.0.1"
+    port: int = 8470
+    # Traefik's address(es), so X-Forwarded-For is trusted for logging.
+    forwarded_allow_ips: str = "127.0.0.1"
+
+
+class AgentEntry(_Model):
+    # sha256 of the agent's bearer token (`ferryman token` makes both).
+    token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pools: list[str] = Field(default_factory=list)
+
+
+class CoordinatorConfig(_Model):
+    listen: Listen = Listen()
+    state: Path = Path("/var/lib/ferryman-coordinator")
+    watch_timeout: float = 30.0
+    pools: dict[str, Pool] = Field(default_factory=dict)
+    agents: dict[str, AgentEntry] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _references(self) -> CoordinatorConfig:
+        for name, pool in self.pools.items():
+            if pool.coordinator:
+                raise ValueError(f"pool {name}: the coordinator serves local pools only")
+        hashes: set[str] = set()
+        for name, agent in self.agents.items():
+            if not _NAME.match(name):
+                raise ValueError(f"invalid agent name: {name!r}")
+            for pool_name in agent.pools:
+                if pool_name not in self.pools:
+                    raise ValueError(f"agent {name}: unknown pool {pool_name!r}")
+            if agent.token_sha256 in hashes:
+                raise ValueError(f"agent {name}: token shared with another agent")
+            hashes.add(agent.token_sha256)
+        return self
+
+    @classmethod
+    def load(cls, path: Path) -> CoordinatorConfig:
+        with path.open() as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)

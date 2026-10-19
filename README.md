@@ -58,6 +58,40 @@ transfers:
     schedule: "0 */4 * * *"          # omit to run on demand only
 ```
 
+## Coordinator
+
+When several hosts upload with the same keys, the daily cap belongs to every
+host using a key, so rotation has to be shared. `ferryman coordinator` owns
+the keys and each pool's rotation state, and agents lease the current key
+from it. It speaks plain HTTP, so put Traefik in front of it to terminate
+TLS.
+
+- **Auth:** every agent sends a bearer token. The coordinator config stores only the token's sha256, and each agent may use only the pools listed for it. `ferryman token` generates a token and its hash.
+- **Leases:** an agent writes its leased key to a 0600 file under `<paths.runtime>/keys/` (rclone's `backend set` needs a key file) and deletes it on shutdown. It follows the pool's epoch with long polls, so a rotation triggered by one host moves every host's mounts without a remount.
+- **Outages:** if the coordinator is down, agents keep their last lease and lose only rotation.
+- **Claims:** a transfer on a coordinator pool must hold a claim before it runs. A `sync` mirrors its source and deletes everything else at its destination, so the coordinator refuses any claim whose destination overlaps another host's transfer on the same drive when either side is a `sync`. Moves and copies into the same place are fine. A claim granted earlier keeps working through a coordinator outage.
+
+```yaml
+# coordinator.yaml
+listen: {host: 127.0.0.1, port: 8470, forwarded_allow_ips: 127.0.0.1}
+state: /var/lib/ferryman-coordinator
+pools:
+  uploads:
+    keys_dir: /etc/ferryman/keys
+    keys: [sa-01@proj.iam.gserviceaccount.com, sa-02@proj.iam.gserviceaccount.com]
+agents:
+  pve-node-01: {token_sha256: <from ferryman token>, pools: [uploads]}
+```
+
+```yaml
+# agent config
+coordinator:
+  url: https://ferryman.example.org
+  token_file: /etc/ferryman/token
+pools:
+  uploads: {coordinator: true}
+```
+
 ## Development
 
 ```sh
