@@ -1,0 +1,184 @@
+"""Service-account key pools and rotation on Drive's daily upload cap.
+
+Google Drive caps uploads at ~750G per identity per rolling 24h. A pool is an
+ordered list of service-account keys that are all members of the same shared
+drives; uploads go through the current key until Drive answers
+"User rate limit exceeded.", then the pool advances to the next key. A
+single-key pool never rotates.
+
+State is per pool, not per unit: the quota is per account across every drive
+it touches, so once one consumer exhausts it, all of them move.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from .config import Pool as PoolConfig
+
+log = logging.getLogger(__name__)
+
+# The exact message rclone's drive backend treats as the daily upload cap (and
+# makes fatal under stop_on_upload_limit). Case matters: the per-request
+# throttle is "User Rate Limit Exceeded" and is retried, not rotated.
+QUOTA_MSG = "User rate limit exceeded."
+
+
+def is_quota_error(message: str | None) -> bool:
+    return bool(message) and QUOTA_MSG in (message or "")
+
+
+class PoolError(Exception):
+    pass
+
+
+class PoolExhausted(PoolError):
+    def __init__(self, pool: str, frees_at: float) -> None:
+        self.frees_at = frees_at
+        super().__init__(
+            f"pool {pool}: every key is exhausted; earliest frees at "
+            f"{time.strftime('%F %T', time.localtime(frees_at))}"
+        )
+
+
+class LocalPool:
+    """A pool whose state lives in a JSON file on this host:
+    {"current": key, "exhausted": {key: epoch}, "rotated_at": epoch}"""
+
+    def __init__(
+        self,
+        name: str,
+        cfg: PoolConfig,
+        state_file: Path,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.name = name
+        self.cfg = cfg
+        self.state_file = state_file
+        self.clock = clock
+        self.lock = asyncio.Lock()
+
+    @property
+    def rotates(self) -> bool:
+        return len(self.cfg.keys) > 1
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            data: dict[str, Any] = json.loads(self.state_file.read_text())
+            return data
+        except FileNotFoundError:
+            return {}
+
+    def _write(self, state: dict[str, Any]) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, self.state_file)
+
+    def available(self) -> list[str]:
+        """Keys not exhausted within the quota window, in config order."""
+        now = self.clock()
+        exhausted = self._read().get("exhausted", {})
+        return [k for k in self.cfg.keys if exhausted.get(k, 0) + self.cfg.quota_window <= now]
+
+    def current(self) -> str:
+        """The key uploads should use right now. Settles on the first available
+        key when the state is empty or the recorded one has been exhausted."""
+        state = self._read()
+        avail = self.available()
+        if not avail:
+            raise self._exhausted(state)
+        cur = state.get("current")
+        if cur in avail:
+            return str(cur)
+        state["current"] = avail[0]
+        self._write(state)
+        return avail[0]
+
+    async def advance(self, expected: str | None = None) -> str:
+        """Mark the current key exhausted and move to the next available one.
+
+        With `expected`, this is a no-op (returning the actual current key)
+        when someone already rotated past it, so N transfers that all hit the
+        cap on the same key rotate once, not N times."""
+        async with self.lock:
+            state = self._read()
+            cur = state.get("current")
+            if expected and cur and cur != expected:
+                log.info("pool %s: already rotated past %s (now %s)", self.name, expected, cur)
+                return str(cur)
+
+            now = self.clock()
+            spent = cur or expected
+            if spent:
+                state.setdefault("exhausted", {})[spent] = now
+            self._write(state)
+
+            # Next available key after the current one, wrapping, so the pool
+            # is consumed in order rather than always restarting from the top.
+            keys = self.cfg.keys
+            i = keys.index(spent) if spent in keys else -1
+            avail = set(self.available())
+            nxt = next((k for k in keys[i + 1 :] + keys[: i + 1] if k in avail), None)
+            if nxt is None:
+                raise self._exhausted(state)
+
+            state["current"] = nxt
+            state["rotated_at"] = now
+            self._write(state)
+            log.warning("pool %s: rotated %s -> %s", self.name, spent or "<none>", nxt)
+            return nxt
+
+    def key_file(self, key: str) -> Path:
+        """Path of a key, after checking it parses as a service-account key
+        for that client_email (an encrypted or wrong file fails here, before
+        rclone ever sees it)."""
+        path = self.cfg.keys_dir / f"{key}.json"
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            raise PoolError(f"pool {self.name}: key file missing: {path}") from None
+        except (OSError, ValueError) as e:
+            raise PoolError(f"pool {self.name}: unreadable key file {path}: {e}") from None
+        if data.get("type") != "service_account" or data.get("client_email") != key:
+            raise PoolError(f"pool {self.name}: {path} is not a service-account key for {key}")
+        return path
+
+    def describe(self) -> dict[str, Any]:
+        state = self._read()
+        now = self.clock()
+        exhausted = state.get("exhausted", {})
+        keys = []
+        for k in self.cfg.keys:
+            try:
+                self.key_file(k)
+                file_ok = True
+            except PoolError:
+                file_ok = False
+            frees = exhausted.get(k, 0) + self.cfg.quota_window
+            keys.append(
+                {
+                    "key": k,
+                    "current": k == state.get("current"),
+                    "file_ok": file_ok,
+                    "exhausted_until": frees if frees > now else None,
+                }
+            )
+        return {
+            "pool": self.name,
+            "quota_window": self.cfg.quota_window,
+            "rotated_at": state.get("rotated_at"),
+            "keys": keys,
+        }
+
+    def _exhausted(self, state: dict[str, Any]) -> PoolExhausted:
+        ex = state.get("exhausted", {})
+        frees = min(ex.values(), default=self.clock()) + self.cfg.quota_window
+        return PoolExhausted(self.name, frees)

@@ -1,0 +1,85 @@
+# Phase 0 spike: can a privileged pod on Talos mount FUSE under a hostPath
+# and share it with other pods via mount propagation? Uses rclone's
+# in-memory backend, so no Drive credentials enter the cluster.
+# Throwaway: `kubectl delete -f spike/talos-fuse.yaml` removes everything.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferryman-spike
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mounter
+  namespace: ferryman-spike
+spec:
+  selector:
+    matchLabels: {app: mounter}
+  template:
+    metadata:
+      labels: {app: mounter}
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: rclone
+          image: rclone/rclone:1.75.1
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              M=/var/lib/ferryman/spike
+              # A previous pod killed without cleanup leaves a dead endpoint.
+              fusermount3 -uz "$M" 2>/dev/null || umount -l "$M" 2>/dev/null || true
+              mkdir -p "$M"
+              rclone mount :memory: "$M" --allow-other --allow-non-empty --vfs-cache-mode writes --log-level INFO &
+              PID=$!
+              trap 'echo "unmounting"; fusermount3 -u "$M" || fusermount3 -uz "$M"; kill $PID; wait $PID; exit 0' TERM INT
+              for i in $(seq 1 30); do grep -q " $M " /proc/self/mountinfo && break; sleep 1; done
+              grep " $M " /proc/self/mountinfo || { echo "mount did not appear"; exit 1; }
+              echo "hello from $NODE pod $HOSTNAME at $(date -Is)" > "$M/hello.txt"
+              echo "mounted and seeded"
+              wait $PID
+          volumeMounts:
+            - name: ferryman
+              mountPath: /var/lib/ferryman
+              mountPropagation: Bidirectional
+      volumes:
+        - name: ferryman
+          hostPath: {path: /var/lib/ferryman, type: DirectoryOrCreate}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: consumer
+  namespace: ferryman-spike
+spec:
+  selector:
+    matchLabels: {app: consumer}
+  template:
+    metadata:
+      labels: {app: consumer}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: reader
+          image: busybox:1.37
+          command: ["/bin/sh", "-c"]
+          args:
+            - while true; do echo "$(date -Is) $(cat /media/spike/hello.txt 2>&1)"; sleep 5; done
+          volumeMounts:
+            - name: ferryman
+              mountPath: /media
+              mountPropagation: HostToContainer
+              readOnly: true
+      volumes:
+        - name: ferryman
+          hostPath: {path: /var/lib/ferryman, type: DirectoryOrCreate}
