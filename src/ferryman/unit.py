@@ -322,6 +322,7 @@ class UnitSupervisor:
                 proc.terminate()
             await self._terminate(proc)
         self.pid = None
+        self.layout.rc_socket(self.name).unlink(missing_ok=True)
         if self.unit.mount:
             # Whatever is left at the mountpoint belonged to the process that
             # just died, so it is a dead endpoint: detach it now rather than

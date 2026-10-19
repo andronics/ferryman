@@ -105,6 +105,10 @@ def agent(
         if os.environ.get("JOURNAL_STREAM")
         else "%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Every rc call is an HTTP request; their per-connection logs drown the
+    # agent's own at DEBUG.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     asyncio.run(Agent(ctx.obj.config()).run())
 
 
