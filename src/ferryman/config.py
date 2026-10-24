@@ -57,6 +57,9 @@ class UnitDefaults(_Model):
     cache_max_size: str = "10G"
     cache_min_free_space: str = "100G"
     warm: bool = True
+    # Mode for directories ferryman creates under roots.remote (mountpoints
+    # and their missing parents), owned by the unit's uid/gid.
+    dir_mode: int = 0o775
 
 
 class Pool(_Model):

@@ -56,6 +56,7 @@ async def test_mount_transfer_crash_and_api(
         await wait_for(lambda: sup.ready)
         assert mountutil.is_mounted(mount)
         assert await asyncio.to_thread((mount / "hello.txt").read_text) == "hello\n"
+        await wait_for(lambda: sup.warm is not None and sup.warm["state"] == "done")
 
         # A staged file moves up through the unit's own process.
         staged = tmp_path / "local/docs/sub"

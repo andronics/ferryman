@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import pytest
 
+from ferryman import mountutil
 from ferryman.agent import Agent
 from ferryman.config import Config
 from ferryman.patterns import match
@@ -134,3 +136,40 @@ def test_patterns() -> None:
     assert match("media-*", names) == ["media-tv", "media-movies"]
     assert match("arc-code, media-tv", names) == ["media-tv", "arc-code"]
     assert match("nope", names) == []
+
+
+async def test_warm_follows_the_refresh_job(agent: Agent, fake_rclone: FakeRclone) -> None:
+    sup = agent.units["media-tv"]
+    await sup._warm()
+    assert sup.warm is not None and sup.warm["state"] == "done" and sup.warm["error"] is None
+    assert fake_rclone.endpoints() == ["vfs/refresh", "job/status"]
+    assert fake_rclone.calls[0][1]["recursive"] == "true"
+    assert sup.status()["warm"] == sup.warm
+
+
+async def test_warm_retries_once_on_directory_errors(agent: Agent, fake_rclone: FakeRclone) -> None:
+    sup = agent.units["media-tv"]
+    sup.warm_retry_delay = 0
+    fake_rclone.refresh_results = [{"": "context deadline exceeded"}, {"": "OK"}]
+    await sup._warm()
+    assert sup.warm is not None and sup.warm["state"] == "done"
+    assert fake_rclone.endpoints().count("vfs/refresh") == 2
+
+    fake_rclone.refresh_results = [{"tv": "file does not exist"}] * 2
+    await sup._warm()
+    assert sup.warm["state"] == "failed"
+    assert sup.warm["error"] == "tv: file does not exist"
+    assert fake_rclone.endpoints().count("vfs/refresh") == 4
+
+
+def test_make_dirs_owns_what_it_creates(tmp_path: Path) -> None:
+    (tmp_path / "remote").mkdir(mode=0o700)
+    target = tmp_path / "remote/media/tv"
+    uid, gid = os.getuid(), os.getgid()
+    mountutil.make_dirs(target, uid, gid, 0o2775)
+    for d in (tmp_path / "remote/media", target):
+        st = d.stat()
+        assert (st.st_uid, st.st_gid, st.st_mode & 0o7777) == (uid, gid, 0o2775)
+    # Existing directories keep their mode.
+    assert (tmp_path / "remote").stat().st_mode & 0o7777 == 0o700
+    mountutil.make_dirs(target, uid, gid, 0o2775)  # idempotent

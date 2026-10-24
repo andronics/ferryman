@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -84,3 +85,24 @@ async def clear_stale(path: Path, timeout: float = 10.0) -> None:
     if is_mounted(path) and not await responsive(path, timeout):
         log.warning("detaching stale FUSE endpoint: %s", path)
         await detach(path)
+
+
+def make_dirs(path: Path, uid: int | None, gid: int | None, mode: int) -> None:
+    """`mkdir -p` that gives each directory it creates the unit's owner and
+    `mode`. The agent runs as root, so plain mkdir would leave intermediate
+    directories root:root 0755; under a mergerfs branch those can then
+    shadow the writable copies on other branches. Existing directories are
+    left alone."""
+    missing: list[Path] = []
+    p = path
+    while not p.exists() and p != p.parent:
+        missing.append(p)
+        p = p.parent
+    for d in reversed(missing):
+        try:
+            d.mkdir(mode=mode)
+        except FileExistsError:
+            continue
+        os.chmod(d, mode)  # mkdir's mode is masked by the umask
+        if uid is not None or gid is not None:
+            os.chown(d, -1 if uid is None else uid, -1 if gid is None else gid)

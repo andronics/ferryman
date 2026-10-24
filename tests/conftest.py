@@ -54,11 +54,13 @@ class FakeRclone:
     """Enough of rclone's rc API to drive transfers, rotation and health.
 
     `job_outcomes` is consumed one per submitted job: None for success, or
-    an error string for failure."""
+    an error string for failure. `refresh_results` likewise gives each async
+    vfs/refresh job its output's result map."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.job_outcomes: list[str | None] = []
+        self.refresh_results: list[dict[str, str]] = []
         self.jobs: dict[int, dict[str, Any]] = {}
         self.last_error: str | None = None
 
@@ -83,6 +85,12 @@ class FakeRclone:
                                 "error": outcome or "", "group": params.get("_group")}  # fmt: skip
             if outcome:
                 self.last_error = outcome
+            return {"jobid": jobid}
+        if endpoint == "vfs/refresh" and params.get("_async"):
+            jobid = len(self.jobs) + 1
+            result = self.refresh_results.pop(0) if self.refresh_results else {"": "OK"}
+            self.jobs[jobid] = {"finished": True, "success": True, "error": "",
+                                "output": {"result": result}}  # fmt: skip
             return {"jobid": jobid}
         if endpoint == "job/status":
             return self.jobs[int(params["jobid"])]

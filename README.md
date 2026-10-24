@@ -41,6 +41,8 @@ defaults:
   gid: 984
   cache_max_size: 10G
   cache_min_free_space: 100G
+  warm: true      # load each mount's dir cache in bulk after it starts
+  dir_mode: 0775  # for directories ferryman creates under roots.remote
 pools:
   uploads:
     keys_dir: /etc/ferryman/keys     # <client_email>.json per key
@@ -57,6 +59,42 @@ transfers:
     mode: move                       # move | copy | sync
     schedule: "0 */4 * * *"          # omit to run on demand only
 ```
+
+Directories that ferryman creates under `roots.remote` (a mountpoint and any
+missing parents) get the unit's `uid`/`gid` and `defaults.dir_mode`. Write
+the mode as YAML octal (`0775`, `02775`), not `0o775`. Existing directories
+are left alone.
+
+`warm` runs a recursive `vfs/refresh` once a mount is ready. Without it, the
+in-memory dir cache starts empty after every restart and the first walk of
+the tree costs one Drive round trip per directory. `ferryman status` shows
+each unit's last warm-up: running, done or failed, how long it took and
+when it ended. It is retried once on failure.
+
+Cron `schedule`s use the host's local timezone. Moving the agent into a UTC
+container shifts every transfer by the host's UTC offset.
+
+## Deployment
+
+The agent runs as root (it mounts FUSE filesystems) under systemd, which it
+tells about readiness and shutdown, and pings for its watchdog. To install it
+into a venv from the lock file:
+
+```sh
+uv venv /opt/ferryman
+uv export --frozen --no-dev --no-emit-project -o /tmp/ferryman-requirements.txt
+uv pip install --python /opt/ferryman/bin/python -r /tmp/ferryman-requirements.txt .
+ln -s /opt/ferryman/bin/ferryman /usr/local/bin/ferryman
+
+install -Dm644 contrib/ferryman.service /etc/systemd/system/ferryman.service
+# Set RequiresMountsFor= in the unit to your roots.local and paths.cache.
+ferryman -c /etc/ferryman/config.yaml verify
+systemctl daemon-reload && systemctl enable --now ferryman
+```
+
+`contrib/ferryman.service` has no sandboxing (`ProtectSystem=` and the
+like): the agent needs `/dev/fuse`, `CAP_SYS_ADMIN` and write access to the
+roots, and a hardened unit has not been tested yet.
 
 ## Coordinator
 

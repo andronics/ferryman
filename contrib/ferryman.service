@@ -1,0 +1,25 @@
+# ferryman agent. Install to /etc/systemd/system/ferryman.service; see the
+# README's Deployment section.
+[Unit]
+Description=ferryman: Google Drive mounts and local->Drive moves (rclone)
+Wants=network-online.target
+After=network-online.target
+# The local root and the cache must be mounted first: set these to your
+# roots.local and paths.cache.
+#RequiresMountsFor=/pool/local /var/cache/ferryman
+
+[Service]
+# The agent sends READY=1 once its API socket is up and its units are
+# launched (they mount in the background), STOPPING=1 on shutdown and
+# WATCHDOG=1 at half of WatchdogSec.
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/ferryman -c /etc/ferryman/config.yaml agent
+WatchdogSec=120
+Restart=on-failure
+RestartSec=10
+# Units unmount in parallel; a busy mount is detached lazily.
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

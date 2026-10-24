@@ -33,6 +33,8 @@ BACKOFF_MAX = 300.0
 # A process that stayed up this long resets the backoff.
 STABLE_AFTER = 600.0
 STOP_TIMEOUT = 15.0
+WARM_POLL = 5.0
+WARM_RETRY_DELAY = 30.0
 
 
 class State(StrEnum):
@@ -57,6 +59,11 @@ class UnitSupervisor:
         self.key_path: Path | None = None
         self.restarts = 0
         self.last_error: str | None = None
+        # The last dir-cache warm-up: state running/done/failed/cancelled.
+        self.warm: dict[str, Any] | None = None
+        self.warm_poll_interval = WARM_POLL
+        self.warm_retry_delay = WARM_RETRY_DELAY
+        self._warm_task: asyncio.Task[None] | None = None
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -202,6 +209,7 @@ class UnitSupervisor:
             "mount": str(self.layout.mount_path(self.name)) if self.unit.mount else None,
             "restarts": self.restarts,
             "last_error": self.last_error,
+            "warm": self.warm,
         }
 
     def _set(self, state: State) -> None:
@@ -246,7 +254,8 @@ class UnitSupervisor:
         L.log_file(n).parent.mkdir(parents=True, exist_ok=True)
         if self.unit.mount:
             await mountutil.clear_stale(mount_path, self.cfg.health.stat_timeout)
-            mount_path.mkdir(parents=True, exist_ok=True)
+            uid, gid, _, _ = resolved(self.cfg, n)
+            mountutil.make_dirs(mount_path, uid, gid, self.cfg.defaults.dir_mode)
         if self.pool is not None:
             lease = await self.pool.lease()
             self.key, self.key_path = lease.key, lease.path
@@ -292,7 +301,8 @@ class UnitSupervisor:
         self._set(State.READY)
         self.last_error = None
         log.info("unit %s: ready", n)
-        await self._warm()
+        if self.unit.mount and resolved(self.cfg, n)[3]:
+            self._warm_task = asyncio.create_task(self._warm(), name=f"warm:{n}")
 
         code = await proc.wait()
         if not self._stop.is_set():
@@ -302,14 +312,38 @@ class UnitSupervisor:
         """rclone's dir cache lives in memory, so every (re)start leaves it
         empty and the first walk of the tree (a library scan) pays a Drive
         round trip per directory. A recursive vfs/refresh fetches the whole
-        drive in bulk pages instead; _async returns once it is queued."""
-        if not self.unit.mount or not resolved(self.cfg, self.name)[3]:
-            return
-        try:
-            await self.rc.call("vfs/refresh", recursive=True, _async=True)
-            log.info("unit %s: dir cache refresh started", self.name)
-        except RcError as e:
-            log.warning("unit %s: dir cache refresh failed: %s", self.name, e)
+        drive in bulk pages instead. It runs as an rc job that is followed to
+        the end: rclone forgets finished jobs after a minute, so this is the
+        only place its outcome can be seen. One retry on failure."""
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(self.warm_retry_delay)
+            started = time.time()
+            self.warm = {"state": "running", "started": started, "finished": None, "error": None}
+            try:
+                # vfs/refresh takes its flags as strings: a JSON true fails
+                # the job with 'value must be string "recursive"=true'.
+                job = await self.rc.call("vfs/refresh", recursive="true", _async=True)
+                log.info("unit %s: dir cache refresh started (job %s)", self.name, job["jobid"])
+                st = await self.rc.job_wait(job["jobid"], self.warm_poll_interval)
+                error = st.get("error") or _refresh_errors(st.get("output"))
+            except RcError as e:
+                error = str(e)
+            except asyncio.CancelledError:
+                self.warm.update(state="cancelled", finished=time.time())
+                raise
+            if error and self._stop.is_set():
+                self.warm.update(state="cancelled", finished=time.time())
+                return  # the process is going away under it
+            took = time.time() - started
+            self.warm.update(finished=time.time(), state="failed" if error else "done", error=error)
+            if not error:
+                log.info("unit %s: dir cache refresh finished in %.0fs", self.name, took)
+                return
+            log.warning(
+                "unit %s: dir cache refresh failed after %.0fs%s: %s",
+                self.name, took, "" if attempt else ", retrying", error,
+            )  # fmt: skip
 
     async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
         if proc.returncode is not None:
@@ -329,6 +363,11 @@ class UnitSupervisor:
             await proc.wait()
 
     async def _cleanup(self) -> None:
+        task, self._warm_task = self._warm_task, None
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         proc, self._proc = self._proc, None
         if proc and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -343,3 +382,13 @@ class UnitSupervisor:
             path = self.layout.mount_path(self.name)
             if mountutil.is_mounted(path):
                 await mountutil.detach(path)
+
+
+def _refresh_errors(output: Any) -> str | None:
+    """vfs/refresh reports per-directory failures in its output while the
+    job itself still succeeds: {"result": {"<dir>": "OK" | "<error>"}}."""
+    result = output.get("result") if isinstance(output, dict) else None
+    if not isinstance(result, dict):
+        return None
+    bad = [f"{d or '/'}: {r}" for d, r in result.items() if r != "OK"]
+    return "; ".join(bad) or None

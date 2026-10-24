@@ -73,13 +73,25 @@ def _die(msg: str) -> NoReturn:
     raise typer.Exit(1)
 
 
+def _span(seconds: float) -> str:
+    s = int(abs(seconds))
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
 def _ago(ts: float | None) -> str:
     if not ts:
         return "-"
-    s = int(time.time() - ts)
-    future, s = s < 0, abs(s)
-    span = f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
-    return f"in {span}" if future else f"{span} ago"
+    s = time.time() - ts
+    return f"in {_span(s)}" if s < 0 else f"{_span(s)} ago"
+
+
+def _warm(w: dict[str, Any] | None) -> str:
+    """The last dir-cache warm-up, e.g. "done 1m05s, 2h03m ago"."""
+    if not w:
+        return "-"
+    if w["state"] == "running":
+        return f"running {_span(time.time() - w['started'])}"
+    return f"{w['state']} {_span(w['finished'] - w['started'])}, {_ago(w['finished'])}"
 
 
 @app.callback()
@@ -156,11 +168,13 @@ def status(ctx: typer.Context) -> None:
     """Units and transfers."""
 
     def render(d: dict[str, Any]) -> None:
-        typer.echo(f"{'UNIT':24} {'STATE':9} {'SINCE':>12} {'RESTARTS':>8}  LAST ERROR")
+        typer.echo(
+            f"{'UNIT':24} {'STATE':9} {'SINCE':>12} {'RESTARTS':>8}  {'WARM':28}  LAST ERROR"
+        )
         for u in d["units"]:
             typer.echo(
                 f"{u['unit']:24} {u['state']:9} {_ago(u['since']):>12} {u['restarts']:>8}  "
-                f"{(u['last_error'] or '')[:60]}"
+                f"{_warm(u.get('warm')):28}  {(u['last_error'] or '')[:60]}"
             )
         if d["transfers"]:
             typer.echo(f"\n{'TRANSFER':24} {'MODE':5} {'STATE':8} {'NEXT':>12}  LAST RUN")
