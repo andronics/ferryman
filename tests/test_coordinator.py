@@ -186,10 +186,12 @@ async def test_coordinator_outage_keeps_last_lease(
 
 def agent_config(tmp_path: Path, site: str, dest: str = "", mode: str = "move") -> Config:
     root = tmp_path / site
+    hostname = site
     (root / "token").parent.mkdir(parents=True, exist_ok=True)
     (root / "token").write_text(TOKENS[site] + "\n")
     return Config.model_validate(
         {
+            "hostname": hostname,
             "coordinator": {"url": "http://co", "token_file": str(root / "token")},
             "paths": {k: str(root / k) for k in ("runtime", "cache", "state", "logs")},
             "roots": {"local": str(root / "local"), "remote": str(root / "remote")},
@@ -293,3 +295,20 @@ async def test_granted_claims_survive_a_coordinator_outage(
     # A restarted agent that can't reach the coordinator still runs it.
     restarted = Agent(agent_config(tmp_path, "site-a"))
     assert restarted.claim_blocks == {}
+
+
+async def test_hostname_dests_keep_two_nodes_syncs_apart(
+    transport: httpx.ASGITransport, tmp_path: Path
+) -> None:
+    """One config on every node: `{hostname}` gives each sync its own folder."""
+    agents = [
+        Agent(agent_config(tmp_path, site, dest="backups/{hostname}", mode="sync"),
+              coordinator_transport=transport)
+        for site in ("site-a", "site-b")
+    ]  # fmt: skip
+    for agent in agents:
+        assert agent.coordinator
+        r = await agent.coordinator.request("PUT", "/v1/claims", json=agent._claims())
+        assert r == {"accepted": ["media"], "conflicts": []}
+    claims = await raw(transport, "GET", "/v1/claims", "token-a")
+    assert claims.json()["site-b"][0]["dest"] == "backups/site-b"

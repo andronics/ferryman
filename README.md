@@ -16,7 +16,7 @@ the dotfiles.
 ferryman -c config.yaml verify          # offline: config, key files, rclone
 ferryman -c config.yaml agent           # the daemon
 ferryman status | stats | jobs [pattern]
-ferryman sync <transfer> [--dry-run] [--no-wait]
+ferryman run <transfer> [--dry-run] [--no-wait]   # `sync` still works
 ferryman restart <unit>
 ferryman pool | rotate <pool>
 ferryman throttle <pattern> <rate|off>
@@ -53,12 +53,36 @@ units:
     mountpoint: media/tv
     pool: uploads
     cache_max_size: 150G
+  backups:
+    drive_id: 0ACZjQ...
+    mountpoint: backups              # names the default source under roots.local
+    pool: uploads
+    mount: false                     # an `rclone rcd`: transfers only, no FUSE
 transfers:
   media-tv:
     unit: media-tv
     mode: move                       # move | copy | sync
     schedule: "0 */4 * * *"          # omit to run on demand only
+    min_age: 5m                      # skip files still being written
+  pve-dump:                          # a backup: mirror a local dir to Drive
+    unit: backups                    # a `mount: false` unit
+    mode: sync
+    source: /var/lib/vz/dump         # absolute, or relative to roots.local
+    dest: proxmox/{hostname}/dump
+    exclude: ["*.tmp", "*.dat"]
+    max_delete: 20
+    schedule: "30 3 * * *"
 ```
+
+Transfer modes:
+
+- **`move`** uploads the source and deletes each file from it once uploaded, removing directories it emptied. It is the staging flow: whatever lands under `roots.local/<mountpoint>` goes up.
+- **`copy`** uploads new and changed files and deletes nothing on either side.
+- **`sync`** makes the destination a mirror of the source, which includes deleting destination files the source no longer has. Two safety rails apply. A sync from an **empty** source is refused, since it would wipe the destination; set `allow_empty: true` if that is really what you mean. `max_delete` aborts the job after that many deletions. rclone has already deleted those files by the time the job aborts.
+
+Every mode skips a source directory that does not exist (it reports nothing to do). `exclude` takes rclone filter patterns. `min_age` skips files modified more recently than the given age, so a backup still being written is left for the next run.
+
+`{hostname}` in `dest` expands to the agent's hostname, so one config can serve every node and each node's backups land in their own folder. The value comes from the top-level `hostname:` key, else `$FERRYMAN_HOSTNAME`, else the system hostname. In a pod, set the env from the node name.
 
 Directories that ferryman creates under `roots.remote` (a mountpoint and any
 missing parents) get the unit's `uid`/`gid` and `defaults.dir_mode`. Write

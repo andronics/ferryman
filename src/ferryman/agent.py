@@ -156,7 +156,8 @@ class Agent:
             u = self.cfg.units[t.unit]
             if u.pool and isinstance(self.pools.get(u.pool), CoordinatorPool):
                 target = u.drive_id or f"pool:{u.pool}"
-                out.append({"transfer": name, "target": target, "dest": t.dest, "mode": t.mode})
+                dest = self.layout.transfer_dest(name)
+                out.append({"transfer": name, "target": target, "dest": dest, "mode": t.mode})
         return out
 
     def _load_claims(self) -> None:

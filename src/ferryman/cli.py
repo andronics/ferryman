@@ -234,7 +234,7 @@ def jobs(ctx: typer.Context, pattern: Annotated[str, typer.Argument()] = "") -> 
 
 
 @app.command()
-def sync(
+def run(
     ctx: typer.Context,
     transfer: Annotated[str, typer.Argument(help="Transfer name")],
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Submit with DryRun set")] = False,
@@ -253,6 +253,10 @@ def sync(
             _die(f"transfer {transfer} failed: {r['error']}")
 
     ctx.obj.show(result, render)
+
+
+# `remote sync` is what the workstation tool called it.
+app.command("sync", hidden=True)(run)
 
 
 @app.command()

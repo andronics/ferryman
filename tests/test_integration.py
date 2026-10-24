@@ -87,7 +87,8 @@ async def test_mount_transfer_crash_and_api(
 
         status = json.loads(await asyncio.to_thread(cli, "--json", "status"))
         assert status["units"][0]["state"] == "ready"
-        assert "0 file(s)" in await asyncio.to_thread(cli, "sync", "docs")
+        assert "0 file(s)" in await asyncio.to_thread(cli, "run", "docs")
+        assert "0 file(s)" in await asyncio.to_thread(cli, "sync", "docs")  # the old name
         assert "docs" in await asyncio.to_thread(cli, "throttle", "docs", "10M")
         assert "docs" in await asyncio.to_thread(cli, "stats")
     finally:
@@ -117,3 +118,40 @@ async def test_stop_while_starting_is_prompt(
         await agent.stop()
     assert all(sup.state.value == "stopped" for sup in agent.units.values())
     assert not mountutil.is_mounted(agent.layout.mount_path("docs"))
+
+
+async def test_backup_sync_through_an_rcd_unit(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    """A `sync` backup through a transfer-only unit: {hostname} in dest,
+    excluded files stay behind, and the mirror deletes what the source lost."""
+    backing, dump = tmp_path / "drive", tmp_path / "dump"
+    backing.mkdir()
+    dump.mkdir()
+    (dump / "vzdump-100.vma.zst").write_text("100\n")
+    (dump / "vzdump-101.vma.zst.tmp").write_text("partial\n")
+    cfg = make_config(
+        hostname="pve-01",
+        units={"backups": {"mountpoint": "backups", "backend": "alias", "mount": False,
+                           "options": {"remote": str(backing)}}},
+        transfers={"dump": {"unit": "backups", "mode": "sync", "source": str(dump),
+                            "dest": "proxmox/{hostname}", "exclude": ["*.tmp"]}},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    agent.job_poll_interval = 0.1
+    try:
+        await agent.start()
+        await wait_for(lambda: agent.units["backups"].ready)
+        result = await agent.transfers["dump"].run()
+        assert result["ok"] and result["files"] == 1, result
+        target = backing / "proxmox/pve-01"
+        assert sorted(p.name for p in target.iterdir()) == ["vzdump-100.vma.zst"]
+        assert (dump / "vzdump-101.vma.zst.tmp").exists()  # sync never touches the source
+
+        (dump / "vzdump-100.vma.zst").unlink()
+        (dump / "vzdump-102.vma.zst").write_text("102\n")
+        result = await agent.transfers["dump"].run()
+        assert result["ok"], result
+        assert sorted(p.name for p in target.iterdir()) == ["vzdump-102.vma.zst"]
+    finally:
+        await agent.stop()

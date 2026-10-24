@@ -86,3 +86,16 @@ def test_load_yaml(tmp_path: Path) -> None:
     cfg = Config.load(path)
     assert cfg.units["docs"].options == {"remote": "/srv"}
     assert cfg.paths.runtime == Path("/run/ferryman")
+
+
+def test_transfer_dest_placeholders_and_sync_options(make_config: Callable[..., Config]) -> None:
+    t = {"unit": "media-tv", "dest": "b/{hostname}"}
+    cfg = make_config(hostname="pve-02", transfers={"t": t})
+    assert Layout(cfg).transfer_dest("t") == "b/pve-02"
+    for bad in ("b/{host}", "b/{0}", "b/{hostname"):
+        with pytest.raises(ValueError, match="dest"):
+            make_config(transfers={"t": {"unit": "media-tv", "dest": bad}})
+    with pytest.raises(ValueError, match="sync only"):
+        make_config(transfers={"t": {"unit": "media-tv", "max_delete": 5}})
+    with pytest.raises(ValueError, match="sync only"):
+        make_config(transfers={"t": {"unit": "media-tv", "mode": "copy", "allow_empty": True}})

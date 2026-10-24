@@ -71,6 +71,8 @@ class TransferRunner:
             "transfer": self.name,
             "unit": self.t.unit,
             "mode": self.t.mode,
+            "source": str(self.agent.layout.transfer_source(self.name)),
+            "dest": self.agent.layout.transfer_dest(self.name),
             "schedule": self.t.schedule,
             "running": self.running,
             "jobid": self.jobid,
@@ -113,6 +115,11 @@ class TransferRunner:
         # normal "nothing to do" case, not a failure.
         if not src.is_dir():
             return {"ok": True, "skipped": f"{src} does not exist"}
+        if t.mode == "sync" and not t.allow_empty and next(src.iterdir(), None) is None:
+            raise TransferError(
+                f"{src} is empty; a sync from it would delete everything at the "
+                "destination (set allow_empty to mean it)"
+            )
         sup = agent.units[t.unit]
         if not sup.ready:
             raise TransferError(f"unit {t.unit} is not ready ({sup.state.value})")
@@ -127,15 +134,24 @@ class TransferRunner:
         endpoint, extra = _ENDPOINTS[t.mode]
         # Eight transfers: at Drive's per-request latency one stream idles
         # about half the time, eight of them fill the uplink.
-        job_config = {"Transfers": t.transfers, "Checkers": t.checkers,
-                      "BufferSize": "16M", "DryRun": dry_run}  # fmt: skip
+        job_config: dict[str, Any] = {"Transfers": t.transfers, "Checkers": t.checkers,
+                                      "BufferSize": "16M", "DryRun": dry_run}  # fmt: skip
+        if t.max_delete is not None:
+            job_config["MaxDelete"] = t.max_delete
+        job_filter: dict[str, Any] = {}
+        if t.exclude:
+            job_filter["ExcludeRule"] = t.exclude
+        if t.min_age:
+            job_filter["MinAge"] = t.min_age
+        if job_filter:
+            extra = {**extra, "_filter": job_filter}
 
         for _ in range(attempts):
             key = sup.key
             reply = await sup.rc.call(
                 endpoint,
                 srcFs=str(src),
-                dstFs=f"{t.unit}:{t.dest}",
+                dstFs=f"{t.unit}:{agent.layout.transfer_dest(self.name)}",
                 _async=True,
                 _group=self.group,
                 _config=job_config,

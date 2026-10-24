@@ -173,3 +173,55 @@ def test_make_dirs_owns_what_it_creates(tmp_path: Path) -> None:
     # Existing directories keep their mode.
     assert (tmp_path / "remote").stat().st_mode & 0o7777 == 0o700
     mountutil.make_dirs(target, uid, gid, 0o2775)  # idempotent
+
+
+async def test_dest_expands_hostname_and_options_reach_the_job(
+    make_config: Callable[..., Config], fake_rclone: FakeRclone, tmp_path: Path
+) -> None:
+    cfg = make_config(
+        hostname="pve-01",
+        units={"backups": {"mountpoint": "backups", "pool": "main", "mount": False}},
+        transfers={"dump": {"unit": "backups", "mode": "sync", "source": str(tmp_path / "dump"),
+                            "dest": "proxmox/{hostname}/dump", "exclude": ["*.tmp"],
+                            "min_age": "10m", "max_delete": 20}},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    agent.job_poll_interval = 0.01
+    sup = agent.units["backups"]
+    sup.layout.runtime_dir("backups").mkdir(parents=True)
+    sup.state = State.READY
+    (tmp_path / "dump").mkdir()
+    (tmp_path / "dump/vzdump-qemu-100.vma.zst").write_text("x")
+    async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("backups")):
+        result = await agent.transfers["dump"].run()
+    assert result["ok"], result
+    endpoint, params = next(c for c in fake_rclone.calls if c[0].startswith("sync/"))
+    assert endpoint == "sync/sync"
+    assert params["dstFs"] == "backups:proxmox/pve-01/dump"
+    assert params["_filter"] == {"ExcludeRule": ["*.tmp"], "MinAge": "10m"}
+    assert params["_config"]["MaxDelete"] == 20
+    assert "deleteEmptySrcDirs" not in params
+    assert agent.transfers["dump"].status()["dest"] == "proxmox/pve-01/dump"
+
+
+async def test_sync_from_an_empty_source_is_refused(
+    make_config: Callable[..., Config], fake_rclone: FakeRclone, tmp_path: Path
+) -> None:
+    def build(allow_empty: bool) -> Agent:
+        t = {"unit": "media-tv", "mode": "sync", "allow_empty": allow_empty}
+        agent = Agent(make_config(transfers={"mirror": t}))
+        agent.job_poll_interval = 0.01
+        agent.units["media-tv"].state = State.READY
+        return agent
+
+    (tmp_path / "local/media/tv").mkdir(parents=True)
+    agent = build(allow_empty=False)
+    result = await agent.transfers["mirror"].run()
+    assert not result["ok"] and "is empty" in result["error"]
+    assert fake_rclone.calls == []
+
+    agent = build(allow_empty=True)
+    agent.layout.runtime_dir("media-tv").mkdir(parents=True)
+    async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
+        result = await agent.transfers["mirror"].run()
+    assert result["ok"], result

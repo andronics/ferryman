@@ -7,7 +7,10 @@ Loaded once from YAML at startup. Every path ferryman touches derives from
 
 from __future__ import annotations
 
+import os
 import re
+import socket
+import string
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -125,10 +128,22 @@ class Transfer(_Model):
     mode: Literal["move", "copy", "sync"] = "move"
     # default: <roots.local>/<unit mountpoint>; relative paths resolve under roots.local
     source: Path | None = None
-    dest: str = ""  # path inside the unit's remote
+    # Path inside the unit's remote. `{hostname}` expands to the agent's
+    # hostname, so one config can send every node's backups to its own folder.
+    dest: str = ""
     schedule: str | None = None  # cron expression; None = run on demand only
     transfers: int = 8
     checkers: int = 8
+    # rclone filter patterns of source files to leave alone (e.g. "*.tmp").
+    exclude: list[str] = Field(default_factory=list)
+    # Skip files modified more recently than this ("15m", "2h"): ones still
+    # being written.
+    min_age: str | None = None
+    # sync only. A sync deletes whatever is at the destination but not in the
+    # source, so an empty source would wipe it: refused unless allow_empty.
+    # max_delete aborts the job after that many deletions.
+    allow_empty: bool = False
+    max_delete: int | None = Field(default=None, ge=0)
 
     @field_validator("schedule")
     @classmethod
@@ -137,8 +152,28 @@ class Transfer(_Model):
             raise ValueError(f"invalid cron expression: {v!r}")
         return v
 
+    @field_validator("dest")
+    @classmethod
+    def _placeholders(cls, v: str) -> str:
+        try:
+            fields = {f for _, f, _, _ in string.Formatter().parse(v) if f is not None}
+        except ValueError as e:
+            raise ValueError(f"bad placeholder in dest {v!r}: {e}") from None
+        if fields - {"hostname"}:
+            raise ValueError(f"dest {v!r}: only {{hostname}} may be substituted")
+        return v
+
+    @model_validator(mode="after")
+    def _sync_only(self) -> Transfer:
+        if self.mode != "sync" and (self.allow_empty or self.max_delete is not None):
+            raise ValueError("allow_empty and max_delete apply to mode: sync only")
+        return self
+
 
 class Config(_Model):
+    # What `{hostname}` expands to. Default: $FERRYMAN_HOSTNAME, else the
+    # host's name (in a pod, set the env from the node name).
+    hostname: str | None = None
     coordinator: CoordinatorRef | None = None
     paths: Paths = Paths()
     roots: Roots
@@ -193,6 +228,7 @@ class Layout:
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        self.hostname = cfg.hostname or os.environ.get("FERRYMAN_HOSTNAME") or socket.gethostname()
 
     @property
     def api_socket(self) -> Path:
@@ -227,6 +263,9 @@ class Layout:
         if t.source is None:
             return self.local_path(t.unit)
         return t.source if t.source.is_absolute() else self.cfg.roots.local / t.source
+
+    def transfer_dest(self, name: str) -> str:
+        return self.cfg.transfers[name].dest.format(hostname=self.hostname)
 
     def leased_keys(self, pool: str) -> Path:
         # Keys leased from the coordinator, on the runtime (tmpfs) dir only.
