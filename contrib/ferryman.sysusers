@@ -1,0 +1,4 @@
+# The `ferryman` system user the coordinator runs as. Install to
+# /usr/lib/sysusers.d/ferryman.conf (or /etc/sysusers.d/) and run
+# `systemd-sysusers`. The agent runs as root and doesn't use it.
+u ferryman - "ferryman coordinator" /var/lib/ferryman-coordinator -

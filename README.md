@@ -56,7 +56,8 @@ rclone does the data path well, but running it as infrastructure leaves a lot to
 
 ```bash
 git clone https://github.com/andronics/ferryman.git && cd ferryman
-uv venv /opt/ferryman
+export UV_PYTHON_INSTALL_DIR=/opt/uv-python   # if uv must download a Python: keep it out of /root
+uv venv --python ">=3.13" /opt/ferryman
 uv export --frozen --no-dev --no-emit-project -o /tmp/ferryman-requirements.txt
 uv pip install --python /opt/ferryman/bin/python -r /tmp/ferryman-requirements.txt .
 ln -s /opt/ferryman/bin/ferryman /usr/local/bin/ferryman
