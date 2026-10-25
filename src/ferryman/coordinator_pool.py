@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from .notify import Emit, Event, discard
 from .pool import Lease, PoolError, PoolExhausted
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,9 @@ class CoordinatorPool:
         self.keys_dir = keys_dir
         self._lease: Lease | None = None
         self._size = 0
+        self.emit: Emit = discard
+        # Leases are served from the cache while the coordinator is away.
+        self.reachable = True
 
     @property
     def size(self) -> int:
@@ -88,6 +92,24 @@ class CoordinatorPool:
     @property
     def rotates(self) -> bool:
         return self._size > 1
+
+    @property
+    def epoch(self) -> int:
+        return self._lease.epoch if self._lease else -1
+
+    @property
+    def current(self) -> str | None:
+        return self._lease.key if self._lease else None
+
+    def _up(self) -> None:
+        if not self.reachable:
+            self.reachable = True
+            self.emit(Event("coordinator.recovered", self.name, "reachable again", "info",
+                            resolves=True))  # fmt: skip
+
+    def _down(self, e: Exception) -> None:
+        self.reachable = False
+        self.emit(Event("coordinator.unreachable", self.name, str(e)))
 
     def _store(self, body: dict[str, Any]) -> Lease:
         key = str(body["key"])
@@ -114,10 +136,14 @@ class CoordinatorPool:
 
     async def lease(self) -> Lease:
         try:
-            return self._store(await self.client.request("GET", f"/v1/pools/{self.name}/lease"))
+            lease = self._store(await self.client.request("GET", f"/v1/pools/{self.name}/lease"))
+            self._up()
+            return lease
         except PoolExhausted:
+            self._up()
             raise
         except CoordinatorError as e:
+            self._down(e)
             if self._lease is None:
                 raise
             log.warning("pool %s: %s; keeping %s", self.name, e, self._lease.key)
@@ -155,7 +181,16 @@ class CoordinatorPool:
                     timeout=self.client.timeout + 60,
                 )
                 retry = WATCH_RETRY_MIN
+                self._up()
+            except PoolExhausted:
+                # Watch replies with a lease, so an all-exhausted pool is a
+                # 409 here; it changes only when a key frees or rotates.
+                self._up()
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, WATCH_RETRY_MAX)
+                continue
             except PoolError as e:
+                self._down(e)
                 log.warning("pool %s: watch failed (%s); retrying in %.0fs", self.name, e, retry)
                 await asyncio.sleep(retry)
                 retry = min(retry * 2, WATCH_RETRY_MAX)

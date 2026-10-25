@@ -21,6 +21,7 @@ ferryman restart <unit>
 ferryman pool | rotate <pool>
 ferryman throttle <pattern> <rate|off>
 ferryman health
+ferryman events [--limit N]              # failures, recoveries, rotations
 ```
 
 The CLI talks to the agent over `<paths.runtime>/api.sock`. To use a different socket, pass `--socket` or set `FERRYMAN_SOCKET`. The config file path can also come from `FERRYMAN_CONFIG`. Add `--json` to get raw output.
@@ -98,6 +99,50 @@ when it ended. It is retried once on failure.
 Cron `schedule`s use the host's local timezone. Moving the agent into a UTC
 container shifts every transfer by the host's UTC offset.
 
+## Notifications
+
+Problems that need a person go out by mail (through the host's `sendmail`), a JSON webhook, or both:
+
+- **Problems:** a unit's process failed or was unhealthy, a transfer failed or was refused a claim, a pool ran out of keys, the coordinator went unreachable, or a warm-up failed twice.
+- **Recoveries:** each problem's recovery is sent once the problem clears.
+- **Information:** rotations and finished warm-ups are informational.
+
+Events are batched for `batch` seconds and sent as one message, so a network blip that restarts every unit produces one mail, not twenty. A problem that stays open, such as a crash-looping unit, is sent once and then again every `repeat` seconds. Its recovery is sent only if the problem was. `ferryman events` shows the recent history whether or not anything was sent.
+
+```yaml
+notify:
+  level: warning            # info | warning | error: the least severe to send
+  batch: 60
+  repeat: 21600
+  mail: {to: [ops@example.org], from: ferryman@pve-01.example.org}
+  webhook: {url: https://hooks.example.org/ferryman, headers: {Authorization: Bearer ...}}
+```
+
+The webhook receives a POST of `{host, title, text, events: [{kind, subject, message, severity, resolves, at}]}`.
+
+## Metrics and probes
+
+`api.listen` opens a TCP port with three endpoints and no control endpoints; control stays on the socket:
+
+- **`/healthz`** answers while the process is alive.
+- **`/readyz`** answers 200 once every unit is ready and 503 with the units still waiting before that, which is what a pod's readiness probe wants.
+- **`/metrics`** serves Prometheus metrics.
+
+```yaml
+api:
+  listen: {host: 0.0.0.0, port: 9470}
+```
+
+- **Units:** `ferryman_unit_ready`, `_state`, `_restarts_total`, `_warm_success`.
+- **The rclone process:** `ferryman_rclone_speed_bytes`, `_bytes`, `_errors`.
+- **Transfers:** `ferryman_transfer_runs_total{result}`, `_bytes_total`, `_last_success`, `_last_success_timestamp_seconds` and `_blocked`.
+- **Pools:** `ferryman_pool_keys_available` and `_current_key`.
+- **Coordinator pools:** `ferryman_coordinator_reachable`.
+
+Alerting on backups, for instance, is `time() - ferryman_transfer_last_success_timestamp_seconds{transfer="pve-dump"} > 26*3600`. That timestamp resets when the agent restarts, so pair the rule with `ferryman_transfer_runs_total`.
+
+The coordinator serves its own `/metrics`: pools, each agent's last report and ready units, and claims.
+
 ## Deployment
 
 The agent runs as root (it mounts FUSE filesystems) under systemd, which it
@@ -131,6 +176,7 @@ TLS.
 - **Auth:** every agent sends a bearer token. The coordinator config stores only the token's sha256, and each agent may use only the pools listed for it. `ferryman token` generates a token and its hash.
 - **Leases:** an agent writes its leased key to a 0600 file under `<paths.runtime>/keys/` (rclone's `backend set` needs a key file) and deletes it on shutdown. It follows the pool's epoch with long polls, so a rotation triggered by one host moves every host's mounts without a remount.
 - **Outages:** if the coordinator is down, agents keep their last lease and lose only rotation.
+- **Reports and commands:** agents report their status every `report_interval` seconds (15 by default) and collect commands from the web UI with long polls. Set `commands: false` in an agent's `coordinator:` block to make it ignore them.
 - **Claims:** a transfer on a coordinator pool must hold a claim before it runs. A `sync` mirrors its source and deletes everything else at its destination, so the coordinator refuses any claim whose destination overlaps another host's transfer on the same drive when either side is a `sync`. Moves and copies into the same place are fine. A claim granted earlier keeps working through a coordinator outage.
 
 ```yaml
@@ -153,6 +199,22 @@ coordinator:
 pools:
   uploads: {coordinator: true}
 ```
+
+### Web UI
+
+`ui: {enabled: true}` in the coordinator config serves a page at `/ui/`. It shows every agent's units, transfers, warm-ups, events and key pools, refreshing every 5s. Its buttons restart a unit, run a transfer or dry-run it, and rotate a shared pool. A restart or run is queued for the agent, picked up by its next long poll, and its result is shown under Commands.
+
+The UI has no login of its own. Put it behind Traefik's forward-auth (authentik). The coordinator refuses UI requests that lack the auth proxy's user header (`ui.user_header`, by default `X-authentik-username`), and records that user on every command. That header is only as trustworthy as the network path, so nothing but Traefik may reach the coordinator's port.
+
+Route the paths separately in Traefik:
+
+| Paths | Who reaches them | Middleware |
+| --- | --- | --- |
+| `/ui/` and `/ui/api/` | people | forward-auth |
+| `/v1/` | agents, which bring their own tokens | none |
+| `/metrics` | Prometheus only | do not route it publicly |
+
+A POST from the page must carry `X-Ferryman-UI: 1`. A cross-site form cannot set that header, which keeps the forward-auth cookie from being used for CSRF.
 
 ## Development
 

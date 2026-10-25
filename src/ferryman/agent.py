@@ -13,12 +13,13 @@ from typing import Any
 
 import httpx
 
-from . import mountutil, patterns, sdnotify
+from . import __version__, mountutil, patterns, sdnotify
 from .config import Config, Layout
 from .coordinator_pool import CoordinatorClient, CoordinatorPool
-from .pool import Lease, LocalPool, Pool, PoolError, is_quota_error
+from .notify import Event, Notifier
+from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
 from .rc import RcError
-from .transfer import TransferRunner
+from .transfer import TransferBusy, TransferRunner
 from .unit import UnitSupervisor
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class Agent:
     ) -> None:
         self.cfg = cfg
         self.layout = Layout(cfg)
+        self.notifier = Notifier(cfg.notify, self.layout.hostname)
         self.job_poll_interval = 5.0
         self.coordinator = (
             CoordinatorClient.from_token_file(
@@ -51,6 +53,11 @@ class Agent:
             name: UnitSupervisor(name, cfg, self.layout, self.pools.get(u.pool or ""))
             for name, u in cfg.units.items()
         }
+        for sup in self.units.values():
+            sup.emit = self.notifier.emit
+        for pool in self.pools.values():
+            if isinstance(pool, CoordinatorPool):
+                pool.emit = self.notifier.emit
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
         # Transfers on coordinator pools must hold a claim before they run;
         # name -> why a transfer may not run (absent: it may).
@@ -62,9 +69,18 @@ class Agent:
     # -------------------------------------------------------------- lifecycle
 
     def spawn(self, coro: Any, name: str) -> asyncio.Task[Any]:
-        task: asyncio.Task[Any] = asyncio.create_task(coro, name=name)
+        return self._track(asyncio.create_task(coro, name=name))
+
+    def _track(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        # Tracked tasks are cancelled before the units stop, so nothing (a
+        # restart, say) starts a unit again during shutdown.
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
+
+    def restart(self, sup: UnitSupervisor) -> asyncio.Task[None]:
+        task = sup.restart_soon()
+        self._track(task)
         return task
 
     async def start(self) -> None:
@@ -76,10 +92,16 @@ class Agent:
                 self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
         if self._claims():
             self.spawn(self._claims_loop(), "claims")
+        if self.cfg.coordinator:
+            self.spawn(self._report_loop(), "report")
+            if self.cfg.coordinator.commands:
+                self.spawn(self._command_loop(), "commands")
         for tr in self.transfers.values():
             if tr.t.schedule:
                 self.spawn(tr.schedule(), f"schedule:{tr.name}")
         self.spawn(self._health_loop(), "health")
+        if self.notifier.enabled:
+            self.spawn(self.notifier.run(), "notify")
         if (interval := sdnotify.watchdog_interval()) is not None:
             self.spawn(self._watchdog(interval), "watchdog")
 
@@ -125,7 +147,16 @@ class Agent:
         a transfer job running in the process carries on under the new key,
         and an upload in flight on the old key fails once and is retried."""
         pool = self.pools[pool_name]
-        lease = await pool.exhausted(expected)
+        before = pool.epoch
+        try:
+            lease = await pool.exhausted(expected)
+        except PoolExhausted as e:
+            self.notifier.emit(Event("pool.exhausted", pool_name, str(e), "error"))
+            raise
+        if lease.epoch != before:
+            why = f"cap hit on {expected}" if expected else "rotated by hand"
+            self.notifier.emit(Event("pool.rotated", pool_name, f"now on {lease.key} ({why})",
+                                     "info"))  # fmt: skip
         await self.apply(pool, lease)
         return lease.key
 
@@ -144,7 +175,7 @@ class Agent:
                 log.error(
                     "unit %s: could not switch to %s (%s); restarting", sup.name, lease.key, e
                 )
-                self.spawn(sup.restart(), f"restart:{sup.name}")
+                self.restart(sup)
 
     # ----------------------------------------------------------------- claims
 
@@ -190,6 +221,7 @@ class Agent:
             }
             for name, why in self.claim_blocks.items():
                 log.error("transfer %s will not run: %s", name, why)
+                self.notifier.emit(Event("transfer.blocked", name, why, "error"))
             granted = [c for c in wanted if c["transfer"] in accepted]
             path = self.layout.claims_file
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,6 +230,75 @@ class Agent:
             os.replace(tmp, path)
             # Re-assert now and then: the coordinator may have lost its state.
             await asyncio.sleep(600)
+
+    # ------------------------------------------------- coordinator UI support
+
+    async def report(self) -> dict[str, Any]:
+        """What the coordinator's UI shows for this agent."""
+        local = [p.describe() for p in self.pools.values() if isinstance(p, LocalPool)]
+        return {
+            "version": __version__,
+            "status": self.status(),
+            "stats": await self.stats(),
+            "pools": local,
+            "events": self.notifier.recent(20),
+        }
+
+    async def _report_loop(self) -> None:
+        assert self.coordinator is not None and self.cfg.coordinator is not None
+        while True:
+            try:
+                await self.coordinator.request("PUT", "/v1/report", json=await self.report())
+            except PoolError as e:
+                log.debug("report: %s", e)  # the watch already complains loudly
+            await asyncio.sleep(self.cfg.coordinator.report_interval)
+
+    async def _command_loop(self) -> None:
+        """Commands from the coordinator's UI, collected with long polls."""
+        assert self.coordinator is not None
+        retry = 5.0
+        while True:
+            try:
+                cmds = await self.coordinator.request(
+                    "GET", "/v1/commands", timeout=self.coordinator.timeout + 60
+                )
+                retry = 5.0
+            except PoolError as e:
+                log.debug("commands: %s; retrying in %.0fs", e, retry)
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, 60.0)
+                continue
+            for c in cmds:
+                self.spawn(self.execute(c), f"command:{c['id']}")
+
+    async def execute(self, cmd: dict[str, Any]) -> dict[str, Any]:
+        action, target = cmd["action"], cmd["target"]
+        log.info("command %s from the coordinator: %s %s", cmd["id"], action, target)
+        result: dict[str, Any]
+        try:
+            if action == "restart":
+                sup = self.units[target]
+                await asyncio.shield(self.restart(sup))
+                result = {"ok": True, "state": sup.state.value}
+            elif action == "run":
+                tr = self.transfers[target]
+                if tr.running:
+                    raise TransferBusy(f"transfer {target} is already running")
+                dry_run = bool(cmd.get("args", {}).get("dry_run"))
+                self.spawn(tr.run(dry_run), f"run:{target}")
+                result = {"ok": True, "started": True}
+            else:
+                result = {"ok": False, "error": f"unknown action {action!r}"}
+        except KeyError as e:
+            result = {"ok": False, "error": f"not found: {e.args[0]}"}
+        except TransferBusy as e:
+            result = {"ok": False, "error": str(e)}
+        if self.coordinator is not None:
+            try:
+                await self.coordinator.request("POST", f"/v1/commands/{cmd['id']}", json=result)
+            except PoolError as e:
+                log.warning("command %s: could not report its result: %s", cmd["id"], e)
+        return result
 
     # ----------------------------------------------------------------- health
 
@@ -215,6 +316,9 @@ class Agent:
         unhealthy as well."""
         report: dict[str, str] = {}
         for sup in list(self.units.values()):
+            if sup.restarting:
+                report[sup.name] = "restarting"
+                continue
             if not sup.ready:
                 report[sup.name] = sup.state.value
                 continue
@@ -227,11 +331,15 @@ class Agent:
                     reason = "mountpoint not responding"
             if reason is None and not await sup.rc.alive():
                 reason = "rc not answering"
-            if reason:
+            # The probes await: something else may have restarted it meanwhile.
+            if reason and not sup.restarting and sup.ready:
                 log.warning("unit %s unhealthy (%s): restarting", sup.name, reason)
-                sup.last_error = reason
-                self.spawn(sup.restart(), f"restart:{sup.name}")
+                sup.failed(f"unhealthy: {reason}")
+                self.restart(sup)
                 report[sup.name] = f"restarted: {reason}"
+                continue
+            if reason:
+                report[sup.name] = "restarting"
                 continue
             report[sup.name] = "healthy"
             await self._unhandled_cap_hit(sup)
@@ -264,6 +372,7 @@ class Agent:
 
     def status(self) -> dict[str, Any]:
         return {
+            "hostname": self.layout.hostname,
             "units": [sup.status() for sup in self.units.values()],
             "transfers": [tr.status() for tr in self.transfers.values()],
         }

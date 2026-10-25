@@ -14,7 +14,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from ferryman.agent import Agent
 from ferryman.config import Config
+from ferryman.unit import State
 
 KEYS = ["sa-01@p.iam.gserviceaccount.com", "sa-02@p.iam.gserviceaccount.com",
         "sa-03@p.iam.gserviceaccount.com"]  # fmt: skip
@@ -119,3 +121,25 @@ async def serve_unix(app: Starlette, path: Path) -> AsyncIterator[None]:
 @pytest.fixture
 def fake_rclone() -> Iterator[FakeRclone]:
     yield FakeRclone()
+
+
+@pytest.fixture
+async def agent(
+    make_config: Callable[..., Config], fake_rclone: FakeRclone, tmp_path: Path
+) -> AsyncIterator[Agent]:
+    """An agent whose media-tv unit is 'ready' on the fake rc server, with
+    something staged to move."""
+    # mount: false - these tests drive the rc API only; real mounts are
+    # covered by test_integration.
+    agent = Agent(make_config(units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+                                                  "drive_id": "0A", "mount": False}}))  # fmt: skip
+    agent.job_poll_interval = 0.01
+    sup = agent.units["media-tv"]
+    sup.layout.runtime_dir("media-tv").mkdir(parents=True)
+    lease = await agent.pools["main"].lease()  # settles the pool on its first key
+    sup.key, sup.key_path = lease.key, lease.path
+    sup.write_conf()
+    sup.state = State.READY
+    (tmp_path / "local/media/tv").mkdir(parents=True)
+    async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
+        yield agent

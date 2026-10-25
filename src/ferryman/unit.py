@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import mountutil
 from .config import Config, Layout, Unit, resolved
+from .notify import Emit, Event, discard
 from .rc import RcClient, RcError
 
 if TYPE_CHECKING:
@@ -64,6 +65,10 @@ class UnitSupervisor:
         self.warm_poll_interval = WARM_POLL
         self.warm_retry_delay = WARM_RETRY_DELAY
         self._warm_task: asyncio.Task[None] | None = None
+        self._restart_task: asyncio.Task[None] | None = None
+        # A failure has been reported and the unit has not been ready since.
+        self._failing = False
+        self.emit: Emit = discard
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -198,6 +203,25 @@ class UnitSupervisor:
         await self.stop()
         self.start()
 
+    def restart_soon(self) -> asyncio.Task[None]:
+        """Restart in the background. A restart already under way is reused,
+        so two triggers for one failure (the health loop and `ferryman
+        health`, say) restart once."""
+        if not self.restarting:
+            self._restart_task = asyncio.create_task(self.restart(), name=f"restart:{self.name}")
+        assert self._restart_task is not None
+        return self._restart_task
+
+    @property
+    def restarting(self) -> bool:
+        return self._restart_task is not None and not self._restart_task.done()
+
+    def failed(self, reason: str) -> None:
+        """Record a failure (and tell someone); cleared when the unit is next ready."""
+        self.last_error = reason
+        self._failing = True
+        self.emit(Event("unit.failed", self.name, reason, "error"))
+
     def status(self) -> dict[str, Any]:
         return {
             "unit": self.name,
@@ -228,9 +252,11 @@ class UnitSupervisor:
                 await self._cleanup()
                 raise
             except Exception as e:
-                self.last_error = str(e)
-                if not self._stop.is_set():
+                if self._stop.is_set():
+                    self.last_error = str(e)
+                else:
                     log.error("unit %s: %s", self.name, e)
+                    self.failed(str(e))
             await self._cleanup()
             if self._stop.is_set():
                 break
@@ -301,6 +327,9 @@ class UnitSupervisor:
         self._set(State.READY)
         self.last_error = None
         log.info("unit %s: ready", n)
+        if self._failing:
+            self._failing = False
+            self.emit(Event("unit.recovered", n, "ready again", "info", resolves=True))
         if self.unit.mount and resolved(self.cfg, n)[3]:
             self._warm_task = asyncio.create_task(self._warm(), name=f"warm:{n}")
 
@@ -339,7 +368,11 @@ class UnitSupervisor:
             self.warm.update(finished=time.time(), state="failed" if error else "done", error=error)
             if not error:
                 log.info("unit %s: dir cache refresh finished in %.0fs", self.name, took)
+                self.emit(Event("warm.done", self.name, f"took {took:.0f}s", "info",
+                                resolves=True))  # fmt: skip
                 return
+            if attempt:
+                self.emit(Event("warm.failed", self.name, error))
             log.warning(
                 "unit %s: dir cache refresh failed after %.0fs%s: %s",
                 self.name, took, "" if attempt else ", retrying", error,

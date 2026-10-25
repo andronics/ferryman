@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from croniter import croniter
 
 from .config import Transfer
+from .notify import Event
 from .pool import PoolError, is_quota_error
 from .rc import RcError
 
@@ -52,6 +53,12 @@ class TransferRunner:
         self.started: float | None = None
         self.next_run: float | None = None
         self.last: dict[str, Any] | None = None
+        # Since the agent started, for /metrics; dry runs are not counted.
+        self.last_ok_at: float | None = None
+        self.runs = {"ok": 0, "skipped": 0, "failed": 0}
+        self.bytes_total = 0
+        self.files_total = 0
+        self._failing = False
 
     @property
     def t(self) -> Transfer:
@@ -79,6 +86,7 @@ class TransferRunner:
             "started": self.started if self.running else None,
             "next_run": self.next_run,
             "last": self.last,
+            "last_ok_at": self.last_ok_at,
         }
 
     async def run(self, dry_run: bool = False) -> dict[str, Any]:
@@ -102,7 +110,24 @@ class TransferRunner:
                 log.info("transfer %s: %s", self.name, describe(result))
             else:
                 log.error("transfer %s failed: %s", self.name, result["error"])
+            if not dry_run:
+                self._account(result)
             return result
+
+    def _account(self, result: dict[str, Any]) -> None:
+        emit = self.agent.notifier.emit
+        if not result["ok"]:
+            self.runs["failed"] += 1
+            self._failing = True
+            emit(Event("transfer.failed", self.name, result["error"], "error"))
+            return
+        self.runs["skipped" if result.get("skipped") else "ok"] += 1
+        self.last_ok_at = result["finished"]
+        self.bytes_total += int(result.get("bytes", 0))
+        self.files_total += int(result.get("files", 0))
+        if self._failing:
+            self._failing = False
+            emit(Event("transfer.recovered", self.name, describe(result), "info", resolves=True))
 
     async def _run(self, dry_run: bool) -> dict[str, Any]:
         t, agent = self.t, self.agent

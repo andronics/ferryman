@@ -71,6 +71,11 @@ class Pool(Protocol):
     @property
     def rotates(self) -> bool: ...
 
+    @property
+    def epoch(self) -> int:
+        """The rotation count as this host last knew it."""
+        ...
+
     async def lease(self) -> Lease: ...
 
     async def exhausted(self, expected: str | None = None) -> Lease:
@@ -151,6 +156,10 @@ class LocalPool:
         when someone already rotated past it, so N transfers that all hit the
         cap on the same key rotate once, not N times."""
         async with self.lock:
+            if not expected and not self._read().get("current"):
+                # Never used yet: rotating by hand means moving past the key
+                # it would settle on, not onto it.
+                self.current()
             state = self._read()
             cur = state.get("current")
             if expected and cur and cur != expected:

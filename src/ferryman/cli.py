@@ -159,6 +159,11 @@ def verify(ctx: typer.Context) -> None:
         for err in errors:
             typer.echo(f"  - {err}")
         failed += bool(errors)
+    if (mail := cfg.notify.mail) is not None:
+        ok = shutil.which(mail.sendmail) is not None
+        typer.echo(f"[{'PASS' if ok else 'FAIL'}] notify: mail to {', '.join(mail.to)} "
+                   f"via {mail.sendmail}")  # fmt: skip
+        failed += not ok
     typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s)")
     raise typer.Exit(1 if failed else 0)
 
@@ -323,6 +328,21 @@ def health(ctx: typer.Context) -> None:
             typer.echo(f"{unit:24} {state}")
 
     ctx.obj.show(r, render)
+
+
+@app.command()
+def events(ctx: typer.Context, limit: Annotated[int, typer.Option(help="How many")] = 50) -> None:
+    """Recent events: failures, recoveries, rotations (newest last)."""
+
+    def render(rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            typer.echo("(no events)")
+        for e in rows:
+            when = time.strftime("%F %T", time.localtime(e["at"]))
+            typer.echo(f"{when}  {e['severity'].upper():7}  {e['kind']} {e['subject']}: "
+                       f"{e['message']}")  # fmt: skip
+
+    ctx.obj.show(ctx.obj.request("GET", "/v1/events", params={"limit": limit}), render)
 
 
 @app.command()

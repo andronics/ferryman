@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from ferryman.agent import Agent
-from ferryman.config import Config, CoordinatorConfig
+from ferryman.config import Config, CoordinatorConfig, Ui
 from ferryman.coordinator import Coordinator, build_app, overlaps, token_hash
 from ferryman.coordinator_pool import CoordinatorClient, CoordinatorError, CoordinatorPool
 from ferryman.pool import PoolExhausted
@@ -312,3 +312,112 @@ async def test_hostname_dests_keep_two_nodes_syncs_apart(
         assert r == {"accepted": ["media"], "conflicts": []}
     claims = await raw(transport, "GET", "/v1/claims", "token-a")
     assert claims.json()["site-b"][0]["dest"] == "backups/site-b"
+
+
+# ------------------------------------------------------------- UI, commands
+
+
+@pytest.fixture
+def ui_transport(coordinator: Coordinator) -> httpx.ASGITransport:
+    co = Coordinator(coordinator.cfg.model_copy(update={"ui": Ui(enabled=True)}))
+    return httpx.ASGITransport(app=build_app(co))
+
+
+UI = {"X-authentik-username": "stephen", "X-Ferryman-UI": "1"}
+
+
+async def ui(transport: httpx.AsyncBaseTransport, method: str, path: str,
+             headers: dict[str, str] | None = None, **kw: Any) -> httpx.Response:  # fmt: skip
+    async with httpx.AsyncClient(transport=transport, base_url="http://co") as c:
+        return await c.request(method, path, headers=UI if headers is None else headers, **kw)
+
+
+async def test_ui_is_off_by_default(transport: httpx.ASGITransport) -> None:
+    assert (await ui(transport, "GET", "/ui/api/state")).status_code == 404
+
+
+async def test_ui_needs_the_auth_proxy_and_the_csrf_header(
+    ui_transport: httpx.ASGITransport,
+) -> None:
+    assert (await ui(ui_transport, "GET", "/ui/", headers={})).status_code == 403
+    page = await ui(ui_transport, "GET", "/ui/")
+    assert page.status_code == 200 and "<title>ferryman</title>" in page.text
+    assert (await ui(ui_transport, "GET", "/ui/api/state", headers={})).status_code == 403
+    r = await ui(ui_transport, "POST", "/ui/api/pools/main/rotate",
+                 headers={"X-authentik-username": "stephen"})  # fmt: skip
+    assert r.status_code == 403 and "X-Ferryman-UI" in r.json()["error"]
+    state = (await ui(ui_transport, "GET", "/ui/api/state")).json()
+    assert state["user"] == "stephen"
+    assert [a["agent"] for a in state["agents"]] == ["site-a", "site-b", "nobody"]
+
+
+async def test_ui_rotate_moves_the_pool(ui_transport: httpx.ASGITransport) -> None:
+    r = await ui(ui_transport, "POST", "/ui/api/pools/main/rotate")
+    assert r.json() == {"pool": "main", "current": B, "epoch": 1}
+    assert (await ui(ui_transport, "POST", "/ui/api/pools/nope/rotate")).status_code == 404
+
+
+async def test_report_command_and_result_round_trip(
+    ui_transport: httpx.ASGITransport, tmp_path: Path, fake_rclone: FakeRclone
+) -> None:
+    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=ui_transport)
+    agent.claim_blocks = {}
+    async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media")):
+        await ready_agent(agent)
+        assert agent.coordinator
+        # Commands only go to units an agent has reported.
+        r = await ui(ui_transport, "POST", "/ui/api/agents/site-a/units/media/restart")
+        assert r.status_code == 404
+        await agent.coordinator.request("PUT", "/v1/report", json=await agent.report())
+        state = (await ui(ui_transport, "GET", "/ui/api/state")).json()
+        reported = state["agents"][0]
+        assert reported["report"]["status"]["hostname"] == "site-a"
+        assert reported["report"]["stats"][0]["unit"] == "media"
+
+        r = await ui(ui_transport, "POST", "/ui/api/agents/site-a/transfers/media/run",
+                     json={"dry_run": True})  # fmt: skip
+        assert r.status_code == 200 and r.json()["state"] == "pending"
+        assert r.json()["by"] == "stephen"
+
+        loop = asyncio.create_task(agent._command_loop())
+        try:
+            async with asyncio.timeout(3):
+                while (await ui(ui_transport, "GET", "/ui/api/state")).json()["commands"][0][
+                    "state"
+                ] != "done":
+                    await asyncio.sleep(0.02)
+                while agent.transfers["media"].last is None:
+                    await asyncio.sleep(0.02)
+        finally:
+            loop.cancel()
+            await agent.stop()
+    cmd = (await ui(ui_transport, "GET", "/ui/api/state")).json()["commands"][0]
+    assert cmd["result"] == {"ok": True, "started": True}
+    assert agent.transfers["media"].last["dry_run"] is True
+    sync_call = next(p for e, p in fake_rclone.calls if e.startswith("sync/"))
+    assert sync_call["_config"]["DryRun"] is True
+
+
+async def test_agent_reports_bad_commands(
+    transport: httpx.ASGITransport, coordinator: Coordinator, tmp_path: Path
+) -> None:
+    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=transport)
+    cmd = await coordinator.queue("site-a", "restart", "nope", "test")
+    assert (await agent.execute(cmd)) == {"ok": False, "error": "not found: nope"}
+    cmd = await coordinator.queue("site-a", "explode", "media", "test")
+    assert "unknown action" in (await agent.execute(cmd))["error"]
+    assert [c["state"] for c in coordinator.commands] == ["failed", "failed"]
+
+
+async def test_coordinator_metrics(
+    transport: httpx.ASGITransport, coordinator: Coordinator
+) -> None:
+    coordinator.report("site-a", {"status": {"units": [{"state": "ready"}, {"state": "backoff"}]}})
+    text = (await raw(transport, "GET", "/metrics")).text
+    assert 'ferryman_agent_units_ready{agent="site-a"} 1.0' in text
+    assert 'ferryman_agent_units{agent="site-a"} 2.0' in text
+    assert f'ferryman_pool_current_key{{pool="main",key="{A}"}} 1.0' not in text  # not settled
+    await raw(transport, "GET", "/v1/pools/main/lease", "token-a")
+    text = (await raw(transport, "GET", "/metrics")).text
+    assert f'ferryman_pool_current_key{{pool="main",key="{A}"}} 1.0' in text
+    assert 'ferryman_agent_last_report_timestamp_seconds{agent="site-b"}' not in text

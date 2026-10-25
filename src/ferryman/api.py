@@ -1,4 +1,5 @@
-"""HTTP/JSON control API, served on a unix socket for the CLI."""
+"""HTTP/JSON control API, served on a unix socket for the CLI, and an optional
+TCP listener that serves only health and metrics (no control)."""
 
 from __future__ import annotations
 
@@ -14,9 +15,10 @@ from typing import TYPE_CHECKING, Any
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
+from .metrics import CONTENT_TYPE, agent_metrics
 from .pool import PoolError
 from .transfer import TransferBusy
 
@@ -65,7 +67,7 @@ def build_app(agent: Agent) -> Starlette:
 
     async def restart(request: Request) -> Any:
         sup = agent.units[request.path_params["name"]]
-        await sup.restart()
+        await asyncio.shield(agent.restart(sup))
         return sup.status()
 
     async def run_transfer(request: Request) -> Any:
@@ -101,8 +103,12 @@ def build_app(agent: Agent) -> Starlette:
     async def health(_: Request) -> Any:
         return await agent.check_health()
 
+    async def events(request: Request) -> Any:
+        return agent.notifier.recent(int(request.query_params.get("limit", "50")))
+
     routes = [
-        Route("/healthz", _json(healthz)),
+        *_probes(agent),
+        Route("/v1/events", _json(events)),
         Route("/v1/status", _json(status)),
         Route("/v1/stats", _json(stats)),
         Route("/v1/jobs", _json(jobs)),
@@ -116,6 +122,27 @@ def build_app(agent: Agent) -> Starlette:
     return Starlette(routes=routes)
 
 
+def _probes(agent: Agent) -> list[Route]:
+    async def healthz(_: Request) -> Response:
+        return JSONResponse({"ok": True})
+
+    async def readyz(_: Request) -> Response:
+        # Ready once every unit is: what a pod's readiness probe should wait
+        # for before the apps that read its mounts start.
+        waiting = {n: s.state.value for n, s in agent.units.items() if not s.ready}
+        return JSONResponse({"ready": not waiting, "waiting": waiting},
+                            status_code=503 if waiting else 200)  # fmt: skip
+
+    async def metrics(_: Request) -> Response:
+        return PlainTextResponse(await agent_metrics(agent), media_type=CONTENT_TYPE)
+
+    return [Route("/healthz", healthz), Route("/readyz", readyz), Route("/metrics", metrics)]
+
+
+def build_tcp_app(agent: Agent) -> Starlette:
+    return Starlette(routes=_probes(agent))
+
+
 class _Server(uvicorn.Server):
     # The agent owns SIGTERM/SIGINT; uvicorn must not install its own.
     def install_signal_handlers(self) -> None:
@@ -127,14 +154,27 @@ class _Server(uvicorn.Server):
 
 
 class ApiServer:
-    def __init__(self, server: _Server, task: asyncio.Task[None], path: Path) -> None:
-        self.server, self.task, self.path = server, task, path
+    def __init__(self, servers: list[tuple[_Server, asyncio.Task[None]]], path: Path) -> None:
+        self.servers, self.path = servers, path
 
     async def stop(self) -> None:
-        self.server.should_exit = True
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.task
+        for server, _ in self.servers:
+            server.should_exit = True
+        for _, task in self.servers:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         self.path.unlink(missing_ok=True)
+
+
+async def _start(config: uvicorn.Config, name: str) -> tuple[_Server, asyncio.Task[None]]:
+    server = _Server(config)
+    task = asyncio.create_task(server.serve(), name=name)
+    while not server.started:
+        if task.done():
+            task.result()
+            raise RuntimeError(f"{name} server exited during startup")
+        await asyncio.sleep(0.05)
+    return server, task
 
 
 def _socket_in_use(path: Path) -> bool:
@@ -154,13 +194,22 @@ async def serve(agent: Agent) -> ApiServer:
             raise RuntimeError(f"another ferryman agent is listening on {path}")
         path.unlink()
     config = uvicorn.Config(build_app(agent), uds=str(path), log_level="warning", lifespan="off")
-    server = _Server(config)
-    task = asyncio.create_task(server.serve(), name="api")
-    while not server.started:
-        if task.done():
-            task.result()
-            raise RuntimeError("API server exited during startup")
-        await asyncio.sleep(0.05)
+    servers = [await _start(config, "api")]
     os.chmod(path, agent.cfg.api.socket_mode)
     log.info("API listening on %s", path)
-    return ApiServer(server, task, path)
+    if (listen := agent.cfg.api.listen) is not None:
+        tcp = uvicorn.Config(
+            build_tcp_app(agent),
+            host=listen.host,
+            port=listen.port,
+            log_level="warning",
+            access_log=False,
+            lifespan="off",
+        )
+        try:
+            servers.append(await _start(tcp, "probes"))
+        except BaseException:
+            await ApiServer(servers, path).stop()
+            raise
+        log.info("health and metrics on %s:%d", listen.host, listen.port)
+    return ApiServer(servers, path)

@@ -6,6 +6,12 @@ terminates TLS. Authentication is its own regardless: each agent sends a
 bearer token whose sha256 is in the config, and may only touch the pools
 listed for it.
 
+Agents report their status to it every few seconds and collect commands
+(restart a unit, run a transfer) from it with long polls, which is what its
+web UI at /ui/ shows and drives. The UI has no login of its own: Traefik puts
+it behind forward-auth (authentik), and the coordinator trusts the user
+header that sets.
+
 It also arbitrates transfer claims. Two agents *moving* (or copying) into the
 same place on a drive is harmless - each only adds its own files - but a
 `sync` mirrors its source and deletes whatever else is there, so a sync
@@ -16,23 +22,34 @@ agent's uploads. Those claims are refused.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
+from importlib import resources
 from pathlib import PurePosixPath
 from typing import Any
 
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from starlette.routing import Route
 
 from .config import CoordinatorConfig
+from .metrics import CONTENT_TYPE, coordinator_metrics
 from .pool import LocalPool, PoolError, PoolExhausted
 
 log = logging.getLogger(__name__)
@@ -62,6 +79,14 @@ class Coordinator:
         }
         self._changed = {name: asyncio.Condition() for name in cfg.pools}
         self.claims_file = cfg.state / "claims.json"
+        # agent -> {"at": when, "report": what it last said}; in memory only,
+        # agents re-report within seconds of a coordinator restart.
+        self.reports: dict[str, dict[str, Any]] = {}
+        # Commands for agents, newest last; pending ones wait for the agent's
+        # next long poll.
+        self.commands: collections.deque[dict[str, Any]] = collections.deque(maxlen=100)
+        self._command_ids = itertools.count(1)
+        self._commands_changed = {name: asyncio.Condition() for name in cfg.agents}
 
     # ---------------------------------------------------------------- auth
 
@@ -100,7 +125,8 @@ class Coordinator:
             async with self._changed[pool.name]:
                 self._changed[pool.name].notify_all()
         if pool.epoch != before:
-            log.warning("pool %s: rotated on a cap hit reported by %s", pool.name, agent)
+            why = f"a cap hit reported by {agent}" if expected else f"request of {agent}"
+            log.warning("pool %s: rotated on %s", pool.name, why)
         return self.lease(pool)
 
     async def watch(self, pool: LocalPool, epoch: int, timeout: float) -> dict[str, Any]:
@@ -109,6 +135,60 @@ class Coordinator:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(cond.wait_for(lambda: pool.epoch != epoch), timeout)
         return self.lease(pool)
+
+    # ------------------------------------------------------ reports, commands
+
+    def report(self, agent: str, body: dict[str, Any]) -> None:
+        self.reports[agent] = {"at": time.time(), "report": body}
+
+    async def queue(self, agent: str, action: str, target: str, by: str,
+                    **args: Any) -> dict[str, Any]:  # fmt: skip
+        if agent not in self.cfg.agents:
+            raise KeyError(agent)
+        cmd = {"id": next(self._command_ids), "agent": agent, "action": action,
+               "target": target, "args": args, "by": by, "state": "pending",
+               "created": time.time(), "result": None}  # fmt: skip
+        self.commands.append(cmd)
+        log.info("%s: %s %s on %s (command %d)", by, action, target, agent, cmd["id"])
+        async with self._commands_changed[agent]:
+            self._commands_changed[agent].notify_all()
+        return cmd
+
+    def _pending(self, agent: str) -> list[dict[str, Any]]:
+        return [c for c in self.commands if c["agent"] == agent and c["state"] == "pending"]
+
+    async def take(self, agent: str, timeout: float) -> list[dict[str, Any]]:
+        """An agent's pending commands, waiting up to `timeout` for one."""
+        cond = self._commands_changed[agent]
+        async with cond:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(cond.wait_for(lambda: bool(self._pending(agent))), timeout)
+        cmds = self._pending(agent)
+        for c in cmds:
+            c["state"] = "sent"
+        return [{k: c[k] for k in ("id", "action", "target", "args")} for c in cmds]
+
+    def finish(self, agent: str, cmd_id: int, result: dict[str, Any]) -> None:
+        for c in self.commands:
+            if c["id"] == cmd_id and c["agent"] == agent:
+                c["state"] = "done" if result.get("ok") else "failed"
+                c["result"] = result
+                c["finished"] = time.time()
+                return
+        raise KeyError(f"command {cmd_id}")
+
+    def state(self) -> dict[str, Any]:
+        """Everything the UI shows."""
+        return {
+            "now": time.time(),
+            "agents": [
+                {"agent": name, "pools": a.pools, **(self.reports.get(name) or {})}
+                for name, a in self.cfg.agents.items()
+            ],
+            "pools": [p.describe() for p in self.pools.values()],
+            "claims": self._read_claims(),
+            "commands": list(self.commands)[::-1],
+        }
 
     # --------------------------------------------------------------- claims
 
@@ -210,9 +290,27 @@ def build_app(co: Coordinator) -> Starlette:
     async def get_claims(_: Request, agent: str) -> Any:
         return co._read_claims()
 
+    async def put_report(request: Request, agent: str) -> Any:
+        co.report(agent, await request.json())
+        return {"ok": True}
+
+    async def get_commands(_: Request, agent: str) -> Any:
+        return await co.take(agent, co.cfg.watch_timeout)
+
+    async def post_command(request: Request, agent: str) -> Any:
+        co.finish(agent, int(request.path_params["id"]), await request.json())
+        return {"ok": True}
+
+    async def metrics(_: Request) -> Response:
+        return PlainTextResponse(coordinator_metrics(co), media_type=CONTENT_TYPE)
+
     return Starlette(
         routes=[
             Route("/healthz", healthz),
+            Route("/metrics", metrics),
+            Route("/v1/report", authed(put_report), methods=["PUT"]),
+            Route("/v1/commands", authed(get_commands)),
+            Route("/v1/commands/{id:int}", authed(post_command), methods=["POST"]),
             Route("/v1/pools", authed(pools)),
             Route("/v1/pools/{pool}", authed(pool)),
             Route("/v1/pools/{pool}/lease", authed(lease)),
@@ -220,8 +318,91 @@ def build_app(co: Coordinator) -> Starlette:
             Route("/v1/pools/{pool}/watch", authed(watch)),
             Route("/v1/claims", authed(get_claims)),
             Route("/v1/claims", authed(put_claims), methods=["PUT"]),
+            *(_ui_routes(co) if co.cfg.ui.enabled else []),
         ]
     )
+
+
+# ---------------------------------------------------------------------- UI
+
+UiHandler = Callable[[Request, str], Awaitable[Any]]
+
+
+def _ui_routes(co: Coordinator) -> list[Route]:
+    header = co.cfg.ui.user_header
+
+    def user_of(request: Request) -> str | None:
+        if header is None:
+            return "ui"
+        return request.headers.get(header) or None
+
+    def guarded(handler: UiHandler) -> Callable[[Request], Awaitable[Response]]:
+        async def wrapped(request: Request) -> Response:
+            user = user_of(request)
+            if user is None:
+                return JSONResponse({"error": f"no {header} header: is the UI behind "
+                                     "the auth proxy?"}, status_code=403)  # fmt: skip
+            # A cross-site form cannot set a custom header; fetch() from the
+            # page does. That is the CSRF guard for the forward-auth cookie.
+            if request.method == "POST" and request.headers.get("x-ferryman-ui") != "1":
+                return JSONResponse({"error": "missing X-Ferryman-UI header"}, status_code=403)
+            try:
+                return JSONResponse(await handler(request, user))
+            except KeyError as e:
+                return JSONResponse({"error": f"not found: {e.args[0]}"}, status_code=404)
+            except PoolError as e:
+                return JSONResponse({"error": str(e)}, status_code=409)
+
+        return wrapped
+
+    page = resources.files("ferryman").joinpath("ui.html").read_text()
+
+    async def index(request: Request) -> Response:
+        if user_of(request) is None:
+            return PlainTextResponse(f"no {header} header: is the UI behind the auth proxy?",
+                                     status_code=403)  # fmt: skip
+        return HTMLResponse(page)
+
+    async def root(_: Request) -> Response:
+        return RedirectResponse("/ui/")
+
+    async def state(_: Request, user: str) -> Any:
+        return {"user": user, **co.state()}
+
+    def _agent_has(agent: str, kind: str, name: str) -> None:
+        rep = co.reports.get(agent)
+        if rep is None:
+            raise KeyError(agent)
+        names = [x[kind[:-1]] for x in rep["report"].get("status", {}).get(kind, [])]
+        if name not in names:
+            raise KeyError(f"{agent}/{name}")
+
+    async def restart(request: Request, user: str) -> Any:
+        a, u = request.path_params["agent"], request.path_params["name"]
+        _agent_has(a, "units", u)
+        return await co.queue(a, "restart", u, user)
+
+    async def run_transfer(request: Request, user: str) -> Any:
+        a, t = request.path_params["agent"], request.path_params["name"]
+        _agent_has(a, "transfers", t)
+        body = await request.json() if await request.body() else {}
+        return await co.queue(a, "run", t, user, dry_run=bool(body.get("dry_run")))
+
+    async def rotate(request: Request, user: str) -> Any:
+        pool = co.pools[request.path_params["pool"]]
+        lease = await co.exhausted(f"{user} (ui)", pool, None)
+        return {"pool": pool.name, "current": lease["key"], "epoch": lease["epoch"]}
+
+    return [
+        Route("/", root),
+        Route("/ui/", index),
+        Route("/ui/api/state", guarded(state)),
+        Route("/ui/api/agents/{agent}/units/{name}/restart", guarded(restart), methods=["POST"]),
+        Route(
+            "/ui/api/agents/{agent}/transfers/{name}/run", guarded(run_transfer), methods=["POST"]
+        ),
+        Route("/ui/api/pools/{pool}/rotate", guarded(rotate), methods=["POST"]),
+    ]
 
 
 def run(cfg: CoordinatorConfig) -> None:

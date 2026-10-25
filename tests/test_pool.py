@@ -101,3 +101,10 @@ def test_quota_message_is_case_sensitive() -> None:
     assert is_quota_error("googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded")
     assert not is_quota_error("User Rate Limit Exceeded")
     assert not is_quota_error(None)
+
+
+async def test_rotating_an_unused_pool_moves_past_its_first_key(tmp_path: Path) -> None:
+    pool = LocalPool("p", PoolConfig(keys_dir=tmp_path, keys=KEYS), tmp_path / "state.json")
+    write_keys(tmp_path, KEYS)
+    assert await pool.advance() == KEYS[1]
+    assert pool.epoch == 1

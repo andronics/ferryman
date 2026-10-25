@@ -39,9 +39,38 @@ class Roots(_Model):
     remote: Path
 
 
+class Listen(_Model):
+    host: str = "127.0.0.1"
+    port: int = 8470
+    # Traefik's address(es), so X-Forwarded-For is trusted for logging.
+    forwarded_allow_ips: str = "127.0.0.1"
+
+
 class Api(_Model):
     socket: Path | None = None  # default: <paths.runtime>/api.sock
     socket_mode: int = 0o660
+    # Optional TCP listener with /healthz, /readyz and /metrics only (no
+    # control: that stays on the socket), for Prometheus and k8s probes.
+    listen: Listen | None = None
+
+
+class MailNotify(_Model):
+    to: list[str] = Field(min_length=1)
+    sender: str | None = Field(default=None, alias="from")  # default ferryman@<hostname>
+    sendmail: str = "/usr/sbin/sendmail"
+
+
+class WebhookNotify(_Model):
+    url: str  # receives a JSON POST: {host, title, text, events: [...]}
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class Notify(_Model):
+    level: Literal["info", "warning", "error"] = "warning"
+    batch: float = 60.0  # collect events this long, then send them as one message
+    repeat: float = 21600.0  # re-send a problem that is still open after this long
+    mail: MailNotify | None = None
+    webhook: WebhookNotify | None = None
 
 
 class Rclone(_Model):
@@ -91,6 +120,10 @@ class CoordinatorRef(_Model):
     url: str  # e.g. https://ferryman.andronics.io (TLS terminated by Traefik)
     token_file: Path
     agent: str | None = None  # informational; the token identifies the agent
+    # How often the agent reports its status (for the coordinator's UI and
+    # metrics), and whether it takes commands (restart, run) from that UI.
+    report_interval: float = 15.0
+    commands: bool = True
 
 
 class Unit(_Model):
@@ -180,6 +213,7 @@ class Config(_Model):
     api: Api = Api()
     rclone: Rclone = Rclone()
     health: Health = Health()
+    notify: Notify = Notify()
     defaults: UnitDefaults = UnitDefaults()
     pools: dict[str, Pool] = Field(default_factory=dict)
     units: dict[str, Unit] = Field(default_factory=dict)
@@ -290,21 +324,25 @@ def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]
 # ---------------------------------------------------------------- coordinator
 
 
-class Listen(_Model):
-    host: str = "127.0.0.1"
-    port: int = 8470
-    # Traefik's address(es), so X-Forwarded-For is trusted for logging.
-    forwarded_allow_ips: str = "127.0.0.1"
-
-
 class AgentEntry(_Model):
     # sha256 of the agent's bearer token (`ferryman token` makes both).
     token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     pools: list[str] = Field(default_factory=list)
 
 
+class Ui(_Model):
+    # The web UI at /ui/, for Traefik to put behind forward-auth. Off by default.
+    enabled: bool = False
+    # Header the auth proxy sets to the signed-in user. When set, requests
+    # without it are refused, and actions are logged with the user. It is
+    # only as trustworthy as the network path: nothing but the proxy must be
+    # able to reach the coordinator's port.
+    user_header: str | None = "X-authentik-username"
+
+
 class CoordinatorConfig(_Model):
     listen: Listen = Listen()
+    ui: Ui = Ui()
     state: Path = Path("/var/lib/ferryman-coordinator")
     watch_timeout: float = 30.0
     pools: dict[str, Pool] = Field(default_factory=dict)

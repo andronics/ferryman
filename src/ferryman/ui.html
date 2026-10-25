@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ferryman</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1f22; --muted: #6b6f76; --line: #e3e1dc;
+  --ok: #1f7a4d; --warn: #a86400; --bad: #b3261e; --accent: #2f5d9e; --chip: #efede8;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a; --panel: #1d2024; --ink: #e6e4df; --muted: #969aa1; --line: #2c3036;
+    --ok: #5cc28c; --warn: #e0a346; --bad: #f07b72; --accent: #82a8e0; --chip: #262a2f;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  padding: 18px 24px 10px; border-bottom: 1px solid var(--line);
+}
+header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+header .meta { color: var(--muted); font-size: 13px; }
+header .meta b { color: var(--ink); font-weight: 500; }
+main { padding: 16px 24px 48px; display: grid; gap: 20px; max-width: 1500px; }
+/* Grid items would otherwise grow to their widest table instead of scrolling it. */
+main > *, .grid2 > *, #agents > *, #pools > * { min-width: 0; }
+section h2 {
+  margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); font-weight: 600;
+}
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.agent > .head {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+}
+.agent > .head .name { font-weight: 600; font-size: 15px; }
+.agent .stale { color: var(--bad); }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 14px; border-bottom: 1px solid var(--line);
+         vertical-align: top; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+     font-weight: 600; }
+td.wrap { white-space: normal; min-width: 36ch; max-width: 60ch; overflow-wrap: anywhere; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+       background: var(--muted); vertical-align: 1px; }
+.s-ready .dot, .s-ok .dot { background: var(--ok); }
+.s-starting .dot, .s-stopping .dot, .s-running .dot { background: var(--warn); }
+.s-backoff .dot, .s-failed .dot, .s-stopped .dot { background: var(--bad); }
+.err { color: var(--bad); }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 10px; background: var(--chip);
+        font-size: 12px; }
+button {
+  font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--chip); color: var(--ink);
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; gap: 6px; }
+.sub { padding: 8px 14px 2px; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.grid2 { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+#toast {
+  position: fixed; right: 16px; bottom: 16px; max-width: 420px; padding: 10px 14px;
+  border-radius: 6px; background: var(--ink); color: var(--bg); font-size: 13px;
+  opacity: 0; transition: opacity .2s; pointer-events: none;
+}
+#toast.show { opacity: .95; }
+.empty { padding: 12px 14px; color: var(--muted); }
+@media (max-width: 640px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  .grid2 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>ferryman</h1>
+  <span class="meta" id="meta">loading…</span>
+</header>
+<main>
+  <section><h2>Agents</h2><div id="agents" style="display:grid;gap:16px"></div></section>
+  <div class="grid2">
+    <section><h2>Key pools</h2><div id="pools" style="display:grid;gap:16px"></div></section>
+    <section><h2>Recent events</h2><div class="panel scroll" id="events"></div></section>
+  </div>
+  <section><h2>Commands</h2><div class="panel scroll" id="commands"></div></section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const STALE_AFTER = 60;  // seconds without a report
+let skew = 0;            // server clock minus ours
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g,
+  (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const now = () => Date.now() / 1000 + skew;
+
+function span(s) {
+  s = Math.round(Math.abs(s));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  if (s < 172800) return `${Math.floor(s / 3600)}h${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}m`;
+  return `${Math.floor(s / 86400)}d`;
+}
+const ago = (ts) => !ts ? "–" : (ts > now() ? `in ${span(ts - now())}` : `${span(now() - ts)} ago`);
+const clock = (ts) => ts ? new Date(ts * 1000).toLocaleString() : "–";
+function iec(n) {
+  for (const [u, s] of [["G", 2 ** 30], ["M", 2 ** 20], ["K", 2 ** 10]]) {
+    if (n >= s) return `${(n / s).toFixed(1)}${u}`;
+  }
+  return `${Math.round(n || 0)}B`;
+}
+const state = (s, label) => `<span class="s-${esc(s)}"><span class="dot"></span>${esc(label ?? s)}</span>`;
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 4000);
+}
+
+async function post(path, body, label) {
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Ferryman-UI": "1"},
+      body: JSON.stringify(body || {}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    toast(`${label}: sent`);
+  } catch (e) {
+    toast(`${label}: ${e.message}`);
+  }
+  refresh();
+}
+
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-act]");
+  if (!b) return;
+  const {act, agent, name} = b.dataset;
+  const enc = encodeURIComponent;
+  if (act === "restart") {
+    if (!confirm(`Restart unit ${name} on ${agent}? Its mount drops for a few seconds.`)) return;
+    post(`/ui/api/agents/${enc(agent)}/units/${enc(name)}/restart`, {}, `restart ${name}`);
+  } else if (act === "run" || act === "dry") {
+    post(`/ui/api/agents/${enc(agent)}/transfers/${enc(name)}/run`, {dry_run: act === "dry"},
+         `${act === "dry" ? "dry run" : "run"} ${name}`);
+  } else if (act === "rotate") {
+    if (!confirm(`Rotate pool ${name}? The current key is marked exhausted for its quota window.`)) return;
+    post(`/ui/api/pools/${enc(name)}/rotate`, {}, `rotate ${name}`);
+  }
+});
+
+function warm(w) {
+  if (!w) return "–";
+  if (w.state === "running") return state("running", `running ${span(now() - w.started)}`);
+  return state(w.state === "done" ? "ok" : "failed",
+               `${w.state} ${span(w.finished - w.started)}, ${ago(w.finished)}`);
+}
+
+function lastRun(t) {
+  const l = t.last;
+  if (!l) return `<span class="muted">never</span>`;
+  const when = ago(l.finished) + (l.dry_run ? " (dry run)" : "");
+  if (!l.ok) return `${state("failed", when)} <span class="err">${esc(l.error)}</span>`;
+  if (l.skipped) return `${state("ok", when)} <span class="muted">nothing to do</span>`;
+  return `${state("ok", when)} ${esc(l.files ?? 0)} file(s), ${iec(l.bytes ?? 0)}` +
+         (l.errors ? `, <span class="err">${esc(l.errors)} error(s)</span>` : "");
+}
+
+function renderAgent(a) {
+  const r = a.report;
+  if (!r) {
+    return `<div class="panel agent"><div class="head"><span class="name">${esc(a.agent)}</span>
+      <span class="muted">has not reported since the coordinator started</span></div></div>`;
+  }
+  const st = r.status, stale = now() - a.at > STALE_AFTER;
+  const speed = Object.fromEntries((r.stats || []).map((x) => [x.unit, x]));
+  const units = st.units.map((u) => {
+    const s = speed[u.unit] || {};
+    return `<tr>
+      <td class="mono">${esc(u.unit)}</td>
+      <td>${state(u.state)} <span class="muted">${ago(u.since)}</span></td>
+      <td class="num">${s.speed ? iec(s.speed) + "/s" : "–"}</td>
+      <td class="num">${u.restarts}</td>
+      <td>${warm(u.warm)}</td>
+      <td class="mono muted">${esc(u.key || "–")}</td>
+      <td class="wrap err">${esc(u.last_error || "")}</td>
+      <td><div class="actions"><button data-act="restart" data-agent="${esc(a.agent)}"
+          data-name="${esc(u.unit)}">Restart</button></div></td>
+    </tr>`;
+  }).join("");
+  const transfers = st.transfers.map((t) => `<tr>
+      <td class="mono">${esc(t.transfer)}</td>
+      <td><span class="chip">${esc(t.mode)}</span></td>
+      <td class="mono">${esc(t.unit)}:${esc(t.dest || "/")}</td>
+      <td>${t.running ? state("running", `running ${span(now() - t.started)}`) : state("ok", "idle")}</td>
+      <td>${t.schedule ? `<span class="mono">${esc(t.schedule)}</span> <span class="muted">${ago(t.next_run)}</span>` : `<span class="muted">on demand</span>`}</td>
+      <td class="wrap">${lastRun(t)}</td>
+      <td><div class="actions">
+        <button data-act="run" data-agent="${esc(a.agent)}" data-name="${esc(t.transfer)}" ${t.running ? "disabled" : ""}>Run</button>
+        <button data-act="dry" data-agent="${esc(a.agent)}" data-name="${esc(t.transfer)}" ${t.running ? "disabled" : ""}>Dry run</button>
+      </div></td>
+    </tr>`).join("");
+  return `<div class="panel agent">
+    <div class="head">
+      <span class="name">${esc(a.agent)}</span>
+      <span class="muted mono">${esc(st.hostname || "")}</span>
+      <span class="${stale ? "stale" : "muted"}">reported ${ago(a.at)}</span>
+      <span class="muted">v${esc(r.version)}</span>
+    </div>
+    <div class="scroll"><table>
+      <tr><th>Unit</th><th>State</th><th class="num">Speed</th><th class="num">Restarts</th>
+          <th>Warm-up</th><th>Key</th><th>Last error</th><th></th></tr>
+      ${units || `<tr><td colspan="8" class="muted">no units</td></tr>`}
+    </table></div>
+    ${transfers ? `<div class="sub">Transfers</div><div class="scroll"><table>
+      <tr><th>Transfer</th><th>Mode</th><th>Destination</th><th>State</th><th>Schedule</th>
+          <th>Last run</th><th></th></tr>${transfers}</table></div>` : ""}
+  </div>`;
+}
+
+function renderPool(p, owner) {
+  const keys = p.keys.map((k) => `<tr>
+      <td>${k.current ? "●" : ""}</td>
+      <td class="mono">${esc(k.key)}</td>
+      <td>${k.file_ok ? "" : `<span class="err">bad key file</span>`}</td>
+      <td>${k.exhausted_until ? state("failed", `exhausted, frees ${ago(k.exhausted_until)}`) : state("ok", "available")}</td>
+    </tr>`).join("");
+  const rotate = owner ? "" : `<button data-act="rotate" data-name="${esc(p.pool)}">Rotate</button>`;
+  return `<div class="panel">
+    <div class="agent"><div class="head">
+      <span class="name mono">${esc(p.pool)}</span>
+      <span class="muted">${owner ? `local to ${esc(owner)}` : "shared"} · epoch ${esc(p.epoch)} ·
+        rotated ${ago(p.rotated_at)} · window ${span(p.quota_window)}</span>
+      <span style="margin-left:auto">${rotate}</span>
+    </div></div>
+    <div class="scroll"><table>${keys}</table></div>
+  </div>`;
+}
+
+function render(d) {
+  skew = d.now - Date.now() / 1000;
+  const reporting = d.agents.filter((a) => a.report && now() - a.at <= STALE_AFTER).length;
+  document.getElementById("meta").innerHTML =
+    `<b>${reporting}</b> of <b>${d.agents.length}</b> agent(s) reporting · signed in as <b>${esc(d.user)}</b>`;
+  document.getElementById("agents").innerHTML =
+    d.agents.map(renderAgent).join("") || `<div class="panel empty">no agents configured</div>`;
+
+  const pools = d.pools.map((p) => renderPool(p, null));
+  for (const a of d.agents) {
+    for (const p of (a.report && a.report.pools) || []) pools.push(renderPool(p, a.agent));
+  }
+  document.getElementById("pools").innerHTML =
+    pools.join("") || `<div class="panel empty">no pools</div>`;
+
+  const events = d.agents.flatMap((a) =>
+    ((a.report && a.report.events) || []).map((e) => ({...e, agent: a.agent})));
+  events.sort((x, y) => y.at - x.at);
+  document.getElementById("events").innerHTML = events.length ? `<table>
+    <tr><th>When</th><th>Agent</th><th>Event</th><th>Subject</th><th>Message</th></tr>
+    ${events.slice(0, 40).map((e) => `<tr>
+      <td title="${esc(clock(e.at))}">${ago(e.at)}</td>
+      <td>${esc(e.agent)}</td>
+      <td class="${e.severity === "error" ? "err" : e.severity === "info" ? "muted" : ""}">${esc(e.kind)}</td>
+      <td class="mono">${esc(e.subject)}</td>
+      <td class="wrap">${esc(e.message)}</td></tr>`).join("")}</table>`
+    : `<div class="empty">nothing yet</div>`;
+
+  document.getElementById("commands").innerHTML = d.commands.length ? `<table>
+    <tr><th>When</th><th>By</th><th>Agent</th><th>Action</th><th>State</th><th>Result</th></tr>
+    ${d.commands.slice(0, 25).map((c) => `<tr>
+      <td title="${esc(clock(c.created))}">${ago(c.created)}</td>
+      <td>${esc(c.by)}</td><td>${esc(c.agent)}</td>
+      <td class="mono">${esc(c.action)} ${esc(c.target)}${c.args && c.args.dry_run ? " (dry run)" : ""}</td>
+      <td>${state(c.state === "done" ? "ok" : c.state === "failed" ? "failed" : "running", c.state)}</td>
+      <td class="wrap ${c.result && !c.result.ok ? "err" : "muted"}">${esc(c.result ? (c.result.error || (c.result.started ? "started" : c.result.state || "ok")) : "")}</td>
+    </tr>`).join("")}</table>` : `<div class="empty">none yet</div>`;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/ui/api/state", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    render(d);
+  } catch (e) {
+    document.getElementById("meta").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
