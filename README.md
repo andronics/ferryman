@@ -83,7 +83,27 @@ Transfer modes:
 
 Every mode skips a source directory that does not exist (it reports nothing to do). `exclude` takes rclone filter patterns. `min_age` skips files modified more recently than the given age, so a backup still being written is left for the next run.
 
-`{hostname}` in `dest` expands to the agent's hostname, so one config can serve every node and each node's backups land in their own folder. The value comes from the top-level `hostname:` key, else `$FERRYMAN_HOSTNAME`, else the system hostname. In a pod, set the env from the node name.
+### Placeholders
+
+A transfer's `source` and `dest` can contain placeholders, so one config can serve every node:
+
+| Placeholder | Where | Expands to |
+| --- | --- | --- |
+| `{hostname}` | source, dest | the top-level `hostname:` key, else `$FERRYMAN_HOSTNAME`, else the system hostname |
+| `{transfer}`, `{unit}` | source, dest | the transfer's name, its unit's name |
+| `{env:NAME}` | source, dest | the environment variable `NAME`, e.g. `{env:NODE_NAME}` set from a pod's node name |
+| `{now:FORMAT}` | dest | the run's start time through strftime, e.g. `{now:%Y/%m}` |
+| `{date}` | dest | `2026-10-25` |
+| `{weekday}` | dest | `mon` to `sun`, whatever the locale |
+
+- **Fixed placeholders** (the first three rows) are filled in once. An unset `{env:NAME}` fails `verify` and stops the agent from starting, rather than failing at run time.
+- **Time placeholders** use the host's local time, like the cron schedules. They are evaluated once per run, so a retry after a key rotation lands in the same folder.
+
+Time placeholders combine with modes as follows:
+
+- **`copy` and `move`** take any of them. `archive/{now:%Y/%m}` files each month's uploads in its own folder.
+- **A `sync` only takes ones that repeat weekly:** `{weekday}`, or `{now:...}` using only `%a %A %u %w`. A sync into a folder that changes every run would upload a full copy each time and never delete the old ones. `dumps/{hostname}/{weekday}` keeps seven rolling mirrors with no pruning, at the cost of seven copies' worth of space and upload.
+- **Coordinator claims** cover the directory in front of the first time placeholder: `dumps/{hostname}/{weekday}` claims `dumps/<host>`.
 
 Directories that ferryman creates under `roots.remote` (a mountpoint and any
 missing parents) get the unit's `uid`/`gid` and `defaults.dir_mode`. Write

@@ -170,13 +170,16 @@ class TransferRunner:
             job_filter["MinAge"] = t.min_age
         if job_filter:
             extra = {**extra, "_filter": job_filter}
+        # Once per run: a retry on the next key must land in the same place
+        # even if a {date} rolled over meanwhile.
+        dest = agent.layout.transfer_dest(self.name)
 
         for _ in range(attempts):
             key = sup.key
             reply = await sup.rc.call(
                 endpoint,
                 srcFs=str(src),
-                dstFs=f"{t.unit}:{agent.layout.transfer_dest(self.name)}",
+                dstFs=f"{t.unit}:{dest}",
                 _async=True,
                 _group=self.group,
                 _config=job_config,
@@ -197,7 +200,7 @@ class TransferRunner:
                 self.jobid = None
 
             if st.get("success"):
-                return {"ok": True, **await self._summary()}
+                return {"ok": True, "dest": dest, **await self._summary()}
             err = str(st.get("error") or "")
             if pool is None or not pool.rotates or not is_quota_error(err):
                 raise TransferError(f"job {jobid}: {err or 'failed'}")

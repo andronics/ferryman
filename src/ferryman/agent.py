@@ -187,7 +187,7 @@ class Agent:
             u = self.cfg.units[t.unit]
             if u.pool and isinstance(self.pools.get(u.pool), CoordinatorPool):
                 target = u.drive_id or f"pool:{u.pool}"
-                dest = self.layout.transfer_dest(name)
+                dest = self.layout.claim_dest(name)
                 out.append({"transfer": name, "target": target, "dest": dest, "mode": t.mode})
         return out
 

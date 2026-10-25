@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from ferryman import mountutil
@@ -201,3 +202,28 @@ async def test_sync_from_an_empty_source_is_refused(
     async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
         result = await agent.transfers["mirror"].run()
     assert result["ok"], result
+
+
+async def test_a_run_keeps_one_dest_across_rotation_retries(
+    make_config: Callable[..., Config], fake_rclone: FakeRclone, tmp_path: Path
+) -> None:
+    cfg = make_config(units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+                                          "drive_id": "0A", "mount": False}},
+                      transfers={"media-tv": {"unit": "media-tv",
+                                              "dest": "in/{date}/{transfer}"}})  # fmt: skip
+    agent = Agent(cfg)
+    agent.job_poll_interval = 0.01
+    sup = agent.units["media-tv"]
+    sup.layout.runtime_dir("media-tv").mkdir(parents=True)
+    lease = await agent.pools["main"].lease()
+    sup.key, sup.key_path = lease.key, lease.path
+    sup.state = State.READY
+    (tmp_path / "local/media/tv").mkdir(parents=True)
+    fake_rclone.job_outcomes = [QUOTA, None]
+    async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
+        result = await agent.transfers["media-tv"].run()
+    assert result["ok"], result
+    dests = [p["dstFs"] for e, p in fake_rclone.calls if e.startswith("sync/")]
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert dests == [f"media-tv:in/{today}/media-tv"] * 2
+    assert result["dest"] == f"in/{today}/media-tv"

@@ -10,13 +10,15 @@ from __future__ import annotations
 import os
 import re
 import socket
-import string
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import yaml
 from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from . import placeholders as ph
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -159,10 +161,12 @@ class Unit(_Model):
 class Transfer(_Model):
     unit: str
     mode: Literal["move", "copy", "sync"] = "move"
-    # default: <roots.local>/<unit mountpoint>; relative paths resolve under roots.local
+    # default: <roots.local>/<unit mountpoint>; relative paths resolve under
+    # roots.local. Takes the fixed placeholders ({hostname}, {transfer},
+    # {unit}, {env:NAME}); see placeholders.py.
     source: Path | None = None
-    # Path inside the unit's remote. `{hostname}` expands to the agent's
-    # hostname, so one config can send every node's backups to its own folder.
+    # Path inside the unit's remote. Takes the fixed placeholders and the
+    # per-run time ones ({now:FORMAT}, {date}, {weekday}).
     dest: str = ""
     schedule: str | None = None  # cron expression; None = run on demand only
     transfers: int = 8
@@ -187,19 +191,27 @@ class Transfer(_Model):
 
     @field_validator("dest")
     @classmethod
-    def _placeholders(cls, v: str) -> str:
-        try:
-            fields = {f for _, f, _, _ in string.Formatter().parse(v) if f is not None}
-        except ValueError as e:
-            raise ValueError(f"bad placeholder in dest {v!r}: {e}") from None
-        if fields - {"hostname"}:
-            raise ValueError(f"dest {v!r}: only {{hostname}} may be substituted")
+    def _dest_placeholders(cls, v: str) -> str:
+        ph.parse(v, ph.FIXED | ph.TIME)
+        return v
+
+    @field_validator("source")
+    @classmethod
+    def _source_placeholders(cls, v: Path | None) -> Path | None:
+        if v is not None:
+            ph.parse(str(v), ph.FIXED)
         return v
 
     @model_validator(mode="after")
     def _sync_only(self) -> Transfer:
         if self.mode != "sync" and (self.allow_empty or self.max_delete is not None):
             raise ValueError("allow_empty and max_delete apply to mode: sync only")
+        if self.mode == "sync" and not ph.repeats_weekly(self.dest):
+            raise ValueError(
+                f"dest {self.dest!r}: a sync into a folder that changes every run uploads a "
+                "full copy each time and never removes the old ones; use {weekday} for "
+                "rolling copies, or mode: copy for dated archives"
+            )
         return self
 
 
@@ -292,14 +304,36 @@ class Layout:
     def pool_state(self, pool: str) -> Path:
         return self.cfg.paths.state / "pools" / f"{pool}.json"
 
+    def _placeholders(self, name: str) -> dict[str, str]:
+        return {"hostname": self.hostname, "transfer": name, "unit": self.cfg.transfers[name].unit}
+
     def transfer_source(self, name: str) -> Path:
         t = self.cfg.transfers[name]
         if t.source is None:
             return self.local_path(t.unit)
-        return t.source if t.source.is_absolute() else self.cfg.roots.local / t.source
+        src = Path(ph.expand(str(t.source), self._placeholders(name)))
+        return src if src.is_absolute() else self.cfg.roots.local / src
 
-    def transfer_dest(self, name: str) -> str:
-        return self.cfg.transfers[name].dest.format(hostname=self.hostname)
+    def transfer_dest(self, name: str, now: datetime | None = None) -> str:
+        """The dest for a run starting at `now` (default: now)."""
+        return ph.expand(self.cfg.transfers[name].dest, self._placeholders(name), now)
+
+    def claim_dest(self, name: str) -> str:
+        """What a coordinator claim covers: the part of the dest that is the
+        same on every run (all of it, unless it has time placeholders)."""
+        return ph.fixed_prefix(self.cfg.transfers[name].dest, self._placeholders(name))
+
+    def check_placeholders(self) -> list[str]:
+        """Problems expanding each transfer's source and dest here (an unset
+        {env:NAME}), for `verify` and agent startup."""
+        problems = []
+        for name in self.cfg.transfers:
+            try:
+                self.transfer_source(name)
+                self.transfer_dest(name)
+            except ph.PlaceholderError as e:
+                problems.append(f"transfer {name}: {e}")
+        return problems
 
     def leased_keys(self, pool: str) -> Path:
         # Keys leased from the coordinator, on the runtime (tmpfs) dir only.

@@ -112,6 +112,9 @@ def agent(
     """Run the daemon."""
     from .agent import Agent
 
+    cfg = ctx.obj.config()
+    if problems := Layout(cfg).check_placeholders():
+        _die("\n".join(problems))
     logging.basicConfig(
         level=log_level.upper(),
         stream=sys.stderr,
@@ -124,7 +127,7 @@ def agent(
     # agent's own at DEBUG.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    asyncio.run(Agent(ctx.obj.config()).run())
+    asyncio.run(Agent(cfg).run())
 
 
 @app.command()
@@ -164,6 +167,9 @@ def verify(ctx: typer.Context) -> None:
         typer.echo(f"[{'PASS' if ok else 'FAIL'}] notify: mail to {', '.join(mail.to)} "
                    f"via {mail.sendmail}")  # fmt: skip
         failed += not ok
+    for problem in layout.check_placeholders():
+        typer.echo(f"[FAIL] {problem}")
+        failed += 1
     typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s)")
     raise typer.Exit(1 if failed else 0)
 
