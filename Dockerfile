@@ -1,5 +1,5 @@
 # ferryman Dockerfile - Multi-stage build
-# One image for both the agent (root: FUSE, bind mounts) and the coordinator
+# One image for both the agent (root: FUSE, bind mounts) and the controller
 # (drops to PUID:PGID). See contrib/docker/docker-compose.yml for how to run each.
 
 # ============================================================
@@ -72,11 +72,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN mkdir -p /etc/ferryman
 COPY contrib/ /usr/share/ferryman/
 
-# Non-root user for the coordinator (the agent stays root)
+# Non-root user for the controller (the agent stays root)
 RUN useradd --system --create-home --shell /usr/sbin/nologin --uid 1000 ferryman
 
 # The agent starts and stays root: FUSE mounts, kernel read-only binds and
-# mount directories need it. The coordinator starts as root only to give
+# mount directories need it. The controller starts as root only to give
 # its state to PUID:PGID (default 1000:1000), then drops to that user --
 # see docker/ferryman.sh. The wrapper shadows the real ferryman on PATH so
 # `docker exec <c> ferryman status` goes through it too.
@@ -88,14 +88,14 @@ ENV PATH="/opt/ferryman/bin:$PATH"
 
 # Default config locations
 ENV FERRYMAN_CONFIG=/etc/ferryman/config.yaml \
-    FERRYMAN_COORDINATOR_CONFIG=/etc/ferryman/coordinator.yaml
+    FERRYMAN_CONTROLLER_CONFIG=/etc/ferryman/controller.yaml
 
-# Health check: the agent answers on its API socket (the coordinator
+# Health check: the agent answers on its API socket (the controller
 # service overrides this in contrib/docker/docker-compose.yml)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD ferryman status > /dev/null || exit 1
 
-# Coordinator port (the agent's servers listen wherever their addr says)
+# Controller port (the agent's servers listen wherever their addr says)
 EXPOSE 8470
 
 # Config, state, cache and logs

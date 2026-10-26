@@ -15,7 +15,7 @@ import httpx
 
 from . import __version__, mountutil, patterns, sdnotify
 from .config import Config, Layout
-from .coordinator_pool import CoordinatorClient, CoordinatorPool
+from .controller_pool import ControllerClient, ControllerPool
 from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
 from .rc import RcError
@@ -28,25 +28,25 @@ log = logging.getLogger(__name__)
 
 class Agent:
     def __init__(
-        self, cfg: Config, coordinator_transport: httpx.AsyncBaseTransport | None = None
+        self, cfg: Config, controller_transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self.cfg = cfg
         self.layout = Layout(cfg)
         self.notifier = Notifier(cfg.notify, self.layout.hostname)
         self.job_poll_interval = 5.0
-        self.coordinator = (
-            CoordinatorClient.from_token_file(
-                cfg.coordinator.url, cfg.coordinator.token_file, coordinator_transport
+        self.controller = (
+            ControllerClient.from_token_file(
+                cfg.controller.url, cfg.controller.token_file, controller_transport
             )
-            if cfg.coordinator
+            if cfg.controller
             else None
         )
         self.pools: dict[str, Pool] = {}
         for name, p in cfg.pools.items():
-            if p.coordinator:
-                assert self.coordinator is not None
-                self.pools[name] = CoordinatorPool(
-                    name, self.coordinator, self.layout.leased_keys(name)
+            if p.controller:
+                assert self.controller is not None
+                self.pools[name] = ControllerPool(
+                    name, self.controller, self.layout.leased_keys(name)
                 )
             else:
                 self.pools[name] = LocalPool(name, p, self.layout.pool_state(name))
@@ -57,11 +57,11 @@ class Agent:
         for sup in self.units.values():
             sup.emit = self.notifier.emit
         for pool in self.pools.values():
-            if isinstance(pool, CoordinatorPool):
+            if isinstance(pool, ControllerPool):
                 pool.emit = self.notifier.emit
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
         self.tuner = Tuner(self)
-        # Transfers on coordinator pools must hold a claim before they run;
+        # Transfers on controller pools must hold a claim before they run;
         # name -> why a transfer may not run (absent: it may).
         self.claim_blocks: dict[str, str] = {}
         self._load_claims()
@@ -90,13 +90,13 @@ class Agent:
         for sup in self.units.values():
             sup.start()
         for pool in self.pools.values():
-            if isinstance(pool, CoordinatorPool):
+            if isinstance(pool, ControllerPool):
                 self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
         if self._claims():
             self.spawn(self._claims_loop(), "claims")
-        if self.cfg.coordinator:
+        if self.cfg.controller:
             self.spawn(self._report_loop(), "report")
-            if self.cfg.coordinator.commands:
+            if self.cfg.controller.commands:
                 self.spawn(self._command_loop(), "commands")
         for tr in self.transfers.values():
             if tr.t.schedule:
@@ -116,10 +116,10 @@ class Agent:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await asyncio.gather(*(sup.stop() for sup in self.units.values()))
         for pool in self.pools.values():
-            if isinstance(pool, CoordinatorPool):
+            if isinstance(pool, ControllerPool):
                 pool.forget()
-        if self.coordinator:
-            await self.coordinator.aclose()
+        if self.controller:
+            await self.controller.aclose()
 
     async def run(self) -> None:
         from .api import serve
@@ -184,20 +184,20 @@ class Agent:
     # ----------------------------------------------------------------- claims
 
     def _claims(self) -> list[dict[str, str]]:
-        """Claims for every transfer whose unit's pool is on the coordinator.
+        """Claims for every transfer whose unit's pool is on the controller.
         A drive is identified by its id (or, without one, its pool)."""
         out = []
         for name, t in self.cfg.transfers.items():
             u = self.cfg.units[t.unit]
-            if u.pool and isinstance(self.pools.get(u.pool), CoordinatorPool):
+            if u.pool and isinstance(self.pools.get(u.pool), ControllerPool):
                 target = u.drive_id or f"pool:{u.pool}"
                 dest = self.layout.claim_dest(name)
                 out.append({"transfer": name, "target": target, "dest": dest, "mode": t.mode})
         return out
 
     def _load_claims(self) -> None:
-        """Until the coordinator answers, a transfer may run only if it was
-        granted before (persisted), unchanged. A coordinator outage then
+        """Until the controller answers, a transfer may run only if it was
+        granted before (persisted), unchanged. A controller outage then
         stops nothing that was already running fine."""
         try:
             granted = json.loads(self.layout.claims_file.read_text())
@@ -205,14 +205,14 @@ class Agent:
             granted = []
         for c in self._claims():
             if c not in granted:
-                self.claim_blocks[c["transfer"]] = "awaiting a claim from the coordinator"
+                self.claim_blocks[c["transfer"]] = "awaiting a claim from the controller"
 
     async def _claims_loop(self) -> None:
-        assert self.coordinator is not None
+        assert self.controller is not None
         wanted = self._claims()
         while True:
             try:
-                r = await self.coordinator.request("PUT", "/v1/claims", json=wanted)
+                r = await self.controller.request("PUT", "/v1/claims", json=wanted)
             except PoolError as e:
                 log.warning("claims: %s; retrying in 30s", e)
                 await asyncio.sleep(30)
@@ -232,13 +232,13 @@ class Agent:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(granted, indent=2) + "\n")
             os.replace(tmp, path)
-            # Re-assert now and then: the coordinator may have lost its state.
+            # Re-assert now and then: the controller may have lost its state.
             await asyncio.sleep(600)
 
-    # ------------------------------------------------- coordinator UI support
+    # ------------------------------------------------- controller UI support
 
     async def report(self) -> dict[str, Any]:
-        """What the coordinator's UI shows for this agent."""
+        """What the controller's UI shows for this agent."""
         local = [p.describe() for p in self.pools.values() if isinstance(p, LocalPool)]
         return {
             "version": __version__,
@@ -249,22 +249,22 @@ class Agent:
         }
 
     async def _report_loop(self) -> None:
-        assert self.coordinator is not None and self.cfg.coordinator is not None
+        assert self.controller is not None and self.cfg.controller is not None
         while True:
             try:
-                await self.coordinator.request("PUT", "/v1/report", json=await self.report())
+                await self.controller.request("PUT", "/v1/report", json=await self.report())
             except PoolError as e:
                 log.debug("report: %s", e)  # the watch already complains loudly
-            await asyncio.sleep(self.cfg.coordinator.report_interval)
+            await asyncio.sleep(self.cfg.controller.report_interval)
 
     async def _command_loop(self) -> None:
-        """Commands from the coordinator's UI, collected with long polls."""
-        assert self.coordinator is not None
+        """Commands from the controller's UI, collected with long polls."""
+        assert self.controller is not None
         retry = 5.0
         while True:
             try:
-                cmds = await self.coordinator.request(
-                    "GET", "/v1/commands", timeout=self.coordinator.timeout + 60
+                cmds = await self.controller.request(
+                    "GET", "/v1/commands", timeout=self.controller.timeout + 60
                 )
                 retry = 5.0
             except PoolError as e:
@@ -277,7 +277,7 @@ class Agent:
 
     async def execute(self, cmd: dict[str, Any]) -> dict[str, Any]:
         action, target = cmd["action"], cmd["target"]
-        log.info("command %s from the coordinator: %s %s", cmd["id"], action, target)
+        log.info("command %s from the controller: %s %s", cmd["id"], action, target)
         result: dict[str, Any]
         try:
             if action == "restart":
@@ -302,9 +302,9 @@ class Agent:
             result = {"ok": False, "error": f"not found: {e.args[0]}"}
         except (TransferBusy, TuneError) as e:
             result = {"ok": False, "error": str(e)}
-        if self.coordinator is not None:
+        if self.controller is not None:
             try:
-                await self.coordinator.request("POST", f"/v1/commands/{cmd['id']}", json=result)
+                await self.controller.request("POST", f"/v1/commands/{cmd['id']}", json=result)
             except PoolError as e:
                 log.warning("command %s: could not report its result: %s", cmd["id"], e)
         return result
@@ -315,7 +315,7 @@ class Agent:
         try:
             await self.tuner.run(apply=apply)
         except TuneError as e:
-            log.warning("tune from the coordinator: %s", e)
+            log.warning("tune from the controller: %s", e)
 
     # ----------------------------------------------------------------- health
 

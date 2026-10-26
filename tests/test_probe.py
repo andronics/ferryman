@@ -1,5 +1,5 @@
 """Key probes: the rclone upload test, the pool's probe bookkeeping, and the
-coordinator returning a key to its pool."""
+controller returning a key to its pool."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from ferryman.config import CoordinatorConfig
+from ferryman.config import ControllerConfig
 from ferryman.config import Pool as PoolConfig
-from ferryman.coordinator import Coordinator
+from ferryman.controller import Controller
 from ferryman.pool import LocalPool, PoolExhausted
 from ferryman.probe import PROBE_DIR, probe
 from tests.conftest import KEYS, write_keys
@@ -186,38 +186,38 @@ async def test_no_probes_without_config_or_for_bad_files(tmp_path: Path, clock: 
 # ------------------------------------------------------------------ config
 
 
-def test_probe_is_a_coordinator_setting(make_config: Any, tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="probe is a coordinator setting"):
+def test_probe_is_a_controller_setting(make_config: Any, tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="probe is a controller setting"):
         make_config(pools={"main": {"keys_dir": str(tmp_path / "keys"), "keys": KEYS,
                                     "probe": {"drive_id": "0A"}}})  # fmt: skip
-    cfg = CoordinatorConfig.model_validate(
+    cfg = ControllerConfig.model_validate(
         {"pools": {"main": {"keys_dir": "/k", "keys": KEYS, "probe": {"drive_id": "0A"}}}}
     )
     probe_cfg = cfg.pools["main"].probe
     assert probe_cfg is not None and probe_cfg.interval == 3600 and probe_cfg.size == "1K"
     for bad in ({"drive_id": "0A", "interval": 60}, {"drive_id": "0A", "size": "lots"}, {}):
         with pytest.raises(ValidationError):
-            CoordinatorConfig.model_validate(
+            ControllerConfig.model_validate(
                 {"pools": {"main": {"keys_dir": "/k", "keys": KEYS, "probe": bad}}}
             )
 
 
-# ------------------------------------------------------------- coordinator
+# ------------------------------------------------------------- controller
 
 
-async def test_coordinator_probe_wakes_watchers_of_an_exhausted_pool(
+async def test_controller_probe_wakes_watchers_of_an_exhausted_pool(
     tmp_path: Path, clock: Clock
 ) -> None:
     write_keys(tmp_path / "keys", KEYS)
     rclone = fake_rclone(tmp_path)
-    cfg = CoordinatorConfig.model_validate({
+    cfg = ControllerConfig.model_validate({
         "state": str(tmp_path / "co"),
         "watch_timeout": 5,
         "rclone": {"binary": str(rclone)},
         "pools": {"main": {"keys_dir": str(tmp_path / "keys"), "keys": [A, B],
                            "probe": {"drive_id": "0ADRIVE", "interval": 300}}},
     })  # fmt: skip
-    co = Coordinator(cfg)
+    co = Controller(cfg)
     pool = co.pools["main"]
     pool.clock = clock
     pool.current()

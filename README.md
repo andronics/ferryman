@@ -47,10 +47,10 @@ rclone does the data path well, but running it as infrastructure leaves a lot to
 - **Move, copy and sync transfers:** these run inside the mount's own process. `sync` has safety rails: an empty source is refused, deletions can be capped, and date-folder mirrors are rejected ([docs](https://github.com/andronics/ferryman/wiki/Transfers))
 - **Placeholders:** `{hostname}`, `{env:NAME}`, `{weekday}` and `{now:%Y/%m}` let one config serve every node ([docs](https://github.com/andronics/ferryman/wiki/Placeholders))
 - **Upload tuning:** `ferryman tune` measures what the host's path to Drive sustains and picks the chunk size and parallel transfers from it, applied live; drift alerts and scheduled re-tunes keep it current ([docs](https://github.com/andronics/ferryman/wiki/Upload-Tuning))
-- **Coordinator:** a shared key pool for several hosts. A cap hit on one moves them all, and backup destinations that would overlap are refused ([docs](https://github.com/andronics/ferryman/wiki/Coordinator))
+- **Controller:** a shared key pool for several hosts. A cap hit on one moves them all, and backup destinations that would overlap are refused ([docs](https://github.com/andronics/ferryman/wiki/Coordinator))
 - **Observability:** Prometheus metrics, mail and webhook alerts, and a web UI with restart, run and rotate buttons ([metrics](https://github.com/andronics/ferryman/wiki/Metrics), [alerts](https://github.com/andronics/ferryman/wiki/Notifications), [UI](https://github.com/andronics/ferryman/wiki/Web-UI))
 
-**How it works:** `ferryman agent` runs on each host under systemd. It supervises one `rclone mount` (or `rclone rcd`) per unit and drives each over its rc socket: further mount paths and servers join that process, so they share its connection, cache and key. It also schedules transfers as rc jobs, checks health, and serves a control API on a unix socket for the `ferryman` CLI. The optional `ferryman coordinator` sits behind Traefik and leases keys to agents.
+**How it works:** `ferryman agent` runs on each host under systemd. It supervises one `rclone mount` (or `rclone rcd`) per unit and drives each over its rc socket: further mount paths and servers join that process, so they share its connection, cache and key. It also schedules transfers as rc jobs, checks health, and serves a control API on a unix socket for the `ferryman` CLI. The optional `ferryman controller` sits behind Traefik and leases keys to agents.
 
 ---
 
@@ -96,12 +96,12 @@ The image (`ghcr.io/andronics/ferryman`, amd64 and arm64) bundles a pinned rclon
 ```bash
 docker compose up -d                               # the agent; edit the volumes first
 docker exec ferryman ferryman status
-docker compose --profile coordinator up -d         # plus the coordinator, as PUID:PGID
+docker compose --profile controller up -d          # plus the controller, as PUID:PGID
 ```
 
 Tags: `latest` and `X.Y.Z`/`X.Y` for releases, `edge` for main.
 
-On Kubernetes, [`contrib/k8s`](contrib/k8s) has Kustomize manifests (the agent as a privileged DaemonSet, plus the coordinator), tested on Talos: `kubectl apply -k contrib/k8s`. See [Deployment](https://github.com/andronics/ferryman/wiki/Deployment#talos--kubernetes).
+On Kubernetes, [`contrib/k8s`](contrib/k8s) has Kustomize manifests (the agent as a privileged DaemonSet, plus the controller), tested on Talos: `kubectl apply -k contrib/k8s`. See [Deployment](https://github.com/andronics/ferryman/wiki/Deployment#talos--kubernetes).
 
 **Continue with the [Quick Start guide](https://github.com/andronics/ferryman/wiki/Quick-Start)** for a first run against a local folder, before any Drive key is involved. Or jump to [Examples](https://github.com/andronics/ferryman/wiki/Examples) for complete configs.
 
@@ -112,13 +112,13 @@ On Kubernetes, [`contrib/k8s`](contrib/k8s) has Kustomize manifests (the agent a
 Everything beyond getting started lives on the **[wiki](https://github.com/andronics/ferryman/wiki)**:
 
 **Core Concepts**
-[Units](https://github.com/andronics/ferryman/wiki/Units) · [Serving](https://github.com/andronics/ferryman/wiki/Serving) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Coordinator](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision) · [Upload Tuning](https://github.com/andronics/ferryman/wiki/Upload-Tuning)
+[Units](https://github.com/andronics/ferryman/wiki/Units) · [Serving](https://github.com/andronics/ferryman/wiki/Serving) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Controller](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision) · [Upload Tuning](https://github.com/andronics/ferryman/wiki/Upload-Tuning)
 
 **Control & Observability**
 [CLI Reference](https://github.com/andronics/ferryman/wiki/CLI-Reference) · [HTTP API Reference](https://github.com/andronics/ferryman/wiki/HTTP-API-Reference) · [Web UI](https://github.com/andronics/ferryman/wiki/Web-UI) · [Notifications](https://github.com/andronics/ferryman/wiki/Notifications) · [Metrics](https://github.com/andronics/ferryman/wiki/Metrics)
 
 **Security**
-[Where keys live, socket and token auth, the coordinator's plain-HTTP hop, the web UI's trust model](https://github.com/andronics/ferryman/wiki/Security)
+[Where keys live, socket and token auth, the controller's plain-HTTP hop, the web UI's trust model](https://github.com/andronics/ferryman/wiki/Security)
 
 **Configuration & Deployment**
 [In-Depth Configuration](https://github.com/andronics/ferryman/wiki/In-Depth-Configuration) · [Deployment](https://github.com/andronics/ferryman/wiki/Deployment) · [Examples](https://github.com/andronics/ferryman/wiki/Examples)
@@ -137,7 +137,7 @@ Everything beyond getting started lives on the **[wiki](https://github.com/andro
 - **Python** ≥ 3.13
 - **rclone** ≥ 1.75
 - **Google Cloud service accounts** that are members of your shared drives. More than one is needed to rotate past the daily cap.
-- **Optional:** Traefik with forward-auth in front of the coordinator, sendmail for mail alerts, Prometheus
+- **Optional:** Traefik with forward-auth in front of the controller, sendmail for mail alerts, Prometheus
 
 ---
 

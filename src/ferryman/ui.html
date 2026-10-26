@@ -105,7 +105,7 @@ button:disabled { opacity: .5; cursor: default; }
 "use strict";
 const STALE_AFTER = 60;  // seconds without a report
 let skew = 0;            // server clock minus ours
-let page = null;         // the page this tab loaded, as the coordinator names it
+let page = null;         // the page this tab loaded, as the controller names it
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g,
   (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
@@ -207,7 +207,7 @@ function renderAgent(a) {
   const r = a.report;
   if (!r) {
     return `<div class="panel agent"><div class="head"><span class="name">${esc(a.agent)}</span>
-      <span class="muted">has not reported since the coordinator started</span></div></div>`;
+      <span class="muted">has not reported since the controller started</span></div></div>`;
   }
   const st = r.status, stale = now() - a.at > STALE_AFTER;
   const speed = Object.fromEntries((r.stats || []).map((x) => [x.unit, x]));
@@ -293,7 +293,7 @@ function renderPool(p, owner) {
 }
 
 function render(d) {
-  // The coordinator now serves a different page: an upgrade. Load it.
+  // The controller now serves a different page: an upgrade. Load it.
   if (page && d.page && d.page !== page) { location.reload(); return; }
   page = page || d.page;
   skew = d.now - Date.now() / 1000;

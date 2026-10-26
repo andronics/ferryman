@@ -9,15 +9,15 @@ api:
     host: 0.0.0.0
     port: 8470
 
-# Keys are leased from the coordinator: none are stored in the cluster's
+# Keys are leased from the controller: none are stored in the cluster's
 # nodes. Each pod's token is its node's, copied in by the init container.
-coordinator:
-  url: http://ferryman-coordinator:8470
+controller:
+  url: http://ferryman-controller:8470
   token_file: /run/secrets/ferryman/token
 
 pools:
   uploads:
-    coordinator: true
+    controller: true
 
 # Pods have no MTA: send alerts to a webhook.
 # notify:

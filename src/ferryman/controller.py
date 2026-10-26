@@ -1,4 +1,4 @@
-"""The coordinator: owns the service-account keys and every pool's rotation
+"""The controller: owns the service-account keys and every pool's rotation
 state, and leases the current key to agents.
 
 It speaks plain HTTP on a TCP port and expects to sit behind Traefik, which
@@ -9,7 +9,7 @@ listed for it.
 Agents report their status to it every few seconds and collect commands
 (restart a unit, run a transfer) from it with long polls, which is what its
 web UI at /ui/ shows and drives. The UI has no login of its own: Traefik puts
-it behind forward-auth (authentik), and the coordinator trusts the user
+it behind forward-auth (authentik), and the controller trusts the user
 header that sets.
 
 It also arbitrates transfer claims. Two agents *moving* (or copying) into the
@@ -48,8 +48,8 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from .config import CoordinatorConfig, parse_size
-from .metrics import CONTENT_TYPE, coordinator_metrics
+from .config import ControllerConfig, parse_size
+from .metrics import CONTENT_TYPE, controller_metrics
 from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
 from .probe import probe
 
@@ -75,8 +75,8 @@ def overlaps(a: str, b: str) -> bool:
     return pa[:n] == pb[:n]
 
 
-class Coordinator:
-    def __init__(self, cfg: CoordinatorConfig) -> None:
+class Controller:
+    def __init__(self, cfg: ControllerConfig) -> None:
         self.cfg = cfg
         self.pools = {
             name: LocalPool(name, p, cfg.state / "pools" / f"{name}.json")
@@ -85,7 +85,7 @@ class Coordinator:
         self._changed = {name: asyncio.Condition() for name in cfg.pools}
         self.claims_file = cfg.state / "claims.json"
         # agent -> {"at": when, "report": what it last said}; in memory only,
-        # agents re-report within seconds of a coordinator restart.
+        # agents re-report within seconds of a controller restart.
         self.reports: dict[str, dict[str, Any]] = {}
         # Commands for agents, newest last; pending ones wait for the agent's
         # next long poll.
@@ -93,7 +93,7 @@ class Coordinator:
         self._command_ids = itertools.count(1)
         self._commands_changed = {name: asyncio.Condition() for name in cfg.agents}
         # uplink -> {"agent", "until"}: agents behind one uplink tune one at a
-        # time. In memory: a coordinator restart frees them, which costs at
+        # time. In memory: a controller restart frees them, which costs at
         # most one overlapping tune.
         self.tune_locks: dict[str, dict[str, Any]] = {}
 
@@ -297,7 +297,7 @@ class Coordinator:
 Handler = Callable[[Request, str], Awaitable[Any]]
 
 
-def build_app(co: Coordinator) -> Starlette:
+def build_app(co: Controller) -> Starlette:
     def authed(handler: Handler) -> Callable[[Request], Awaitable[JSONResponse]]:
         async def wrapped(request: Request) -> JSONResponse:
             agent = co.agent_for(request.headers.get("authorization"))
@@ -370,7 +370,7 @@ def build_app(co: Coordinator) -> Starlette:
         return {"ok": True}
 
     async def metrics(_: Request) -> Response:
-        return PlainTextResponse(coordinator_metrics(co), media_type=CONTENT_TYPE)
+        return PlainTextResponse(controller_metrics(co), media_type=CONTENT_TYPE)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
@@ -409,7 +409,7 @@ def build_app(co: Coordinator) -> Starlette:
 UiHandler = Callable[[Request, str], Awaitable[Any]]
 
 
-def _ui_routes(co: Coordinator) -> list[Route]:
+def _ui_routes(co: Controller) -> list[Route]:
     header = co.cfg.ui.user_header
 
     def user_of(request: Request) -> str | None:
@@ -438,7 +438,7 @@ def _ui_routes(co: Coordinator) -> list[Route]:
 
     page = resources.files("ferryman").joinpath("ui.html").read_text()
     # Open tabs compare this with the one they loaded and reload when the
-    # coordinator starts serving a different page (an upgrade).
+    # controller starts serving a different page (an upgrade).
     page_id = hashlib.sha256(page.encode()).hexdigest()[:16]
 
     async def index(request: Request) -> Response:
@@ -498,8 +498,8 @@ def _ui_routes(co: Coordinator) -> list[Route]:
     ]
 
 
-def run(cfg: CoordinatorConfig) -> None:
-    co = Coordinator(cfg)
+def run(cfg: ControllerConfig) -> None:
+    co = Controller(cfg)
     for name, p in co.pools.items():
         for key in p.cfg.keys:
             try:

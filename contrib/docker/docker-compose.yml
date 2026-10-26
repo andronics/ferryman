@@ -1,7 +1,7 @@
-# ferryman - agent (and optionally the coordinator) under Docker
+# ferryman - agent (and optionally the controller) under Docker
 #
 #   docker compose up -d                          # the agent
-#   docker compose --profile coordinator up -d    # plus the coordinator
+#   docker compose --profile controller up -d     # plus the controller
 #   docker exec ferryman ferryman status          # the CLI, inside the container
 #
 # The agent needs what it needs under systemd: root, /dev/fuse, and the
@@ -73,33 +73,33 @@ services:
       retries: 3
       start_period: 30s
 
-  # Optional: the coordinator. Shares key pools between hosts and serves the
+  # Optional: the controller. Shares key pools between hosts and serves the
   # web UI. Runs as PUID:PGID, not root. Its config must listen on 0.0.0.0
   # (listen: {host: 0.0.0.0, port: 8470}) to be reachable through the port
   # below; put Traefik in front for TLS.
-  coordinator:
+  controller:
     image: ghcr.io/andronics/ferryman:latest
-    container_name: ferryman-coordinator
+    container_name: ferryman-controller
     restart: unless-stopped
-    profiles: ["coordinator"]
-    command: ["coordinator"]
+    profiles: ["controller"]
+    command: ["controller"]
 
     ports:
-      - "127.0.0.1:8470:8470"   # coordinator HTTP (UI, agent API)
+      - "127.0.0.1:8470:8470"   # controller HTTP (UI, agent API)
 
     volumes:
-      # coordinator.yaml and the pool keys (readable by PUID:PGID)
+      # controller.yaml and the pool keys (readable by PUID:PGID)
       - /etc/ferryman:/etc/ferryman:ro
       # The config's default `state:`; given to PUID:PGID at start
-      - ./coordinator-state:/var/lib/ferryman-coordinator
+      - ./controller-state:/var/lib/ferryman-controller
 
     environment:
       PUID: "1000"
       PGID: "1000"
       TZ: "Europe/London"
-      # If coordinator.yaml sets another `state:`, name it here too so its
+      # If controller.yaml sets another `state:`, name it here too so its
       # ownership is fixed at start:
-      # FERRYMAN_COORDINATOR_STATE: /var/lib/ferryman-coordinator
+      # FERRYMAN_CONTROLLER_STATE: /var/lib/ferryman-controller
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8470/healthz')"]

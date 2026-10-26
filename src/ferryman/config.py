@@ -171,7 +171,7 @@ class Tuning(_Model):
     # and re-tune on drift. (`ferryman tune --apply` applies one either way.)
     apply: Literal["suggest", "auto"] = "suggest"
     schedule: str | None = None  # cron for a re-tune; skipped while the link is busy
-    # Hosts behind the same uplink share a name here; with a coordinator, only
+    # Hosts behind the same uplink share a name here; with a controller, only
     # one of them tunes at a time, or each would measure the others' probes.
     uplink: str | None = None
     # Drift: drift_runs qualifying transfer runs in a row below drift x the
@@ -209,7 +209,7 @@ class Tuning(_Model):
 
 
 class Probe(_Model):
-    """Coordinator pools: test each exhausted key every `interval` with a
+    """Controller pools: test each exhausted key every `interval` with a
     small upload, and return it to the pool as soon as one succeeds, rather
     than waiting out the whole quota_window (the cap is reported to roll, so
     a key can upload again well before then). The quota_window still frees
@@ -228,19 +228,19 @@ class Probe(_Model):
 
 class Pool(_Model):
     # A local pool names its keys by client_email; each is <keys_dir>/<key>.json.
-    # A coordinator pool (`coordinator: true`) has neither: the coordinator
+    # A controller pool (`controller: true`) has neither: the controller
     # owns the keys and the rotation state, and agents lease from it.
-    coordinator: bool = False
+    controller: bool = False
     keys_dir: Path | None = None
     keys: list[str] = Field(default_factory=list)
     quota_window: int = 86400
-    probe: Probe | None = None  # the coordinator's pools only
+    probe: Probe | None = None  # the controller's pools only
 
     @model_validator(mode="after")
     def _shape(self) -> Pool:
-        if self.coordinator:
+        if self.controller:
             if self.keys or self.keys_dir:
-                raise ValueError("a coordinator pool has no keys or keys_dir of its own")
+                raise ValueError("a controller pool has no keys or keys_dir of its own")
             return self
         if not self.keys or self.keys_dir is None:
             raise ValueError("a local pool needs keys_dir and at least one key")
@@ -249,11 +249,11 @@ class Pool(_Model):
         return self
 
 
-class CoordinatorRef(_Model):
+class ControllerRef(_Model):
     url: str  # e.g. https://ferryman.andronics.io (TLS terminated by Traefik)
     token_file: Path
     agent: str | None = None  # informational; the token identifies the agent
-    # How often the agent reports its status (for the coordinator's UI and
+    # How often the agent reports its status (for the controller's UI and
     # metrics), and whether it takes commands (restart, run) from that UI.
     report_interval: float = 15.0
     commands: bool = True
@@ -526,7 +526,7 @@ class Config(_Model):
     # What `{hostname}` expands to. Default: $FERRYMAN_HOSTNAME, else the
     # host's name (in a pod, set the env from the node name).
     hostname: str | None = None
-    coordinator: CoordinatorRef | None = None
+    controller: ControllerRef | None = None
     paths: Paths = Paths()
     api: Api = Api()
     rclone: Rclone = Rclone()
@@ -545,6 +545,12 @@ class Config(_Model):
         leave a bare 'extra inputs are not permitted'."""
         if not isinstance(data, dict):
             return data
+        if "coordinator" in data:
+            raise ValueError("coordinator was renamed in 0.3: it is `controller` now")
+        for name, p in (data.get("pools") or {}).items():
+            if isinstance(p, dict) and "coordinator" in p:
+                raise ValueError(f"pool {name}: coordinator was renamed in 0.3: it is "
+                                 "`controller` now")  # fmt: skip
         if "roots" in data:
             raise ValueError(
                 "roots was removed in 0.2: give each unit `mounts: [{path: "
@@ -574,13 +580,13 @@ class Config(_Model):
                     raise ValueError(f"invalid {kind} name: {name!r}")
         for name, pool in self.pools.items():
             if pool.probe is not None:
-                raise ValueError(f"pool {name}: probe is a coordinator setting (its pools "
+                raise ValueError(f"pool {name}: probe is a controller setting (its pools "
                                  "probe their exhausted keys)")  # fmt: skip
-        if self.coordinator is None:
+        if self.controller is None:
             for name, pool in self.pools.items():
-                if pool.coordinator:
-                    raise ValueError(f"pool {name} is served by the coordinator, but no "
-                                     "coordinator is configured")  # fmt: skip
+                if pool.controller:
+                    raise ValueError(f"pool {name} is served by the controller, but no "
+                                     "controller is configured")  # fmt: skip
         for name, unit in self.units.items():
             if unit.pool and unit.pool not in self.pools:
                 raise ValueError(f"unit {name}: unknown pool {unit.pool!r}")
@@ -699,7 +705,7 @@ class Layout:
         return ph.expand(self.cfg.transfers[name].dest, self._placeholders(name), now)
 
     def claim_dest(self, name: str) -> str:
-        """What a coordinator claim covers: the part of the dest that is the
+        """What a controller claim covers: the part of the dest that is the
         same on every run (all of it, unless it has time placeholders)."""
         return ph.fixed_prefix(self.cfg.transfers[name].dest, self._placeholders(name))
 
@@ -772,7 +778,7 @@ class Layout:
         return None
 
     def leased_keys(self, pool: str) -> Path:
-        # Keys leased from the coordinator, on the runtime (tmpfs) dir only.
+        # Keys leased from the controller, on the runtime (tmpfs) dir only.
         return self.cfg.paths.runtime / "keys" / pool
 
     @property
@@ -807,7 +813,7 @@ def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]
     )
 
 
-# ---------------------------------------------------------------- coordinator
+# ---------------------------------------------------------------- controller
 
 
 class AgentEntry(_Model):
@@ -822,24 +828,24 @@ class Ui(_Model):
     # Header the auth proxy sets to the signed-in user. When set, requests
     # without it are refused, and actions are logged with the user. It is
     # only as trustworthy as the network path: nothing but the proxy must be
-    # able to reach the coordinator's port.
+    # able to reach the controller's port.
     user_header: str | None = "X-authentik-username"
 
 
-class CoordinatorConfig(_Model):
+class ControllerConfig(_Model):
     listen: Listen = Listen()
     ui: Ui = Ui()
     rclone: Rclone = Rclone()  # runs key probes (pools with `probe:`)
-    state: Path = Path("/var/lib/ferryman-coordinator")
+    state: Path = Path("/var/lib/ferryman-controller")
     watch_timeout: float = 30.0
     pools: dict[str, Pool] = Field(default_factory=dict)
     agents: dict[str, AgentEntry] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _references(self) -> CoordinatorConfig:
+    def _references(self) -> ControllerConfig:
         for name, pool in self.pools.items():
-            if pool.coordinator:
-                raise ValueError(f"pool {name}: the coordinator serves local pools only")
+            if pool.controller:
+                raise ValueError(f"pool {name}: the controller serves local pools only")
         hashes: set[str] = set()
         for name, agent in self.agents.items():
             if not _NAME.match(name):
@@ -853,7 +859,7 @@ class CoordinatorConfig(_Model):
         return self
 
     @classmethod
-    def load(cls, path: Path) -> CoordinatorConfig:
+    def load(cls, path: Path) -> ControllerConfig:
         with path.open() as f:
             data = yaml.safe_load(f) or {}
         return cls.model_validate(data)

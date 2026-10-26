@@ -8,8 +8,8 @@ single-key pool never rotates.
 
 State is per pool, not per unit: the quota is per account across every drive
 it touches, so once one consumer exhausts it, all of them move. A pool is
-either local (state in a file on this host) or served by the coordinator
-(state shared by every agent leasing from it; see coordinator_pool.py). Every
+either local (state in a file on this host) or served by the controller
+(state shared by every agent leasing from it; see controller_pool.py). Every
 rotation bumps the pool's epoch, which is how watchers notice it.
 """
 

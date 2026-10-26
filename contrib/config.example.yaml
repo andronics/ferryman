@@ -81,14 +81,14 @@ tuning:
   transfers: [1, 2, 4, 8, 12, 16] # ascending, starting at 1
   apply: suggest                  # suggest: record only; auto: apply non-noisy results, re-tune on drift
   schedule: null                  # cron for re-tunes, e.g. "0 4 * * 0"
-  uplink: null                    # hosts sharing an uplink take turns (needs the coordinator)
+  uplink: null                    # hosts sharing an uplink take turns (needs the controller)
   drift: 0.6                      # drift_runs large transfer runs in a row below this
   drift_runs: 3                   #   fraction of the profile's rate raise tune.drift
 
-# A coordinator shares key pools between hosts and serves the web UI. Off
-# unless set; with it, pools may say `coordinator: true`.
-coordinator: null
-# coordinator:
+# A controller shares key pools between hosts and serves the web UI. Off
+# unless set; with it, pools may say `controller: true`.
+controller: null
+# controller:
 #   url: https://ferryman.example.org
 #   token_file: /etc/ferryman/token     # from `ferryman token`
 #   agent: pve-01                       # informational; the token identifies the agent
@@ -101,15 +101,15 @@ coordinator: null
 # A local pool names each key by client_email: <keys_dir>/<key>.json.
 pools:
   uploads:
-    coordinator: false            # true: the coordinator owns the keys (then no keys/keys_dir)
+    controller: false            # true: the controller owns the keys (then no keys/keys_dir)
     keys_dir: /etc/ferryman/keys
     keys:
       - sa-01@my-project.iam.gserviceaccount.com
       - sa-02@my-project.iam.gserviceaccount.com
       - sa-03@my-project.iam.gserviceaccount.com
     quota_window: 86400           # seconds an exhausted key sits out
-  # A pool the coordinator owns (no keys here; needs `coordinator:` above):
-  # shared: {coordinator: true}
+  # A pool the controller owns (no keys here; needs `controller:` above):
+  # shared: {controller: true}
 
 # One rclone process per unit. Names: letters, digits, _ . - (not leading).
 # Mount paths are absolute; ferryman creates the last directory only, so the
