@@ -51,7 +51,7 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from .alerts import Alerts
+from .alerts import Alerts, describe_action
 from .config import ControllerConfig, parse_size
 from .events import EventStore
 from .metrics import CONTENT_TYPE, controller_metrics
@@ -97,7 +97,10 @@ class Controller:
         self._apply(cfg)
         self.events = EventStore(cfg.state, cfg.events.retention_days * 86400.0)
         # Only the controller notifies: its rules over every event.
-        self.alerts = Alerts(cfg.notify, cfg.state, bound=self.bound_to)
+        self.alerts = Alerts(cfg.notify, cfg.state, bound=self.bound_to,
+                             enabled=cfg.actions.enabled)  # fmt: skip
+        self.alerts.act = self.act
+        self.alerts.emit = self.events.emit
         self.events.listeners.append(self.alerts.on_event)
         self.started = time.time()
         # Problems the controller has raised and not yet seen end.
@@ -141,7 +144,7 @@ class Controller:
         Returns those agents."""
         before = {a: s["version"] for a, s in self._slices.items()}
         self._apply(cfg)
-        self.alerts.update(cfg.notify)
+        self.alerts.update(cfg.notify, cfg.actions.enabled)
         self.config_error = None
         changed = [a for a, s in self._slices.items() if before.get(a) != s["version"]]
         async with self._config_changed:
@@ -310,6 +313,53 @@ class Controller:
             self.events.emit("probe.recovered", pool.name, f"{key} can upload again", "info")
             self.check_pools()
         return r.result
+
+    # ---------------------------------------------------------------- actions
+
+    async def act(self, a: dict[str, Any]) -> None:
+        """Carry out a rule's due action: a command for its agent, or a
+        rotation here. Each is recorded as an event, and so is a target
+        that no longer exists (the config changed since it was planned)."""
+        rule, action = a["rule"], a["action"]
+        what = describe_action(action, a)
+
+        def failed(why: str) -> None:
+            self.events.emit("action.failed", rule, f"{what}: {why}", "error")
+
+        if action == "rotate":
+            name = a.get("pool")
+            if name is None:
+                spec = self.cfg.agents.get(a.get("agent") or "")
+                t = spec.transfers.get(a.get("via") or "") if spec else None
+                name = self.cfg.units[t.unit].pool if t else None
+            if name not in self.pools:
+                failed(f"no pool {name!r}")
+                return
+            try:
+                lease = await self.exhausted(f"rule:{rule}", self.pools[name], None)
+            except PoolError as e:
+                failed(str(e))
+                return
+            self.events.emit("action.taken", rule, f"{what}: now on {lease['key']}", "info")
+            return
+        agent = a.get("agent")
+        spec = self.cfg.agents.get(agent or "")
+        if agent is None or spec is None:
+            failed(f"no agent {agent!r}")
+            return
+        if action == "restart":
+            if a["unit"] not in spec.units:
+                failed(f"unit {a['unit']} isn't bound on {agent}")
+                return
+            cmd = await self.queue(agent, "restart", a["unit"], "", rule=rule)
+        elif action in ("retry", "run"):
+            if a["transfer"] not in spec.transfers:
+                failed(f"no transfer {a['transfer']} on {agent}")
+                return
+            cmd = await self.queue(agent, "run", a["transfer"], "", rule=rule)
+        else:  # tune
+            cmd = await self.queue(agent, "tune", "drive", "", rule=rule, apply=None)
+        self.events.emit("action.taken", rule, f"{what} (command {cmd['id']})", "info")
 
     # ---------------------------------------------------- the controller's own
 
@@ -543,6 +593,7 @@ def build_app(co: Controller) -> Starlette:
             asyncio.create_task(co.config_loop()),
             asyncio.create_task(co.watch_loop()),
             asyncio.create_task(co.alerts.run()),
+            asyncio.create_task(co.alerts.run_actions()),
         ]
         loop = asyncio.get_running_loop()
 
