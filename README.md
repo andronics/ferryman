@@ -66,7 +66,7 @@ ln -s /opt/ferryman/bin/ferryman /usr/local/bin/ferryman
 
 ### Run it
 
-Write `/etc/ferryman/config.yaml` (the example above, with your drive ids and keys), then:
+Write `/etc/ferryman/config.yaml`: the example above with your drive ids and keys, or start from [`contrib/config.example.yaml`](contrib/config.example.yaml), which lists every setting with its default. Then:
 
 ```bash
 ferryman verify                                    # offline: config, key files, rclone
