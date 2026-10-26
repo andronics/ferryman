@@ -144,12 +144,13 @@ async def test_the_agent_tracks_the_controllers_version(
     # The controller is back, on the same version: confirmed.
     agent.on_slice({"version": start.slice["version"]})
     assert agent.config_state["state"] == "applied"
-    # A newer one that runs here: pending (until live apply).
+    # A newer one that runs here: applied in place, and cached.
     newer = Controller(controller_config(tmp_path, uid=1001)).cfg.slice("site-a")
     agent.on_slice(newer)
-    assert agent.config_state["state"] == "pending"
-    assert agent.config_state["offered"] == newer["version"]
-    # One that doesn't: rejected, with why.
+    assert agent.config_state == {"version": newer["version"], "state": "applied", "error": None}
+    assert agent.units["backups"].unit.uid == 1001
+    assert load_cached(boot) == newer
+    # One that doesn't: rejected, with why; the applied one stays in force.
     bad = Controller(controller_config(
         tmp_path, mounts=[{"path": str(boot.paths.state / "x")}])).cfg.slice("site-a")  # fmt: skip
     agent.on_slice(bad)
@@ -157,10 +158,11 @@ async def test_the_agent_tracks_the_controllers_version(
         agent.config_state["state"] == "rejected"
         and "ferryman's own" in agent.config_state["error"]
     )
+    assert agent.config_state["version"] == newer["version"] and load_cached(boot) == newer
     assert (await agent.report())["config"]["state"] == "rejected"
 
 
-async def test_a_pending_version_is_waited_on_not_spun_on(
+async def test_a_rejected_version_is_waited_on_not_spun_on(
     boot: AgentBootstrap, tmp_path: Path, co: Controller
 ) -> None:
     import asyncio
@@ -168,12 +170,13 @@ async def test_a_pending_version_is_waited_on_not_spun_on(
     switch = Switch(httpx.ASGITransport(app=build_app(co)))
     start = await start_config(boot, client(switch))
     agent = Agent(start.cfg, controller_transport=switch, bootstrap=boot, start=start)
-    await co.reload(controller_config(tmp_path, uid=1001))  # newer, not applied
+    # A newer version this host refuses (a mount inside its state dir).
+    await co.reload(controller_config(tmp_path, mounts=[{"path": str(boot.paths.state / "m")}]))
     switch.calls = 0
     task = asyncio.create_task(agent._config_loop())
     await asyncio.sleep(0.5)  # watch_timeout is 0.3s: a couple of long polls at most
     task.cancel()
-    assert agent.config_state["state"] == "pending"
+    assert agent.config_state["state"] == "rejected"
     assert switch.calls <= 4
 
 

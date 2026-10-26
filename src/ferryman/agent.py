@@ -12,8 +12,8 @@ from typing import Any
 import httpx
 
 from . import __version__, mountutil, patterns, sdnotify
-from .bootstrap import Rejected, Start, build, fetch
-from .config import AgentBootstrap, Config, Layout
+from .bootstrap import Rejected, Start, build, fetch, save_cached
+from .config import AgentBootstrap, Config, Layout, unit_spec
 from .controller_pool import ControllerClient, ControllerPool
 from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
@@ -38,10 +38,11 @@ class Agent:
         # directly, as tests do; nothing then follows the controller's).
         self.bootstrap = bootstrap
         self.slice = start.slice if start else None
-        # What the controller sees of it: the version running, and whether
-        # it is the controller's latest (applied), a cached one the
-        # controller hasn't confirmed (cached), or behind a newer one
-        # (pending, or rejected with the error).
+        # What the controller sees of it: the version in force, and whether
+        # it is fully applied, a cached one the controller hasn't confirmed
+        # (cached), partly applied while running transfers finish (pending,
+        # with what waits), or behind a newer one this host refused
+        # (rejected, with why).
         self.config_state: dict[str, Any] = {
             "version": self.slice.get("version") if self.slice else None,
             "state": "cached" if start and start.source == "cache" else "applied",
@@ -59,28 +60,36 @@ class Agent:
             if cfg.controller
             else None
         )
-        self.pools: dict[str, Pool] = {}
-        for name, p in cfg.pools.items():
-            if p.controller:
-                assert self.controller is not None
-                self.pools[name] = ControllerPool(
-                    name, self.controller, self.layout.leased_keys(name)
-                )
-            else:
-                self.pools[name] = LocalPool(name, p, self.layout.pool_state(name))
-        self.units = {
-            name: UnitSupervisor(name, cfg, self.layout, self.pools.get(u.pool or ""))
-            for name, u in cfg.units.items()
-        }
-        for sup in self.units.values():
-            sup.emit = self.notifier.emit
-        for pool in self.pools.values():
-            if isinstance(pool, ControllerPool):
-                pool.emit = self.notifier.emit
+        self.pools: dict[str, Pool] = {name: self._pool(name) for name in cfg.pools}
+        self.units = {name: self._supervisor(name) for name in cfg.units}
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
         self.tuner = Tuner(self)
         self._tasks: set[asyncio.Task[Any]] = set()
         self._stopping = asyncio.Event()
+        self._started = False
+        # Per-name tasks a new config may cancel or replace.
+        self._watches: dict[str, asyncio.Task[Any]] = {}
+        self._schedules: dict[str, asyncio.Task[Any]] = {}
+        self._tune_schedule: asyncio.Task[Any] | None = None
+        self._tune_schedule_for: str | None = None
+        # Units being stopped or swapped for a new config's; awaited at
+        # shutdown, never cancelled (a unit must unmount cleanly).
+        self._settling: set[asyncio.Task[Any]] = set()
+
+    def _pool(self, name: str) -> Pool:
+        p = self.cfg.pools[name]
+        if p.controller:
+            assert self.controller is not None
+            pool = ControllerPool(name, self.controller, self.layout.leased_keys(name))
+            pool.emit = self.notifier.emit
+            return pool
+        return LocalPool(name, p, self.layout.pool_state(name))
+
+    def _supervisor(self, name: str) -> UnitSupervisor:
+        u = self.cfg.units[name]
+        sup = UnitSupervisor(name, self.cfg, self.layout, self.pools.get(u.pool or ""))
+        sup.emit = self.notifier.emit
+        return sup
 
     # -------------------------------------------------------------- lifecycle
 
@@ -99,24 +108,34 @@ class Agent:
         self._track(task)
         return task
 
+    def _watch(self, name: str) -> None:
+        pool = self.pools[name]
+        if isinstance(pool, ControllerPool):
+            self._watches[name] = self.spawn(pool.watch(self.apply), f"watch:{name}")
+
+    def _schedule(self, name: str) -> None:
+        tr = self.transfers[name]
+        if tr.t.schedule:
+            self._schedules[name] = self.spawn(tr.schedule(), f"schedule:{name}")
+
     async def start(self) -> None:
+        self._started = True
         self.cfg.paths.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         for sup in self.units.values():
             sup.start()
-        for pool in self.pools.values():
-            if isinstance(pool, ControllerPool):
-                self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
+        for name in self.pools:
+            self._watch(name)
         if self.cfg.controller:
             self.spawn(self._report_loop(), "report")
             if self.bootstrap is not None and self.slice is not None:
                 self.spawn(self._config_loop(), "config")
             if self.cfg.controller.commands:
                 self.spawn(self._command_loop(), "commands")
-        for tr in self.transfers.values():
-            if tr.t.schedule:
-                self.spawn(tr.schedule(), f"schedule:{tr.name}")
+        for name in self.transfers:
+            self._schedule(name)
         if self.cfg.tuning.schedule:
-            self.spawn(self.tuner.schedule(), "tune-schedule")
+            self._tune_schedule = self.spawn(self.tuner.schedule(), "tune-schedule")
+            self._tune_schedule_for = self.cfg.tuning.schedule
         self.spawn(self._health_loop(), "health")
         if self.notifier.enabled:
             self.spawn(self.notifier.run(), "notify")
@@ -124,10 +143,12 @@ class Agent:
             self.spawn(self._watchdog(interval), "watchdog")
 
     async def stop(self) -> None:
+        self._stopping.set()
         # Transfers first (stopping their jobs), then the processes under them.
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*self._settling, return_exceptions=True)
         await asyncio.gather(*(sup.stop() for sup in self.units.values()))
         # Leased keys stay: the next start may need them if the controller
         # is away then.
@@ -229,8 +250,8 @@ class Agent:
             self.on_slice(slc)
 
     def on_slice(self, slc: dict[str, Any]) -> None:
-        """A slice from the controller: the one running (now confirmed), or a
-        newer one, checked here and, until live apply, left for a restart."""
+        """A slice from the controller: the one in force (now confirmed), or
+        a newer one, checked here, then applied in place."""
         if slc.get("version") == self.config_state["version"]:
             if self.config_state["state"] == "cached":
                 self.config_state.update(state="applied", error=None)
@@ -241,14 +262,126 @@ class Agent:
             return  # a long poll that timed out on a version we've seen
         assert self.bootstrap is not None
         try:
-            build(self.bootstrap, slc)
+            cfg = build(self.bootstrap, slc)
         except Rejected as e:
-            log.error("config version %s rejected: %s", slc.get("version"), e)
+            log.error("config version %s rejected, %s stays in force: %s",
+                      slc.get("version"), self.config_state["version"], e)  # fmt: skip
             self.config_state.update(state="rejected", error=str(e), offered=slc.get("version"))
             return
-        log.warning("config version %s is ready: restart the agent to apply it",
-                    slc.get("version"))  # fmt: skip
-        self.config_state.update(state="pending", error=None, offered=slc.get("version"))
+        save_cached(self.bootstrap, slc)
+        self.apply_config(cfg, slc)
+
+    # ---------------------------------------------------------- live apply
+
+    def apply_config(self, cfg: Config, slc: dict[str, Any]) -> None:
+        """Put a new config in force without a restart: only what changed is
+        touched, and nothing a running transfer uses changes under it."""
+        log.info("applying config version %s", slc.get("version"))
+        self.cfg, self.layout, self.slice = cfg, Layout(cfg), slc
+        self.config_state = {"version": slc.get("version"), "state": "applied", "error": None}
+        self.reconcile()
+
+    def _busy(self, unit: str) -> list[str]:
+        """Running transfers that use a unit."""
+        return [n for n, tr in self.transfers.items() if tr.running and tr.t.unit == unit]
+
+    def reconcile(self) -> None:
+        """Bring what runs in line with self.cfg, as far as it can now; what
+        must wait for a running transfer is listed as pending and done when
+        that transfer ends (on_transfer_done calls this again)."""
+        want, waits = self.cfg, []
+        for name in want.pools:
+            if name not in self.pools:
+                self.pools[name] = self._pool(name)
+                if self._started:
+                    self._watch(name)
+        # Units: new ones start, changed ones are swapped, removed ones stop.
+        for name, sup in list(self.units.items()):
+            if name in want.units:
+                same_pool = sup.pool is self.pools.get(want.units[name].pool or "")
+                if same_pool and unit_spec(sup.cfg, name) == unit_spec(want, name):
+                    sup.cfg, sup.layout = want, self.layout  # equal: just the newer copy
+                    continue
+            if busy := self._busy(name):
+                what = "restart" if name in want.units else "stop"
+                waits.append(f"{what} unit {name} after transfer {', '.join(busy)}")
+                continue
+            new = self._supervisor(name) if name in want.units else None
+            if new is None:
+                del self.units[name]
+            else:
+                self.units[name] = new
+            log.info("unit %s: %s for the new config", name, "restarting" if new else "stopping")
+            self._settle(sup, new)
+        for name in want.units:
+            if name not in self.units:
+                self.units[name] = self._supervisor(name)
+                log.info("unit %s: starting for the new config", name)
+                if self._started:
+                    self.units[name].start()
+        # Transfers: a changed or removed one finishes its run first.
+        for name, tr in list(self.transfers.items()):
+            new_t = want.transfers.get(name)
+            if new_t == tr.t:
+                continue
+            if tr.running:
+                what = "update" if new_t else "remove"
+                waits.append(f"{what} transfer {name} after its run")
+                continue
+            if task := self._schedules.pop(name, None):
+                task.cancel()
+            del self.transfers[name]
+            if new_t is not None:
+                self.transfers[name] = TransferRunner(name, self)
+                if self._started:
+                    self._schedule(name)
+        for name in want.transfers:
+            if name not in self.transfers:
+                self.transfers[name] = TransferRunner(name, self)
+                if self._started:
+                    self._schedule(name)
+        # Pools no unit uses any more.
+        for name in list(self.pools):
+            if name not in want.pools and not any(
+                s.pool is self.pools[name] for s in self.units.values()
+            ):
+                if task := self._watches.pop(name, None):
+                    task.cancel()
+                pool = self.pools.pop(name)
+                if isinstance(pool, ControllerPool):
+                    pool.discard()
+        if self._started and want.tuning.schedule != self._tune_schedule_for:
+            if self._tune_schedule is not None:
+                self._tune_schedule.cancel()
+                self._tune_schedule = None
+            if want.tuning.schedule:
+                self._tune_schedule = self.spawn(self.tuner.schedule(), "tune-schedule")
+            self._tune_schedule_for = want.tuning.schedule
+        if waits:
+            self.config_state.update(state="pending", pending=waits)
+            for w in waits:
+                log.info("config version %s: %s", self.config_state["version"], w)
+        else:
+            self.config_state.update(state="applied")
+            self.config_state.pop("pending", None)
+
+    def _settle(self, old: UnitSupervisor, new: UnitSupervisor | None) -> None:
+        """Stop a unit's process, then start its replacement (they share its
+        rc socket and mount paths, so never both at once)."""
+
+        async def go() -> None:
+            await old.stop()
+            if new is not None and self._started and not self._stopping.is_set():
+                new.start()
+
+        task = asyncio.create_task(go(), name=f"settle:{old.name}")
+        self._settling.add(task)
+        task.add_done_callback(self._settling.discard)
+
+    def on_transfer_done(self, name: str) -> None:
+        """A run ended: what a new config left waiting on it can go ahead."""
+        if self.config_state.get("pending") and not self._stopping.is_set():
+            self.reconcile()
 
     async def _report_loop(self) -> None:
         assert self.controller is not None and self.cfg.controller is not None
