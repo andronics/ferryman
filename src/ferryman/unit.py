@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import mountutil
-from .config import Config, Layout, Unit, resolved
+from .config import Config, Layout, Unit, read_settings, resolved
 from .notify import Emit, Event, discard
 from .rc import RcClient, RcError
 
@@ -133,11 +133,9 @@ class UnitSupervisor:
             return [self.cfg.rclone.binary, "rcd", *common]
 
         uid, gid, cache_max, _ = resolved(self.cfg, n)
-        # Read-ahead is deliberately small (default --buffer-size, no
-        # --vfs-read-ahead): library scanners open every video just to probe
-        # its header, and each open downloads the whole read-ahead window
-        # into the VFS cache. At 256M+256M that churned ~600G through a 64G
-        # cache in under three days.
+        read = {k: v["value"] for k, v in read_settings(self.cfg, n).items()}
+        # Read flags come from defaults and the unit (see UnitDefaults for why
+        # they are small).
         #
         # The dir cache is in memory only and --poll-interval keeps it
         # correct, so --dir-cache-time is long on purpose: expiry would just
@@ -151,12 +149,14 @@ class UnitSupervisor:
             "--rc",
             "--allow-non-empty",
             "--allow-other",
-            "--buffer-size", "16M",
+            "--buffer-size", read["buffer_size"],
             "--default-permissions",
             "--dir-cache-time", "1000h",
             "--poll-interval", "15s",
             "--umask", "002",
-            "--vfs-cache-mode", "full",
+            "--vfs-cache-mode", read["vfs_cache_mode"],
+            "--vfs-read-chunk-size", read["vfs_read_chunk_size"],
+            "--vfs-read-ahead", read["vfs_read_ahead"],
             "--vfs-cache-max-age", "336h",
             "--vfs-cache-max-size", cache_max,
             "--vfs-cache-poll-interval", "5m",
@@ -238,6 +238,7 @@ class UnitSupervisor:
             "restarts": self.restarts,
             "last_error": self.last_error,
             "warm": self.warm,
+            "read": read_settings(self.cfg, self.name) if self.unit.mount else None,
         }
 
     def _set(self, state: State) -> None:
