@@ -20,6 +20,7 @@ use_trash = false fails with a 404 for service accounts on shared drives).
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -27,12 +28,15 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from croniter import croniter
+
 from .config import Tuning, parse_size
 from .notify import Event
-from .pool import is_quota_error
+from .pool import PoolError, is_quota_error
 from .rc import RcClient, RcError
 from .transfer import iec
 
@@ -55,6 +59,12 @@ PURGE_TIMEOUT = 120.0
 # workstation; eight filled its uplink.
 DEFAULT_TRANSFERS = 8
 DEFAULT_CHUNK = "128M"
+# A transfer run says something about the link only if it moved this much,
+# in files of at least DRIFT_FILE_CHUNKS chunks: small files are bound by
+# API round trips, not bandwidth.
+DRIFT_MIN_BYTES = 1 << 30
+DRIFT_FILE_CHUNKS = 4
+IDLE_POLL = 300.0  # how often a queued re-tune checks for an idle link
 # A probe process past 2 x max_memory plus this aborts the tune: chunk
 # buffers are the only thing that should grow with the settings.
 RSS_SLACK = 512 << 20
@@ -299,6 +309,12 @@ class Tuner:
         self.last: dict[str, Any] | None = None
         self.progress: str | None = None
         self.sample_interval = 1.0
+        self.idle_poll = IDLE_POLL
+        self.next_run: float | None = None
+        # Qualifying transfer runs' rates over the profile's, newest last.
+        self.recent: collections.deque[float] = collections.deque(maxlen=self.cfg.drift_runs)
+        self.drifting = False
+        self._retune: asyncio.Task[None] | None = None
         if self.active:
             for sup in self._tunable():
                 sup.tuned_chunk = self.active.chunk_size
@@ -318,6 +334,10 @@ class Tuner:
             "profile": asdict(self.profile) if self.profile else None,
             "active": asdict(self.active) if self.active else None,
             "last": self.last,
+            "next_run": self.next_run,
+            "drifting": self.drifting,
+            "recent": list(self.recent),
+            "retune_queued": self._retune is not None and not self._retune.done(),
             "units": {s.name: self.unit_settings(s.name) for s in self.agent.units.values()
                       if s.unit.backend == BACKEND},
             "transfers": {n: self.transfer_settings(n) for n in self.agent.transfers},
@@ -441,6 +461,15 @@ class Tuner:
         emit = self.agent.notifier.emit
         async with self.lock:
             started = time.time()
+            try:
+                await self._lock_uplink(plan["max_seconds"])
+            except TuneError as e:
+                self.last = {"ok": False, "error": str(e), "started": started,
+                             "finished": time.time()}  # fmt: skip
+                log.warning("tune not started: %s", e)
+                if isinstance(e, TuneBusy):
+                    raise  # a queued re-tune keeps waiting
+                return self.last
             log.info("tune: probing via unit %s on %s", sup.name, sup.key)
             try:
                 profile = await self._tune(sup)
@@ -456,8 +485,10 @@ class Tuner:
                 return self.last
             finally:
                 self.progress = None
+                await self._unlock_uplink()
             profile.save(self.agent.layout.tune_profile(BACKEND))
             self.profile = profile
+            self.recent.clear()
             self.last = {"ok": True, "started": started, "finished": time.time()}
             summary = describe(profile)
             log.info("tune: %s", summary)
@@ -468,6 +499,102 @@ class Tuner:
                 log.warning("tune: not applying a noisy profile; re-run, or apply by hand")
         applied = await self.apply() if apply else []
         return {"ok": True, "profile": asdict(profile), "applied": applied}
+
+    # ------------------------------------------------- drift and schedule
+
+    def observe(self, transfer: str, result: dict[str, Any]) -> None:
+        """Compare a finished transfer run's rate with the profile in effect
+        (else the latest); enough slow runs in a row mean the link changed."""
+        ref = self.active or self.profile
+        t = self.agent.cfg.transfers[transfer]
+        if ref is None or self.agent.cfg.units[t.unit].backend != BACKEND:
+            return
+        size, files = int(result.get("bytes", 0)), int(result.get("files", 0))
+        secs = float(result.get("transfer_time") or 0)
+        chunk = parse_size(self.unit_settings(t.unit)["chunk_size"])
+        if size < DRIFT_MIN_BYTES or not files or secs <= 0:
+            return
+        if size / files < DRIFT_FILE_CHUNKS * chunk:
+            return
+        ratio = size / secs / ref.rate
+        self.recent.append(ratio)
+        emit = self.agent.notifier.emit
+        if ratio >= self.cfg.drift:
+            if self.drifting:
+                self.drifting = False
+                emit(Event("tune.recovered", BACKEND, f"transfer {transfer} ran at "
+                           f"{iec(size / secs)}/s, {ratio:.0%} of the profile", "info",
+                           resolves=True))  # fmt: skip
+            return
+        if self.drifting or len(self.recent) < self.cfg.drift_runs:
+            return
+        if all(r < self.cfg.drift for r in self.recent):
+            self.drifting = True
+            msg = (f"the last {len(self.recent)} transfer runs reached "
+                   f"{', '.join(f'{r:.0%}' for r in self.recent)} of the profile's "
+                   f"{iec(ref.rate)}/s")  # fmt: skip
+            log.warning("tune: drift: %s", msg)
+            emit(Event("tune.drift", BACKEND, msg, "warning"))
+            if self.cfg.apply == "auto":
+                self.queue_retune()
+
+    def queue_retune(self) -> None:
+        """Re-tune once nothing else is using the link."""
+        if self._retune is None or self._retune.done():
+            self._retune = self.agent.spawn(self._retune_when_idle(), "retune")
+
+    async def _retune_when_idle(self) -> None:
+        while True:
+            await asyncio.sleep(self.idle_poll)
+            try:
+                await self.run()
+                return
+            except TuneBusy as e:
+                log.debug("re-tune waiting: %s", e)
+            except TuneError as e:
+                log.warning("re-tune dropped: %s", e)
+                return
+
+    async def schedule(self) -> None:
+        if not self.cfg.schedule:
+            return
+        it = croniter(self.cfg.schedule, datetime.now().astimezone())
+        while True:
+            self.next_run = it.get_next(float)
+            await asyncio.sleep(max(0.0, self.next_run - time.time()))
+            try:
+                await self.run()
+            except TuneError as e:
+                log.info("scheduled tune skipped: %s", e)
+
+    # ---------------------------------------------------------- uplink lock
+
+    @property
+    def _uplink_path(self) -> str | None:
+        if self.cfg.uplink and self.agent.coordinator is not None:
+            return f"/v1/tune-lock/{self.cfg.uplink}"
+        return None
+
+    async def _lock_uplink(self, seconds: float) -> None:
+        """Hold the coordinator's lock on this host's uplink for the tune."""
+        if (path := self._uplink_path) is None:
+            return
+        assert self.agent.coordinator is not None
+        try:
+            r = await self.agent.coordinator.request("POST", path, json={"ttl": seconds + 300})
+        except PoolError as e:
+            raise TuneError(f"cannot take the uplink {self.cfg.uplink} lock: {e}") from e
+        if not r["granted"]:
+            raise TuneBusy(f"{r['holder']} is tuning on uplink {self.cfg.uplink}")
+
+    async def _unlock_uplink(self) -> None:
+        if (path := self._uplink_path) is None:
+            return
+        assert self.agent.coordinator is not None
+        try:
+            await self.agent.coordinator.request("DELETE", path)
+        except PoolError as e:
+            log.warning("tune: could not release the uplink lock (it expires): %s", e)
 
     # ------------------------------------------------------------ internals
 

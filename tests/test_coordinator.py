@@ -421,3 +421,67 @@ async def test_coordinator_metrics(
     text = (await raw(transport, "GET", "/metrics")).text
     assert f'ferryman_pool_current_key{{pool="main",key="{A}"}} 1.0' in text
     assert 'ferryman_agent_last_report_timestamp_seconds{agent="site-b"}' not in text
+
+
+# ------------------------------------------------------------------ tuning
+
+
+async def test_tune_lock_one_agent_per_uplink(
+    transport: httpx.ASGITransport, coordinator: Coordinator
+) -> None:
+    a, b = client(transport, "site-a"), client(transport, "site-b")
+    assert (await a.request("POST", "/v1/tune-lock/home", json={"ttl": 600}))["granted"]
+    r = await b.request("POST", "/v1/tune-lock/home", json={"ttl": 600})
+    assert r == {"granted": False, "holder": "site-a", "until": r["until"]}
+    assert (await b.request("POST", "/v1/tune-lock/office", json={"ttl": 600}))["granted"]
+    await b.request("DELETE", "/v1/tune-lock/home")  # not b's to release
+    assert not (await b.request("POST", "/v1/tune-lock/home"))["granted"]
+    await a.request("DELETE", "/v1/tune-lock/home")
+    assert (await b.request("POST", "/v1/tune-lock/home"))["granted"]
+    # A holder that never releases loses the lock when it expires.
+    coordinator.tune_locks["home"]["until"] = 0
+    assert (await a.request("POST", "/v1/tune-lock/home"))["granted"]
+    assert set(coordinator.state()["tune_locks"]) == {"home", "office"}
+
+
+async def test_tuner_waits_for_the_uplink_lock(
+    agent: Agent, transport: httpx.ASGITransport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ferryman.config import Tuning
+    from ferryman.tuning import TuneBusy
+
+    agent.cfg = agent.cfg.model_copy(update={"tuning": Tuning(uplink="home")})
+    agent.coordinator = client(transport, "site-a")
+    await client(transport, "site-b").request("POST", "/v1/tune-lock/home")
+    tuned: list[str] = []
+
+    async def fake_tune(sup: Any) -> Any:
+        tuned.append(sup.name)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(agent.tuner, "_tune", fake_tune)
+    with pytest.raises(TuneBusy, match="site-b is tuning on uplink home"):
+        await agent.tuner.run()
+    assert tuned == []
+    await client(transport, "site-b").request("DELETE", "/v1/tune-lock/home")
+    with pytest.raises(RuntimeError):
+        await agent.tuner.run()
+    assert tuned == ["media-tv"]
+    # Released even though the tune blew up.
+    assert (await client(transport, "site-b").request("POST", "/v1/tune-lock/home"))["granted"]
+
+
+async def test_ui_tune_button_queues_a_command(
+    ui_transport: httpx.ASGITransport, tmp_path: Path
+) -> None:
+    assert (await ui(ui_transport, "POST", "/ui/api/agents/site-a/tune")).status_code == 404
+    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=ui_transport)
+    assert agent.coordinator
+    await agent.coordinator.request("PUT", "/v1/report", json=await agent.report())
+    r = await ui(ui_transport, "POST", "/ui/api/agents/site-a/tune")
+    assert r.status_code == 200
+    assert (r.json()["action"], r.json()["target"]) == ("tune", "drive")
+    # The agent refuses a tune it cannot run, and says why.
+    result = await agent.execute({"id": 1, "action": "tune", "target": "drive", "args": {}})
+    assert result == {"ok": False, "error": "no ready drive unit to borrow a drive and key from"}
+    await agent.stop()

@@ -4,8 +4,10 @@ the fake rclone, and the tuner's guards and profile."""
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -389,3 +391,100 @@ async def test_tune_metrics(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> No
     assert 'ferryman_tune_transfers{backend="drive",profile="latest"} 6.0' in text
     assert 'ferryman_tune_limit{limit="path",backend="drive",profile="active"} 1.0' in text
     assert 'ferryman_tune_running{backend="drive"} 0.0' in text
+
+
+# ------------------------------------------------- phase 3: drift, schedule
+
+G = 1 << 30
+
+
+def run_at(rate: float, size: int = 4 * G, files: int = 8) -> dict[str, object]:
+    return {"ok": True, "bytes": size, "files": files, "transfer_time": size / rate}
+
+
+async def test_drift_needs_consecutive_slow_large_runs(
+    agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tune_to(agent, monkeypatch)
+    await agent.tuner.run(apply=True)  # rate 150M/s
+    obs = agent.tuner.observe
+    obs("media-tv", run_at(50 * M))
+    obs("media-tv", run_at(50 * M, size=200 * M))  # too small to count
+    obs("media-tv", run_at(50 * M, files=400))  # 10M files: API-bound, not counted
+    obs("media-tv", run_at(140 * M))  # back to normal: the streak breaks
+    obs("media-tv", run_at(50 * M))
+    obs("media-tv", run_at(60 * M))
+    assert not agent.tuner.drifting
+    obs("media-tv", run_at(70 * M))
+    assert agent.tuner.drifting
+    events = [e for e in agent.notifier.recent(20) if e["kind"].startswith("tune.")]
+    assert events[-1]["kind"] == "tune.drift" and "33%, 40%, 47%" in events[-1]["message"]
+    obs("media-tv", run_at(50 * M))  # still slow: no second alert
+    assert sum(e["kind"] == "tune.drift" for e in agent.notifier.recent(20)) == 1
+    obs("media-tv", run_at(120 * M))
+    assert not agent.tuner.drifting
+    assert agent.notifier.recent(1)[-1]["kind"] == "tune.recovered"
+
+
+async def test_drift_with_auto_retunes_once_idle(
+    agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent.cfg = agent.cfg.model_copy(update={"tuning": Tuning(apply="auto", drift_runs=1)})
+    tune_to(agent, monkeypatch)
+    await agent.tuner.run()
+    agent.tuner.idle_poll = 0.01
+
+    async def slower(sup: object) -> Profile:
+        return make_profile(at=5.0, rate=60.0 * M, chunk_size=16 * M, transfers=4)
+
+    monkeypatch.setattr(agent.tuner, "_tune", slower)
+    tr = agent.transfers["media-tv"]
+    async with tr.lock:  # a transfer holds the link: the re-tune waits
+        agent.tuner.observe("media-tv", run_at(40 * M))
+        assert agent.tuner.status()["retune_queued"]
+        await asyncio.sleep(0.05)
+        assert agent.tuner.active is not None and agent.tuner.active.rate == 150 * M
+    async with asyncio.timeout(2):
+        while agent.tuner.active is None or agent.tuner.active.rate != 60 * M:
+            await asyncio.sleep(0.01)
+    assert agent.tuner.recent == collections.deque()
+
+
+async def test_no_profile_no_drift(agent: Agent) -> None:
+    agent.tuner.observe("media-tv", run_at(1 * M))
+    assert not agent.tuner.recent
+
+
+async def test_schedule_runs_tunes_and_skips_busy_links(
+    agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent.cfg = agent.cfg.model_copy(update={"tuning": Tuning(schedule="0 3 * * *")})
+
+    class Every:
+        def __init__(self, *a: object) -> None:
+            pass
+
+        def get_next(self, _: type) -> float:
+            return time.time() + 0.02
+
+    monkeypatch.setattr(tuning, "croniter", Every)
+    calls: list[int] = []
+
+    async def fake_run(*a: object, **kw: object) -> dict[str, object]:
+        calls.append(1)
+        if len(calls) == 1:
+            raise TuneBusy("transfer media-tv is running")
+        return {"ok": True}
+
+    monkeypatch.setattr(agent.tuner, "run", fake_run)
+    task = asyncio.create_task(agent.tuner.schedule())
+    async with asyncio.timeout(2):
+        while len(calls) < 3:
+            await asyncio.sleep(0.01)
+    task.cancel()
+    assert agent.tuner.next_run is not None
+
+
+def test_bad_schedule_is_rejected() -> None:
+    with pytest.raises(ValueError, match="invalid cron"):
+        Tuning(schedule="every day")

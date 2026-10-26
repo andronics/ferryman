@@ -112,6 +112,8 @@ class TransferRunner:
                 log.error("transfer %s failed: %s", self.name, result["error"])
             if not dry_run:
                 self._account(result)
+                if result["ok"] and not result.get("skipped"):
+                    self.agent.tuner.observe(self.name, result)
             return result
 
     def _account(self, result: dict[str, Any]) -> None:
@@ -220,6 +222,8 @@ class TransferRunner:
             "files": st.get("transfers", 0),
             "bytes": st.get("bytes", 0),
             "errors": st.get("errors", 0),
+            # Seconds spent transferring: the drift check's rate denominator.
+            "transfer_time": st.get("transferTime", 0),
         }
 
     async def schedule(self) -> None:

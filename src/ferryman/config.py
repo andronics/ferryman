@@ -125,9 +125,24 @@ class Tuning(_Model):
     chunk_sizes: list[str] = Field(default_factory=lambda: ["8M", "16M", "32M", "64M", "128M",
                                                             "256M"])  # fmt: skip
     transfers: list[int] = Field(default_factory=lambda: [1, 2, 4, 8, 12, 16])
-    # suggest: record the profile only. auto: apply it unless it is noisy.
-    # (`ferryman tune --apply` applies one either way.)
+    # suggest: record the profile only. auto: apply it unless it is noisy,
+    # and re-tune on drift. (`ferryman tune --apply` applies one either way.)
     apply: Literal["suggest", "auto"] = "suggest"
+    schedule: str | None = None  # cron for a re-tune; skipped while the link is busy
+    # Hosts behind the same uplink share a name here; with a coordinator, only
+    # one of them tunes at a time, or each would measure the others' probes.
+    uplink: str | None = None
+    # Drift: drift_runs qualifying transfer runs in a row below drift x the
+    # profile's rate raise tune.drift (and, with apply: auto, a re-tune).
+    drift: float = Field(default=0.6, gt=0, lt=1)
+    drift_runs: int = Field(default=3, ge=1)
+
+    @field_validator("schedule")
+    @classmethod
+    def _cron(cls, v: str | None) -> str | None:
+        if v is not None and not croniter.is_valid(v):
+            raise ValueError(f"invalid cron expression: {v!r}")
+        return v
 
     @field_validator("budget", "probe_bytes", "max_memory")
     @classmethod
