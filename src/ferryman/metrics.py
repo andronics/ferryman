@@ -56,7 +56,7 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_transfer_bytes_total": ("counter", "Bytes moved by successful runs."),
     "ferryman_transfer_files_total": ("counter", "Files moved by successful runs."),
     "ferryman_pool_keys": ("gauge", "Keys in the pool."),
-    "ferryman_pool_keys_available": ("gauge", "Keys not exhausted in the quota window."),
+    "ferryman_pool_keys_available": ("gauge", "Keys usable now: not exhausted, key file good."),
     "ferryman_pool_keys_bad": ("gauge", "Keys whose file is missing or invalid."),
     "ferryman_pool_epoch": ("gauge", "Rotations of the pool so far."),
     "ferryman_pool_rotated_timestamp_seconds": ("gauge", "When the pool last rotated."),
@@ -100,7 +100,8 @@ class Exposition:
 def _pool(m: Exposition, info: dict[str, Any]) -> None:
     p, keys = info["pool"], info["keys"]
     m.add("ferryman_pool_keys", len(keys), pool=p)
-    m.add("ferryman_pool_keys_available", sum(not k["exhausted_until"] for k in keys), pool=p)
+    usable = sum(not k["exhausted_until"] and k["file_ok"] for k in keys)
+    m.add("ferryman_pool_keys_available", usable, pool=p)
     m.add("ferryman_pool_keys_bad", sum(not k["file_ok"] for k in keys), pool=p)
     m.add("ferryman_pool_epoch", info["epoch"], pool=p)
     m.add("ferryman_pool_rotated_timestamp_seconds", info.get("rotated_at"), pool=p)

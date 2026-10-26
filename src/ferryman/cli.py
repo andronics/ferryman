@@ -313,6 +313,8 @@ def pool(ctx: typer.Context) -> None:
                     + time.strftime("%F %T", time.localtime(k["exhausted_until"]))
                     if k["exhausted_until"]
                     else "available"
+                    if k["file_ok"]
+                    else "skipped"
                 )
                 typer.echo(
                     f"  {'*' if k['current'] else ' '} {k['key']:66} "
@@ -325,7 +327,8 @@ def pool(ctx: typer.Context) -> None:
 
 @app.command()
 def rotate(ctx: typer.Context, pool_name: Annotated[str, typer.Argument(metavar="POOL")]) -> None:
-    """Advance a pool to its next key and move running units onto it."""
+    """Move a pool to its next usable key (the current one keeps its quota)
+    and move running units onto it."""
     r = ctx.obj.request("POST", f"/v1/pools/{pool_name}/rotate")
     ctx.obj.show(r, lambda d: typer.echo(f"pool {d['pool']} now on {d['current']}"))
 

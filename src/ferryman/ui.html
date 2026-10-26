@@ -105,6 +105,7 @@ button:disabled { opacity: .5; cursor: default; }
 "use strict";
 const STALE_AFTER = 60;  // seconds without a report
 let skew = 0;            // server clock minus ours
+let page = null;         // the page this tab loaded, as the coordinator names it
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g,
   (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
@@ -166,7 +167,7 @@ document.addEventListener("click", (ev) => {
     if (!confirm(`Tune uploads on ${agent}? Probes upload up to its tuning budget, counted against the current key's daily cap.`)) return;
     post(`/ui/api/agents/${enc(agent)}/tune`, {}, `tune ${agent}`);
   } else if (act === "rotate") {
-    if (!confirm(`Rotate pool ${name}? The current key is marked exhausted for its quota window.`)) return;
+    if (!confirm(`Rotate pool ${name} to its next usable key? The current key stays available.`)) return;
     post(`/ui/api/pools/${enc(name)}/rotate`, {}, `rotate ${name}`);
   }
 });
@@ -260,7 +261,7 @@ function renderPool(p, owner) {
       <td>${k.current ? "●" : ""}</td>
       <td class="mono">${esc(k.key)}</td>
       <td>${k.file_ok ? "" : `<span class="err">bad key file</span>`}</td>
-      <td>${k.exhausted_until ? state("failed", `exhausted, frees ${ago(k.exhausted_until)}`) : state("ok", "available")}</td>
+      <td>${k.exhausted_until ? state("failed", `exhausted, frees ${ago(k.exhausted_until)}`) : k.file_ok ? state("ok", "available") : state("failed", "skipped")}</td>
     </tr>`).join("");
   const rotate = owner ? "" : `<button data-act="rotate" data-name="${esc(p.pool)}">Rotate</button>`;
   return `<div class="panel">
@@ -275,6 +276,9 @@ function renderPool(p, owner) {
 }
 
 function render(d) {
+  // The coordinator now serves a different page: an upgrade. Load it.
+  if (page && d.page && d.page !== page) { location.reload(); return; }
+  page = page || d.page;
   skew = d.now - Date.now() / 1000;
   const reporting = d.agents.filter((a) => a.report && now() - a.at <= STALE_AFTER).length;
   document.getElementById("meta").innerHTML =
