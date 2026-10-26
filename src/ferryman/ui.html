@@ -71,6 +71,8 @@ button:disabled { opacity: .5; cursor: default; }
 .actions { display: flex; gap: 6px; }
 .sub { padding: 8px 14px 2px; font-size: 11px; text-transform: uppercase;
        letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.tuning { padding: 2px 14px 10px; }
+.sub button { margin-left: 8px; text-transform: none; letter-spacing: 0; }
 .grid2 { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
 #toast {
   position: fixed; right: 16px; bottom: 16px; max-width: 420px; padding: 10px 14px;
@@ -160,6 +162,9 @@ document.addEventListener("click", (ev) => {
   } else if (act === "run" || act === "dry") {
     post(`/ui/api/agents/${enc(agent)}/transfers/${enc(name)}/run`, {dry_run: act === "dry"},
          `${act === "dry" ? "dry run" : "run"} ${name}`);
+  } else if (act === "tune") {
+    if (!confirm(`Tune uploads on ${agent}? Probes upload up to its tuning budget, counted against the current key's daily cap.`)) return;
+    post(`/ui/api/agents/${enc(agent)}/tune`, {}, `tune ${agent}`);
   } else if (act === "rotate") {
     if (!confirm(`Rotate pool ${name}? The current key is marked exhausted for its quota window.`)) return;
     post(`/ui/api/pools/${enc(name)}/rotate`, {}, `rotate ${name}`);
@@ -181,6 +186,20 @@ function lastRun(t) {
   if (l.skipped) return `${state("ok", when)} <span class="muted">nothing to do</span>`;
   return `${state("ok", when)} ${esc(l.files ?? 0)} file(s), ${iec(l.bytes ?? 0)}` +
          (l.errors ? `, <span class="err">${esc(l.errors)} error(s)</span>` : "");
+}
+
+function tuning(a, t) {
+  if (!t) return "";
+  const prof = (p) => `<span class="mono">${iec(p.chunk_size)} × ${p.transfers}</span>, ${iec(p.rate)}/s
+    <span class="muted">(limit ${esc(p.limit)}${p.noisy ? ", noisy" : ""}, ${ago(p.at)})</span>`;
+  const parts = [];
+  if (t.running) parts.push(state("running", t.progress || "tuning"));
+  parts.push(t.active ? `in effect: ${prof(t.active)}` : `<span class="muted">in effect: defaults</span>`);
+  if (t.profile && (!t.active || t.profile.at !== t.active.at)) parts.push(`latest: ${prof(t.profile)}`);
+  if (t.drifting) parts.push(state("failed", "slower than the profile"));
+  if (t.last && !t.last.ok) parts.push(`<span class="err">${esc(t.last.error)}</span>`);
+  return `<div class="sub">Upload tuning<button data-act="tune" data-agent="${esc(a.agent)}"
+      ${t.running ? "disabled" : ""}>Tune</button></div><div class="tuning">${parts.join(" · ")}</div>`;
 }
 
 function renderAgent(a) {
@@ -229,6 +248,7 @@ function renderAgent(a) {
           <th>Warm-up</th><th>Key</th><th>Last error</th><th></th></tr>
       ${units || `<tr><td colspan="8" class="muted">no units</td></tr>`}
     </table></div>
+    ${tuning(a, st.tuning)}
     ${transfers ? `<div class="sub">Transfers</div><div class="scroll"><table>
       <tr><th>Transfer</th><th>Mode</th><th>Destination</th><th>State</th><th>Schedule</th>
           <th>Last run</th><th></th></tr>${transfers}</table></div>` : ""}

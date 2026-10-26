@@ -53,6 +53,8 @@ from .metrics import CONTENT_TYPE, coordinator_metrics
 from .pool import LocalPool, PoolError, PoolExhausted
 
 log = logging.getLogger(__name__)
+# Longest an uplink's tune lock lasts if its agent never releases it.
+TUNE_LOCK_MAX = 7200.0
 
 
 def token_hash(token: str) -> str:
@@ -87,6 +89,28 @@ class Coordinator:
         self.commands: collections.deque[dict[str, Any]] = collections.deque(maxlen=100)
         self._command_ids = itertools.count(1)
         self._commands_changed = {name: asyncio.Condition() for name in cfg.agents}
+        # uplink -> {"agent", "until"}: agents behind one uplink tune one at a
+        # time. In memory: a coordinator restart frees them, which costs at
+        # most one overlapping tune.
+        self.tune_locks: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------ tune locks
+
+    def tune_lock(self, agent: str, uplink: str, ttl: float) -> dict[str, Any]:
+        now = time.time()
+        held = self.tune_locks.get(uplink)
+        if held and held["until"] > now and held["agent"] != agent:
+            return {"granted": False, "holder": held["agent"], "until": held["until"]}
+        until = now + min(max(ttl, 60.0), TUNE_LOCK_MAX)
+        self.tune_locks[uplink] = {"agent": agent, "until": until}
+        log.info("uplink %s: %s is tuning", uplink, agent)
+        return {"granted": True, "holder": agent, "until": until}
+
+    def tune_unlock(self, agent: str, uplink: str) -> dict[str, Any]:
+        held = self.tune_locks.get(uplink)
+        if held and held["agent"] == agent:
+            del self.tune_locks[uplink]
+        return {"ok": True}
 
     # ---------------------------------------------------------------- auth
 
@@ -188,6 +212,7 @@ class Coordinator:
             "pools": [p.describe() for p in self.pools.values()],
             "claims": self._read_claims(),
             "commands": list(self.commands)[::-1],
+            "tune_locks": {u: h for u, h in self.tune_locks.items() if h["until"] > time.time()},
         }
 
     # --------------------------------------------------------------- claims
@@ -294,6 +319,13 @@ def build_app(co: Coordinator) -> Starlette:
         co.report(agent, await request.json())
         return {"ok": True}
 
+    async def tune_lock(request: Request, agent: str) -> Any:
+        body = await request.json() if await request.body() else {}
+        return co.tune_lock(agent, request.path_params["uplink"], float(body.get("ttl", 3600)))
+
+    async def tune_unlock(request: Request, agent: str) -> Any:
+        return co.tune_unlock(agent, request.path_params["uplink"])
+
     async def get_commands(_: Request, agent: str) -> Any:
         return await co.take(agent, co.cfg.watch_timeout)
 
@@ -309,6 +341,8 @@ def build_app(co: Coordinator) -> Starlette:
             Route("/healthz", healthz),
             Route("/metrics", metrics),
             Route("/v1/report", authed(put_report), methods=["PUT"]),
+            Route("/v1/tune-lock/{uplink}", authed(tune_lock), methods=["POST"]),
+            Route("/v1/tune-lock/{uplink}", authed(tune_unlock), methods=["DELETE"]),
             Route("/v1/commands", authed(get_commands)),
             Route("/v1/commands/{id:int}", authed(post_command), methods=["POST"]),
             Route("/v1/pools", authed(pools)),
@@ -388,6 +422,14 @@ def _ui_routes(co: Coordinator) -> list[Route]:
         body = await request.json() if await request.body() else {}
         return await co.queue(a, "run", t, user, dry_run=bool(body.get("dry_run")))
 
+    async def tune(request: Request, user: str) -> Any:
+        a = request.path_params["agent"]
+        if a not in co.reports:
+            raise KeyError(a)
+        body = await request.json() if await request.body() else {}
+        apply = body.get("apply")
+        return await co.queue(a, "tune", "drive", user, apply=apply)
+
     async def rotate(request: Request, user: str) -> Any:
         pool = co.pools[request.path_params["pool"]]
         lease = await co.exhausted(f"{user} (ui)", pool, None)
@@ -401,6 +443,7 @@ def _ui_routes(co: Coordinator) -> list[Route]:
         Route(
             "/ui/api/agents/{agent}/transfers/{name}/run", guarded(run_transfer), methods=["POST"]
         ),
+        Route("/ui/api/agents/{agent}/tune", guarded(tune), methods=["POST"]),
         Route("/ui/api/pools/{pool}/rotate", guarded(rotate), methods=["POST"]),
     ]
 

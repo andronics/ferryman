@@ -20,7 +20,7 @@ from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
 from .rc import RcError
 from .transfer import TransferBusy, TransferRunner
-from .tuning import Tuner
+from .tuning import TuneError, Tuner
 from .unit import UnitSupervisor
 
 log = logging.getLogger(__name__)
@@ -101,6 +101,8 @@ class Agent:
         for tr in self.transfers.values():
             if tr.t.schedule:
                 self.spawn(tr.schedule(), f"schedule:{tr.name}")
+        if self.cfg.tuning.schedule:
+            self.spawn(self.tuner.schedule(), "tune-schedule")
         self.spawn(self._health_loop(), "health")
         if self.notifier.enabled:
             self.spawn(self.notifier.run(), "notify")
@@ -282,6 +284,11 @@ class Agent:
                 sup = self.units[target]
                 await asyncio.shield(self.restart(sup))
                 result = {"ok": True, "state": sup.state.value}
+            elif action == "tune":
+                self.tuner.check()
+                apply = cmd.get("args", {}).get("apply")
+                self.spawn(self._tune_quietly(apply), "tune")
+                result = {"ok": True, "started": True}
             elif action == "run":
                 tr = self.transfers[target]
                 if tr.running:
@@ -293,7 +300,7 @@ class Agent:
                 result = {"ok": False, "error": f"unknown action {action!r}"}
         except KeyError as e:
             result = {"ok": False, "error": f"not found: {e.args[0]}"}
-        except TransferBusy as e:
+        except (TransferBusy, TuneError) as e:
             result = {"ok": False, "error": str(e)}
         if self.coordinator is not None:
             try:
@@ -301,6 +308,14 @@ class Agent:
             except PoolError as e:
                 log.warning("command %s: could not report its result: %s", cmd["id"], e)
         return result
+
+    async def _tune_quietly(self, apply: bool | None) -> None:
+        # Nobody awaits a tune started from the UI: its outcome is the
+        # tuner's status and events, which the next report carries.
+        try:
+            await self.tuner.run(apply=apply)
+        except TuneError as e:
+            log.warning("tune from the coordinator: %s", e)
 
     # ----------------------------------------------------------------- health
 
