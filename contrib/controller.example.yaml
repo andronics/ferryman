@@ -80,21 +80,44 @@ pools:
       drive: first
       drive_id: null
 
-# WHAT each unit is: no paths, no hosts.
+# WHAT each unit is: no paths, no hosts. Names: letters, digits, _ . - (not
+# leading). One rclone process per unit on each agent that binds it.
 units:
-  media-tv:
+  media-tv:                       # a shared drive, mounted for media servers
     backend: drive
-    drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive
-    pool: uploads
+    drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive's id (from its URL)
+    pool: uploads                 # required for drive units
     options: {}                   # extra rclone remote options, verbatim
     warm: null                    # null: defaults
-    buffer_size: null
+    buffer_size: null             # read settings: null takes `defaults`
     vfs_cache_mode: null
-    vfs_read_chunk_size: 64M      # this drive is read in smaller pieces
+    vfs_read_chunk_size: null
     vfs_read_ahead: null
+  media-music:                    # many small random reads: fetch less per open
+    drive_id: 0ADDDDDDDDDDDDDDDDD
+    pool: uploads
+    buffer_size: "0"              # no in-memory read-ahead
+    vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
+  media-photos:
+    drive_id: 0AEEEEEEEEEEEEEEEEE
+    pool: uploads
+  backups:                        # bound without mounts: no FUSE, just `rclone rcd` for transfers
+    drive_id: 0ACCCCCCCCCCCCCCCCC
+    pool: uploads
+  scratch:                        # any rclone backend; options go into its conf verbatim
+    backend: alias
+    options:
+      remote: /srv/scratch
+    # A drive unit's options can override what ferryman renders, e.g.
+    # chunk_size: 64M (always with a suffix: a bare number is KiB to rclone).
 
 # Each agent: its token's sha256 (`ferryman token` makes both), and HOW it
 # runs the units it binds. It may lease the pools of those units.
+#
+# Mount paths are absolute; the agent creates the last directory only, so
+# the parent must exist. Never a system directory, inside another mount, or
+# overlapping a transfer's source (the agent checks, and refuses a slice
+# that fails). Paths take {hostname} {unit} {env:NAME}.
 agents:
   pve-01:                         # a Proxmox host: mounts, serves, uploads
     token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
@@ -108,18 +131,64 @@ agents:
       uplink: home
     units:
       media-tv:
-        mounts:
-          - {path: /pool/google/media-tv}
-          - {path: /srv/media/tv, read_only: true}
-        serve:
-          - {type: webdav, addr: ":8081", htpasswd: /etc/ferryman/htpasswd}
+        mounts:                   # the first runs the process; the rest join it
+          - path: /pool/google/media/tv
+            allow_other: true     # other users (the media server) may use it (default)
+            default_permissions: true   # the kernel enforces mode bits (default)
+          - path: /pool/google/{hostname}/tv
+            allow_other: false    # this path for root only; same files, same cache
+          - path: /pool/google/ro/tv
+            read_only: true       # a kernel ro bind of the first writable mount (root only)
+        cache_max_size: 150G      # a library worth caching
+      media-music:
+        mounts: [{path: /pool/google/media/music}]
+      media-photos:               # no mounts, served instead: no FUSE
+        serve:                    # servers inside the unit's process: same cache and key
+          - type: webdav          # dlna ftp http nfs restic s3 sftp webdav
+            addr: 127.0.0.1:8081  # required and unique per host: host:port
+            htpasswd: /etc/ferryman/secrets/photos.htpasswd   # http, webdav, restic
+            cert: /etc/ferryman/tls/photos.crt                # TLS (ftp: implicit FTPS)
+            key: /etc/ferryman/tls/photos.key
+          - type: ftp
+            addr: 0.0.0.0:2121    # beyond loopback: authentication required
+            passive_port: 30000-30099   # ftp only, required; ranges may not overlap
+            user: photos          # with pass_file (s3: access key id + secret key)
+            pass_file: /etc/ferryman/secrets/photos-ftp       # read at start; mode 0600
+            options:              # passed to rclone as-is (its flag names, _ for -);
+              public_ip: 10.0.100.5   # VFS settings are refused: they are the unit's
+          - type: sftp
+            addr: 127.0.0.1:2022
+            host_key: /etc/ferryman/secrets/photos-ssh-host-key   # sftp only; mode 0600
+          - type: dlna            # no auth exists for dlna/nfs: beyond loopback only with
+            addr: :7879
+            allow_unauthenticated: true
+      backups: {}
+      scratch:
+        mounts: [{path: /pool/google/scratch}]
     transfers:                    # this host's: each reads a local source
-      tv-uploads:
+      tv-staging:                 # whatever lands in the source goes up
         unit: media-tv
-        source: /pool/incoming/tv
-        mode: move
-        schedule: "*/15 * * * *"
-        min_age: 15m
+        source: /pool/ceph/staging/tv   # absolute, placeholders allowed; not in or above a mount
+        mode: move                # files are deleted locally once uploaded
+        schedule: "0 */4 * * *"   # cron, host's timezone; omit to run on demand only
+        min_age: 5m               # skip files still being written
+        exclude: ["*.part", "*.tmp"]    # rclone filter patterns to leave alone
+      pve-dump:                   # a backup: a mirror per weekday, 7 rolling copies
+        unit: backups
+        mode: sync                # deletes at the destination what the source lacks
+        source: /var/lib/vz/dump
+        dest: proxmox/{hostname}/{weekday}
+        schedule: "30 3 * * *"
+        max_delete: 50            # abort the job after this many deletions
+        allow_empty: false        # refuse a sync from an empty source (the default)
+      configs:                    # dated archives: copy, never sync, into a dated folder
+        unit: backups
+        mode: copy
+        source: /etc
+        dest: configs/{hostname}/{now:%Y/%m}
+        schedule: "0 2 1 * *"
+        transfers: 2              # pin these instead of the tuning profile (else 8)
+        checkers: 4
 
   emby-01:                        # inside the Emby container: read-only, its own uid
     token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
@@ -129,7 +198,7 @@ agents:
         uid: 1001
         gid: 1001
         cache_max_size: 20G
-        mount_args: []            # raw rclone flags, last (prefer the settings)
+        mount_args: []            # raw rclone flags, appended last (prefer the settings)
         warm: false               # this host only: overrides the unit's policy
         buffer_size: 64M
         vfs_cache_mode: full

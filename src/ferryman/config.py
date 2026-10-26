@@ -790,8 +790,9 @@ class Layout:
         return None
 
     def leased_keys(self, pool: str) -> Path:
-        # Keys leased from the controller, on the runtime (tmpfs) dir only.
-        return self.cfg.paths.runtime / "keys" / pool
+        # The key leased from the controller, kept (root-only) in the state
+        # dir so a restart during a controller outage can still mount.
+        return self.cfg.paths.state / "controller" / "keys" / pool
 
 
 def read_settings(cfg: Config, unit: str) -> dict[str, dict[str, str]]:
@@ -947,6 +948,12 @@ class AgentBootstrap(_Model):
             raise ValueError(f"{', '.join(moved)} moved to the controller's config in 0.3 "
                              "(see `ferryman migrate`)")  # fmt: skip
         return data
+
+    @classmethod
+    def load(cls, path: Path) -> AgentBootstrap:
+        with path.open() as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)
 
 
 class Ui(_Model):

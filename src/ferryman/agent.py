@@ -12,7 +12,8 @@ from typing import Any
 import httpx
 
 from . import __version__, mountutil, patterns, sdnotify
-from .config import Config, Layout
+from .bootstrap import Rejected, Start, build, fetch
+from .config import AgentBootstrap, Config, Layout
 from .controller_pool import ControllerClient, ControllerPool
 from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
@@ -26,9 +27,28 @@ log = logging.getLogger(__name__)
 
 class Agent:
     def __init__(
-        self, cfg: Config, controller_transport: httpx.AsyncBaseTransport | None = None
+        self,
+        cfg: Config,
+        controller_transport: httpx.AsyncBaseTransport | None = None,
+        bootstrap: AgentBootstrap | None = None,
+        start: Start | None = None,
     ) -> None:
         self.cfg = cfg
+        # The agent's own file and the slice it runs (None: a config given
+        # directly, as tests do; nothing then follows the controller's).
+        self.bootstrap = bootstrap
+        self.slice = start.slice if start else None
+        # What the controller sees of it: the version running, and whether
+        # it is the controller's latest (applied), a cached one the
+        # controller hasn't confirmed (cached), or behind a newer one
+        # (pending, or rejected with the error).
+        self.config_state: dict[str, Any] = {
+            "version": self.slice.get("version") if self.slice else None,
+            "state": "cached" if start and start.source == "cache" else "applied",
+            "error": start.rejected if start else None,
+        }
+        if start and start.rejected:
+            self.config_state["state"] = "rejected"
         self.layout = Layout(cfg)
         self.notifier = Notifier(cfg.notify, self.layout.hostname)
         self.job_poll_interval = 5.0
@@ -88,6 +108,8 @@ class Agent:
                 self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
         if self.cfg.controller:
             self.spawn(self._report_loop(), "report")
+            if self.bootstrap is not None and self.slice is not None:
+                self.spawn(self._config_loop(), "config")
             if self.cfg.controller.commands:
                 self.spawn(self._command_loop(), "commands")
         for tr in self.transfers.values():
@@ -107,9 +129,8 @@ class Agent:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await asyncio.gather(*(sup.stop() for sup in self.units.values()))
-        for pool in self.pools.values():
-            if isinstance(pool, ControllerPool):
-                pool.forget()
+        # Leased keys stay: the next start may need them if the controller
+        # is away then.
         if self.controller:
             await self.controller.aclose()
 
@@ -184,7 +205,50 @@ class Agent:
             "stats": await self.stats(),
             "pools": local,
             "events": self.notifier.recent(20),
+            "config": self.config_state,
         }
+
+    async def _config_loop(self) -> None:
+        """Follow the controller's slice for this agent with long polls."""
+        assert self.controller is not None and self.bootstrap is not None
+        retry = 5.0
+        while True:
+            # Wait on the newest version seen, so one pending or rejected
+            # doesn't come straight back; ask outright while running a
+            # cached one, so a controller that's back confirms it at once.
+            seen = self.config_state.get("offered") or self.config_state["version"]
+            wait = None if self.config_state["state"] == "cached" else seen
+            try:
+                slc = await fetch(self.controller, wait, timeout=self.controller.timeout + 60)
+                retry = 5.0
+            except PoolError as e:
+                log.debug("config: %s; retrying in %.0fs", e, retry)
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, 60.0)
+                continue
+            self.on_slice(slc)
+
+    def on_slice(self, slc: dict[str, Any]) -> None:
+        """A slice from the controller: the one running (now confirmed), or a
+        newer one, checked here and, until live apply, left for a restart."""
+        if slc.get("version") == self.config_state["version"]:
+            if self.config_state["state"] == "cached":
+                self.config_state.update(state="applied", error=None)
+            return
+        if slc.get("version") == self.config_state.get("offered"):
+            return  # already pending or rejected
+        if "units" not in slc:
+            return  # a long poll that timed out on a version we've seen
+        assert self.bootstrap is not None
+        try:
+            build(self.bootstrap, slc)
+        except Rejected as e:
+            log.error("config version %s rejected: %s", slc.get("version"), e)
+            self.config_state.update(state="rejected", error=str(e), offered=slc.get("version"))
+            return
+        log.warning("config version %s is ready: restart the agent to apply it",
+                    slc.get("version"))  # fmt: skip
+        self.config_state.update(state="pending", error=None, offered=slc.get("version"))
 
     async def _report_loop(self) -> None:
         assert self.controller is not None and self.cfg.controller is not None

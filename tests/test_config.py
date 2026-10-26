@@ -129,43 +129,31 @@ def test_transfer_dest_placeholders_and_sync_options(make_config: Callable[..., 
         make_config(transfers={"t": {"unit": "media-tv", "mode": "copy", "allow_empty": True}})
 
 
-EXAMPLE = Path(__file__).parent.parent / "contrib/config.example.yaml"
+EXAMPLE = Path(__file__).parent.parent / "contrib/agent.example.yaml"
 
 
-def test_example_config_is_valid_and_complete() -> None:
-    """contrib/config.example.yaml loads, shows the global sections at their
-    defaults, and mentions every setting, so it cannot fall behind the code."""
+def test_agent_example_is_valid_and_complete() -> None:
+    """contrib/agent.example.yaml loads, shows every setting at its default
+    (but the controller, which has none), so it cannot fall behind the code."""
     import yaml
     from pydantic import BaseModel
 
-    from ferryman.config import Mount, Pool, Serve, Transfer, Unit
+    from ferryman.config import AgentBootstrap, ControllerRef
 
-    cfg = Config.load(EXAMPLE)
-    # Its secret files and TLS certs are examples: absent here, and that's all.
-    assert [p for p in Layout(cfg).check_paths() if not p.endswith("does not exist")] == []
-    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
-        value = getattr(cfg, section)
+    b = AgentBootstrap.load(EXAMPLE)
+    for section in ("paths", "api", "rclone"):
+        value = getattr(b, section)
         assert value == type(value)(), f"{section} differs from its defaults"
-    assert cfg.hostname is None and cfg.controller is None
-
+    assert b.hostname is None
     raw = yaml.safe_load(EXAMPLE.read_text())
 
     def names(model: type[BaseModel]) -> set[str]:
         return {f.alias or n for n, f in model.model_fields.items()}
 
-    assert set(raw) == names(Config)
-    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
-        model = type(getattr(cfg, section))
-        assert set(raw[section]) == names(model), section
-    for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
-        shown = set().union(*(set(v) for v in raw[key].values()))
-        # A pool's probe is the controller's (the agent refuses it).
-        wanted = names(model) - ({"probe"} if key == "pools" else set())
-        assert shown == wanted, f"{key}: missing {wanted - shown}"
-    mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
-    assert set().union(*(set(m) for m in mounts)) == names(Mount)
-    serves = [sv for u in raw["units"].values() for sv in u.get("serve") or []]
-    assert set().union(*(set(sv) for sv in serves)) == names(Serve)
+    assert set(raw) == names(AgentBootstrap)
+    assert set(raw["controller"]) == names(ControllerRef)
+    for section in ("paths", "api", "rclone"):
+        assert set(raw[section]) == names(type(getattr(b, section))), section
 
 
 # ---------------------------------------------------------- read settings

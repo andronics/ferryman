@@ -75,10 +75,10 @@ ln -s /opt/ferryman/bin/ferryman /usr/local/bin/ferryman
 
 ### Run it
 
-Write `/etc/ferryman/config.yaml`: the example above with your drive ids and keys, or start from [`contrib/config.example.yaml`](contrib/config.example.yaml), which lists every setting with its default. Then:
+Write the controller's config, `/etc/ferryman/controller.yaml`, from [`contrib/controller.example.yaml`](contrib/controller.example.yaml), and on each host the agent's own `/etc/ferryman/agent.yaml` from [`contrib/agent.example.yaml`](contrib/agent.example.yaml); both list every setting with its default. Then:
 
 ```bash
-ferryman verify                                    # offline: config, paths, key and secret files, rclone
+ferryman verify                                    # this host: its config, the controller, its slice, paths, rclone
 install -Dm644 contrib/systemd/ferryman.service /etc/systemd/system/ferryman.service
 systemctl daemon-reload && systemctl enable --now ferryman
 

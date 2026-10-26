@@ -45,14 +45,21 @@ units:
 # its node's name in the ferryman-agent-tokens Secret (`ferryman token`
 # prints a token and its sha256). Each binds the units it runs: where it
 # mounts them. The nodes are alike, so they share one binding.
-# (Until agents take their units from here, contrib/k8s/agent/config.yaml
-# still defines them too.)
 agents:
   talos-01: &node
     token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    defaults:
+      uid: 1000                   # who owns the files in the mounts: the apps' uid
+      gid: 1000
     units:
+      # Mount paths live under /var/lib/drive, the DaemonSet's Bidirectional
+      # hostPath, so they show on the node and in consumer pods. Not under
+      # /var/lib/ferryman (paths.state): the agent refuses that.
       media-tv:
         mounts: [{path: /var/lib/drive/media-tv}]
+    # Transfers read from paths inside the pod: add a hostPath volume for
+    # each source to the agent's daemonset.yaml, at the same path.
+    transfers: {}
   talos-02:
     <<: *node
     token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"

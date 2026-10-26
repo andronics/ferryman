@@ -91,8 +91,8 @@ jobs:
           kubectl kustomize contrib/k8s > /dev/null
           uv run python -c "
           from pathlib import Path
-          from ferryman.config import Config, ControllerConfig
-          Config.load(Path('contrib/k8s/agent/config.yaml'))
+          from ferryman.config import AgentBootstrap, ControllerConfig
+          AgentBootstrap.load(Path('contrib/k8s/agent/agent.yaml'))
           ControllerConfig.load(Path('contrib/k8s/controller/controller.yaml'))
           "
           echo "✓ contrib/k8s renders and its configs load"
