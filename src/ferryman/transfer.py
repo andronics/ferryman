@@ -59,10 +59,15 @@ class TransferRunner:
         self.bytes_total = 0
         self.files_total = 0
         self._failing = False
+        # This runner's own config, kept: the agent's may change under a run
+        # (a new slice), and the run carries on as it started. A changed
+        # transfer gets a new runner once this one is idle.
+        self._t = agent.cfg.transfers[name]
+        self.layout = agent.layout
 
     @property
     def t(self) -> Transfer:
-        return self.agent.cfg.transfers[self.name]
+        return self._t
 
     @property
     def group(self) -> str:
@@ -78,8 +83,8 @@ class TransferRunner:
             "transfer": self.name,
             "unit": self.t.unit,
             "mode": self.t.mode,
-            "source": str(self.agent.layout.transfer_source(self.name)),
-            "dest": self.agent.layout.transfer_dest(self.name),
+            "source": str(self.layout.transfer_source(self.name)),
+            "dest": self.layout.transfer_dest(self.name),
             "schedule": self.t.schedule,
             "running": self.running,
             "jobid": self.jobid,
@@ -92,6 +97,13 @@ class TransferRunner:
     async def run(self, dry_run: bool = False) -> dict[str, Any]:
         if self.lock.locked():
             raise TransferBusy(f"transfer {self.name} is already running")
+        try:
+            return await self._locked_run(dry_run)
+        finally:
+            # Whatever a new config left waiting on this run can go ahead.
+            self.agent.on_transfer_done(self.name)
+
+    async def _locked_run(self, dry_run: bool) -> dict[str, Any]:
         async with self.lock:
             self.started = time.time()
             result: dict[str, Any]
@@ -133,7 +145,7 @@ class TransferRunner:
 
     async def _run(self, dry_run: bool) -> dict[str, Any]:
         t, agent = self.t, self.agent
-        src = agent.layout.transfer_source(self.name)
+        src = self.layout.transfer_source(self.name)
         # Most units never have anything staged, so a missing source is the
         # normal "nothing to do" case, not a failure.
         if not src.is_dir():
@@ -169,7 +181,7 @@ class TransferRunner:
             extra = {**extra, "_filter": job_filter}
         # Once per run: a retry on the next key must land in the same place
         # even if a {date} rolled over meanwhile.
-        dest = agent.layout.transfer_dest(self.name)
+        dest = self.layout.transfer_dest(self.name)
 
         for _ in range(attempts):
             key = sup.key

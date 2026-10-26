@@ -824,6 +824,26 @@ def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]
     )
 
 
+def unit_spec(cfg: Config, unit: str) -> dict[str, Any]:
+    """Everything a unit's process is built from. Two configs giving a unit
+    the same spec run it the same way: a new slice restarts a unit only if
+    its spec changed. (Its pool's key isn't in it: a lease moves a running
+    unit in place.)"""
+    return {
+        # Raw, less what takes a default: those count by resolved value, so
+        # the same value from somewhere else restarts nothing.
+        "unit": cfg.units[unit].model_dump(
+            mode="json", exclude={*READ_SETTINGS, "uid", "gid", "cache_max_size", "warm"}
+        ),
+        "read": {k: v["value"] for k, v in read_settings(cfg, unit).items()},
+        "resolved": resolved(cfg, unit),
+        "cache_min_free_space": cfg.defaults.cache_min_free_space,
+        "dir_mode": cfg.defaults.dir_mode,
+        "stat_timeout": cfg.health.stat_timeout,
+        "rclone": cfg.rclone.model_dump(mode="json"),
+    }
+
+
 # ---------------------------------------------------------------- controller
 
 

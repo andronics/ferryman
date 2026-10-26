@@ -178,6 +178,12 @@ class ControllerPool:
         )
         return self._store(body)
 
+    def discard(self) -> None:
+        """Remove the leased key from disk: no unit uses this pool any more."""
+        for path in [*self.keys_dir.glob("*.json"), self._meta]:
+            path.unlink(missing_ok=True)
+        self._lease = None
+
     async def info(self) -> dict[str, Any]:
         info: dict[str, Any] = await self.client.request("GET", f"/v2/pools/{self.name}")
         return info
