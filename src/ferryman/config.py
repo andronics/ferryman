@@ -68,23 +68,149 @@ class Api(_Model):
     listen: Listen | None = None
 
 
-class MailNotify(_Model):
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+
+
+def duration(v: object) -> float:
+    """Seconds, from a number or "90s", "15m", "6h", "2d"."""
+    if isinstance(v, int | float) and not isinstance(v, bool):
+        return float(v)
+    m = _DURATION.match(str(v).strip())
+    if not m:
+        raise ValueError(f"invalid duration {v!r} (e.g. 90, 15m, 6h, 2d)")
+    return float(m[1]) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
+
+
+# ------------------------------------------------------------- notifications
+# The controller's: agents never notify (they send it their events).
+
+
+class SmtpChannel(_Model):
+    host: str
+    port: int = 587
+    starttls: bool = True  # STARTTLS on a plain connection (587)
+    ssl: bool = False  # TLS from the start (465); not with starttls
+    user: str | None = None
+    pass_file: Path | None = None  # the password, read at each send
+    sender: str = Field(alias="from")
     to: list[str] = Field(min_length=1)
-    sender: str | None = Field(default=None, alias="from")  # default ferryman@<hostname>
+
+    @model_validator(mode="after")
+    def _tls(self) -> SmtpChannel:
+        if self.ssl and self.starttls:
+            raise ValueError("smtp: ssl and starttls are alternatives: set one")
+        if (self.user is None) != (self.pass_file is None):
+            raise ValueError("smtp: user and pass_file go together")
+        return self
+
+
+class SendmailChannel(_Model):
     sendmail: str = "/usr/sbin/sendmail"
+    sender: str | None = Field(default=None, alias="from")  # default ferryman@<host>
+    to: list[str] = Field(min_length=1)
 
 
-class WebhookNotify(_Model):
-    url: str  # receives a JSON POST: {host, title, text, events: [...]}
+class WebhookChannel(_Model):
+    url: str  # receives a JSON POST: {title, text, events: [...]}
     headers: dict[str, str] = Field(default_factory=dict)
 
 
-class Notify(_Model):
-    level: Literal["info", "warning", "error"] = "warning"
-    batch: float = 60.0  # collect events this long, then send them as one message
-    repeat: float = 21600.0  # re-send a problem that is still open after this long
-    mail: MailNotify | None = None
-    webhook: WebhookNotify | None = None
+class Channel(_Model):
+    smtp: SmtpChannel | None = None
+    sendmail: SendmailChannel | None = None
+    webhook: WebhookChannel | None = None
+
+    @model_validator(mode="after")
+    def _one(self) -> Channel:
+        if sum(x is not None for x in (self.smtp, self.sendmail, self.webhook)) != 1:
+            raise ValueError("a channel is exactly one of smtp, sendmail, webhook")
+        return self
+
+
+Severity = Literal["info", "warning", "error"]
+
+
+class RuleMatch(_Model):
+    # All that are set must hold. kind, agent and subject take globs
+    # ("unit.*"); severity is the least that matches.
+    kind: str | None = None
+    severity: Severity | None = None
+    agent: str | None = None  # "controller" for the controller's own events
+    subject: str | None = None
+
+
+class RuleWhen(_Model):
+    # Fires once, within `within`, there are `count` matching events, or
+    # matching events from `agents` distinct agents ("all-bound": every
+    # agent bound to the subject unit). Counted separately per value of
+    # the `per` fields; unset: per agent and subject (count), per subject
+    # (agents).
+    count: int | None = Field(default=None, ge=1)
+    agents: int | Literal["all-bound"] | None = None
+    within: float
+    per: list[Literal["agent", "subject", "kind"]] | None = None
+
+    @field_validator("within", mode="before")
+    @classmethod
+    def _within(cls, v: object) -> float:
+        return duration(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _per(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("per") is None:
+            per = ["agent", "subject"] if data.get("count") is not None else ["subject"]
+            data = {**data, "per": per}
+        return data
+
+    @model_validator(mode="after")
+    def _one(self) -> RuleWhen:
+        if (self.count is None) == (self.agents is None):
+            raise ValueError("when: set count or agents (one)")
+        if self.agents is not None and "agent" in (self.per or []):
+            raise ValueError("when: agents counts across agents, so it can't be per agent")
+        return self
+
+
+class Rule(_Model):
+    name: str
+    match: RuleMatch = RuleMatch()
+    when: RuleWhen | None = None
+    send: list[str] = Field(min_length=1)  # channel names
+
+
+class Notifications(_Model):
+    batch: float = 60.0  # collect this long, then one message per channel
+    repeat: float = 21600.0  # an open problem is sent again at most this often
+    channels: dict[str, Channel] = Field(default_factory=dict)
+    # None: one rule, `default`: every warning and error to every channel
+    # (what 0.2 agents did on their own).
+    rules: list[Rule] | None = None
+
+    @field_validator("batch", "repeat", mode="before")
+    @classmethod
+    def _durations(cls, v: object) -> float:
+        return duration(v)
+
+    @model_validator(mode="after")
+    def _references(self) -> Notifications:
+        names = set()
+        for r in self.rules or []:
+            if r.name in names:
+                raise ValueError(f"rule {r.name}: two rules have that name")
+            names.add(r.name)
+            for ch in r.send:
+                if ch not in self.channels:
+                    raise ValueError(f"rule {r.name}: unknown channel {ch!r}")
+        return self
+
+    def effective_rules(self) -> list[Rule]:
+        if self.rules is not None:
+            return self.rules
+        if not self.channels:
+            return []
+        return [Rule(name="default", match=RuleMatch(severity="warning"),
+                     send=list(self.channels))]  # fmt: skip
 
 
 class Rclone(_Model):
@@ -545,7 +671,6 @@ class Config(_Model):
     api: Api = Api()
     rclone: Rclone = Rclone()
     health: Health = Health()
-    notify: Notify = Notify()
     defaults: UnitDefaults = UnitDefaults()
     tuning: Tuning = Tuning()
     pools: dict[str, Pool] = Field(default_factory=dict)
@@ -1004,6 +1129,7 @@ class ControllerConfig(_Model):
     state: Path = Path("/var/lib/ferryman-controller")
     watch_timeout: float = 30.0
     events: Events = Events()
+    notify: Notifications = Notifications()
     health: Health = Health()
     tuning: Tuning = Tuning()
     defaults: UnitDefaults = UnitDefaults()

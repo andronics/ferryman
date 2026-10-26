@@ -31,6 +31,45 @@ events:
   retention_days: 30              # how long the controller keeps them
   silent_after: 120               # seconds without a report before agent.silent
 
+# Notifications: only the controller sends them (agents send it their
+# events). Without `rules`, one default rule sends every warning and error
+# to every channel, as 0.2 agents did. A firing rule opens a problem: sent
+# once, again at most every `repeat`, and closed (and its recovery sent)
+# by the matching recovery event, e.g. unit.recovered for unit.failed.
+notify:
+  batch: 60                       # collect this long, then one message per channel
+  repeat: 6h                      # re-send a problem still open after this long
+  channels: {}                    # none: nothing is sent
+  #   ops:
+  #     smtp:                     # the controller usually runs without sendmail
+  #       host: smtp.example.org
+  #       port: 587
+  #       starttls: true          # or ssl: true (465)
+  #       user: ferryman
+  #       pass_file: /etc/ferryman/smtp.pass
+  #       from: ferryman@example.org
+  #       to: [ops@example.org]
+  #   ha:
+  #     webhook: {url: https://ha.example.org/api/webhook/ferryman, headers: {}}
+  #   local:
+  #     sendmail: {sendmail: /usr/sbin/sendmail, to: [root]}
+  rules: null                     # null: the default rule
+  # rules:
+  #   - name: errors              # every error, once, then every `repeat`
+  #     match: {severity: error}
+  #     send: [ops]
+  #   - name: crash-loop          # 3 failures of one unit on one agent in 15 minutes
+  #     match: {kind: unit.failed}
+  #     when: {count: 3, within: 15m, per: [agent, subject]}
+  #     send: [ops, ha]
+  #   - name: down-everywhere     # every agent bound to the unit failed it
+  #     match: {kind: unit.failed}
+  #     when: {agents: all-bound, within: 5m}
+  #     send: [ha]
+  #   - name: quiet-agent         # globs: kind, agent ("controller": its own), subject
+  #     match: {kind: agent.silent, agent: controller}
+  #     send: [ha]
+
 # Every agent's health check.
 health:
   interval: 120                   # seconds between health checks
