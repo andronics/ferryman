@@ -1,0 +1,137 @@
+# ferryman controller config: every setting, with its default.
+#
+# Copy to /etc/ferryman/controller.yaml and keep what you change. Unknown
+# keys are errors, so a typo fails loudly; a config that fails a check never
+# reaches an agent.
+#
+# Units say WHAT is mounted (a drive, its key pool, how it is read). Each
+# agent's bindings say HOW that host runs it (where, as whom, with what
+# cache and servers), so one unit can be mounted differently on every host.
+# Sections down to `defaults` show their defaults exactly; pools, units and
+# agents are worked examples to adapt.
+
+listen:
+  host: 127.0.0.1
+  port: 8470
+  forwarded_allow_ips: 127.0.0.1  # Traefik's address(es), trusted for X-Forwarded-For
+
+state: /var/lib/ferryman-controller   # pool rotation state, probes
+watch_timeout: 30                 # seconds a long poll (watch, commands) waits
+
+ui:
+  enabled: false
+  user_header: X-authentik-username   # null disables the check (testing only)
+
+rclone:                           # runs key probes; needed only with `probe:`
+  binary: rclone
+  log_level: INFO
+
+# Every agent's health check.
+health:
+  interval: 120                   # seconds between health checks
+  stat_timeout: 10                # seconds a stat of a mount path may take before it counts as wedged
+
+# Every agent's upload tuning; an agent's `tuning:` overrides it field by
+# field (its own uplink and memory).
+tuning:
+  budget: 32G
+  probe_bytes: 2G
+  max_memory: 2G
+  warmup: 3
+  window: 15
+  repeats: 2
+  chunk_sizes: [8M, 16M, 32M, 64M, 128M, 256M]
+  transfers: [1, 2, 4, 8, 12, 16]
+  apply: suggest
+  schedule: null
+  uplink: null
+  drift: 0.6
+  drift_runs: 3
+
+# Precedence. A unit's read policy (the read settings and warm): these,
+# then the unit, then a binding. A host's settings (uid, gid, cache sizes,
+# dir_mode): these, then the agent's `defaults`, then a binding.
+defaults:
+  uid: null
+  gid: null
+  cache_max_size: 10G             # per unit: not a total
+  cache_min_free_space: 100G
+  warm: true
+  dir_mode: 0775
+  buffer_size: 16M
+  vfs_cache_mode: full
+  vfs_read_chunk_size: 128M
+  vfs_read_ahead: "0"
+
+pools:
+  uploads:
+    keys_dir: /etc/ferryman/keys  # one <client_email>.json per key
+    keys:
+      - sa-01@my-project.iam.gserviceaccount.com
+      - sa-02@my-project.iam.gserviceaccount.com
+    quota_window: 86400           # seconds a capped key stays exhausted, at most
+    controller: false             # always false here: these are the controller's own pools
+    # Test each exhausted key with a small upload; return it to the pool as
+    # soon as one lands. The drive: the first unit's on this pool (first),
+    # each unit's in turn (rotate), or drive_id, which wins.
+    probe:
+      interval: 3600
+      size: 1K
+      drive: first
+      drive_id: null
+
+# WHAT each unit is: no paths, no hosts.
+units:
+  media-tv:
+    backend: drive
+    drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive
+    pool: uploads
+    options: {}                   # extra rclone remote options, verbatim
+    warm: null                    # null: defaults
+    buffer_size: null
+    vfs_cache_mode: null
+    vfs_read_chunk_size: 64M      # this drive is read in smaller pieces
+    vfs_read_ahead: null
+
+# Each agent: its token's sha256 (`ferryman token` makes both), and HOW it
+# runs the units it binds. It may lease the pools of those units.
+agents:
+  pve-01:                         # a Proxmox host: mounts, serves, uploads
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    defaults:                     # this host's own: uid, gid, cache sizes, dir_mode
+      uid: 1000
+      gid: 1000
+      cache_max_size: 50G
+      cache_min_free_space: 200G
+      dir_mode: 0775
+    tuning:                       # over the controller's, field by field
+      uplink: home
+    units:
+      media-tv:
+        mounts:
+          - {path: /pool/google/media-tv}
+          - {path: /srv/media/tv, read_only: true}
+        serve:
+          - {type: webdav, addr: ":8081", htpasswd: /etc/ferryman/htpasswd}
+    transfers:                    # this host's: each reads a local source
+      tv-uploads:
+        unit: media-tv
+        source: /pool/incoming/tv
+        mode: move
+        schedule: "*/15 * * * *"
+        min_age: 15m
+
+  emby-01:                        # inside the Emby container: read-only, its own uid
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+    units:
+      media-tv:
+        mounts: [{path: /media/tv, read_only: true}]
+        uid: 1001
+        gid: 1001
+        cache_max_size: 20G
+        mount_args: []            # raw rclone flags, last (prefer the settings)
+        warm: false               # this host only: overrides the unit's policy
+        buffer_size: 64M
+        vfs_cache_mode: full
+        vfs_read_chunk_size: 128M
+        vfs_read_ahead: 256M

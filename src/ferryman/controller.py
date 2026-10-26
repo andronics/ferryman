@@ -33,7 +33,6 @@ import os
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from importlib import resources
-from pathlib import PurePosixPath
 from typing import Any
 
 import uvicorn
@@ -48,7 +47,7 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from .config import ControllerConfig, parse_size
+from .config import ControllerConfig, overlaps, parse_size
 from .metrics import CONTENT_TYPE, controller_metrics
 from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
 from .probe import probe
@@ -66,13 +65,6 @@ def token_hash(token: str) -> str:
 
 class Forbidden(Exception):
     pass
-
-
-def overlaps(a: str, b: str) -> bool:
-    """Whether two paths inside a drive are the same or one contains the other."""
-    pa, pb = PurePosixPath("/", a).parts, PurePosixPath("/", b).parts
-    n = min(len(pa), len(pb))
-    return pa[:n] == pb[:n]
 
 
 class Controller:
@@ -96,6 +88,8 @@ class Controller:
         # time. In memory: a controller restart frees them, which costs at
         # most one overlapping tune.
         self.tune_locks: dict[str, dict[str, Any]] = {}
+        # pool -> the index of the drive its last probe used (drive: rotate).
+        self._probe_turn: dict[str, int] = {}
 
     # ------------------------------------------------------------ tune locks
 
@@ -131,7 +125,7 @@ class Controller:
     def pool_for(self, agent: str, pool: str) -> LocalPool:
         if pool not in self.pools:
             raise KeyError(pool)
-        if pool not in self.cfg.agents[agent].pools:
+        if pool not in self.cfg.agent_pools(agent):
             raise Forbidden(f"agent {agent} may not use pool {pool}")
         return self.pools[pool]
 
@@ -178,10 +172,20 @@ class Controller:
                         log.exception("pool %s: probing %s failed", pool.name, key)
             await asyncio.sleep(PROBE_TICK)
 
+    def probe_drive(self, pool: str) -> str:
+        """The drive the pool's next probe uploads to (see Probe.drive)."""
+        drives = self.cfg.probe_drives(pool)
+        probe = self.cfg.pools[pool].probe
+        if probe is None or probe.drive == "first" or len(drives) == 1:
+            return drives[0]
+        turn = self._probe_turn.get(pool, -1) + 1
+        self._probe_turn[pool] = turn
+        return drives[turn % len(drives)]
+
     async def probe_key(self, pool: LocalPool, key: str, marked: float) -> str:
         cfg = pool.cfg.probe
         assert cfg is not None
-        r = await probe(self.cfg.rclone.binary, pool.key_file(key), cfg.drive_id,
+        r = await probe(self.cfg.rclone.binary, pool.key_file(key), self.probe_drive(pool.name),
                         parse_size(cfg.size), self.cfg.state / "probe",
                         key.split("@", 1)[0])  # fmt: skip
         if r.result == "error":
@@ -240,8 +244,12 @@ class Controller:
         return {
             "now": time.time(),
             "agents": [
-                {"agent": name, "pools": a.pools, **(self.reports.get(name) or {})}
-                for name, a in self.cfg.agents.items()
+                {
+                    "agent": name,
+                    "pools": self.cfg.agent_pools(name),
+                    **(self.reports.get(name) or {}),
+                }
+                for name in self.cfg.agents
             ],
             "pools": [p.describe() for p in self.pools.values()],
             "claims": self._read_claims(),
@@ -323,7 +331,7 @@ def build_app(co: Controller) -> Starlette:
         return JSONResponse({"ok": True})
 
     async def pools(_: Request, agent: str) -> Any:
-        return [co.pools[p].describe() for p in co.cfg.agents[agent].pools]
+        return [co.pools[p].describe() for p in co.cfg.agent_pools(agent)]
 
     async def pool(request: Request, agent: str) -> Any:
         return co.pool_for(agent, request.path_params["pool"]).describe()
