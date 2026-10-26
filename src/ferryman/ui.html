@@ -328,7 +328,7 @@ function render(d) {
       <td title="${esc(clock(c.created))}">${ago(c.created)}</td>
       <td>${esc(c.by)}</td><td>${esc(c.agent)}</td>
       <td class="mono">${esc(c.action)} ${esc(c.target)}${c.args && c.args.dry_run ? " (dry run)" : ""}</td>
-      <td>${state(c.state === "done" ? "ok" : c.state === "failed" ? "failed" : "running", c.state)}</td>
+      <td>${state(c.state === "done" ? "ok" : ["failed", "expired"].includes(c.state) ? "failed" : "running", c.state)}</td>
       <td class="wrap ${c.result && !c.result.ok ? "err" : "muted"}">${esc(c.result ? (c.result.error || (c.result.started ? "started" : c.result.state || "ok")) : "")}</td>
     </tr>`).join("")}</table>` : `<div class="empty">none yet</div>`;
 }

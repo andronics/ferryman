@@ -223,3 +223,31 @@ async def test_an_exhausted_controller_pool_is_raised_once_by_the_controller(
     assert agent.outbox is not None
     assert "pool.exhausted" not in [e["kind"] for e in agent.outbox.entries]
     assert kinds(co) == ["pool.exhausted"]
+
+
+async def test_a_command_never_collected_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    co = Controller(controller_config(tmp_path))
+    ui = await co.queue("site-a", "restart", "backups", "stephen")
+    rule = await co.queue("site-a", "restart", "backups", "", rule="crash-loop")
+    assert rule["by"] == "rule:crash-loop" and ui["by"] == "stephen"
+    later = time.time() + 601
+    monkeypatch.setattr("ferryman.controller.time.time", lambda: later)
+    assert await co.take("site-a", 0.01) == []  # never handed out
+    assert ui["state"] == rule["state"] == "expired"
+    # Only the rule's is an event: an action that didn't happen.
+    assert kinds(co) == ["action.expired"]
+
+
+async def test_a_rules_command_results_are_events(tmp_path: Path) -> None:
+    co = Controller(controller_config(tmp_path))
+    ok = await co.queue("site-a", "restart", "backups", "", rule="crash-loop")
+    bad = await co.queue("site-a", "run", "dump", "", rule="retry")
+    by_hand = await co.queue("site-a", "restart", "backups", "stephen")
+    await co.take("site-a", 0.01)
+    co.finish("site-a", ok["id"], {"ok": True})
+    co.finish("site-a", bad["id"], {"ok": False, "error": "already running"})
+    co.finish("site-a", by_hand["id"], {"ok": True})
+    assert kinds(co) == ["action.done", "action.failed"]
+    assert "already running" in co.events.recent[-1]["message"]
