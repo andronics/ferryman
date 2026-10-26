@@ -25,18 +25,37 @@ pools:
     keys:
       - sa-01@my-project.iam.gserviceaccount.com
       - sa-02@my-project.iam.gserviceaccount.com
-    # Test each exhausted key hourly with a small upload into this shared
-    # drive, and return it to the pool as soon as one lands, rather than
-    # after the whole quota_window (the cap is reported to roll).
+    # Test each exhausted key hourly with a small upload, and return it to
+    # the pool as soon as one lands, rather than after the whole
+    # quota_window (the cap is reported to roll). The drive: the first
+    # unit's on this pool (drive: first), each unit's in turn (drive:
+    # rotate), or a drive_id of its own.
     # probe:
-    #   drive_id: 0AAAAAAAAAAAAAAAAAA
     #   interval: 3600
     #   size: 1K
+    #   drive: first
+
+# What each unit is, on whichever node runs it.
+units:
+  media-tv:
+    drive_id: 0AAAAAAAAAAAAAAAAAA
+    pool: uploads
 
 # One entry per node: the agent on each node uses the token stored under
-# its node's name in the ferryman-agent-tokens Secret. `ferryman token`
-# prints a token and its sha256.
+# its node's name in the ferryman-agent-tokens Secret (`ferryman token`
+# prints a token and its sha256). Each binds the units it runs: where it
+# mounts them. The nodes are alike, so they share one binding.
+# (Until agents take their units from here, contrib/k8s/agent/config.yaml
+# still defines them too.)
 agents:
-  talos-01: {token_sha256: "0000000000000000000000000000000000000000000000000000000000000001", pools: [uploads]}
-  talos-02: {token_sha256: "0000000000000000000000000000000000000000000000000000000000000002", pools: [uploads]}
-  talos-03: {token_sha256: "0000000000000000000000000000000000000000000000000000000000000003", pools: [uploads]}
+  talos-01: &node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    units:
+      media-tv:
+        mounts: [{path: /var/lib/drive/media-tv}]
+  talos-02:
+    <<: *node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+  talos-03:
+    <<: *node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000003"

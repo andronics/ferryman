@@ -34,10 +34,12 @@ def controller(tmp_path: Path) -> Controller:
             "state": str(tmp_path / "co-state"),
             "watch_timeout": 0.5,
             "pools": {"main": {"keys_dir": str(tmp_path / "keys"), "keys": KEYS}},
+            # An agent may lease the pools of the units bound to it.
+            "units": {"tv": {"drive_id": "0A", "pool": "main"}},
             "agents": {
-                "site-a": {"token_sha256": token_hash("token-a"), "pools": ["main"]},
-                "site-b": {"token_sha256": token_hash("token-b"), "pools": ["main"]},
-                "nobody": {"token_sha256": token_hash("token-c"), "pools": []},
+                "site-a": {"token_sha256": token_hash("token-a"), "units": {"tv": {}}},
+                "site-b": {"token_sha256": token_hash("token-b"), "units": {"tv": {}}},
+                "nobody": {"token_sha256": token_hash("token-c")},
             },
         }
     )
