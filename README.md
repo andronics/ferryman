@@ -79,7 +79,7 @@ Write `/etc/ferryman/config.yaml`: the example above with your drive ids and key
 
 ```bash
 ferryman verify                                    # offline: config, paths, key and secret files, rclone
-install -Dm644 contrib/ferryman.service /etc/systemd/system/ferryman.service
+install -Dm644 contrib/systemd/ferryman.service /etc/systemd/system/ferryman.service
 systemctl daemon-reload && systemctl enable --now ferryman
 
 ferryman status                                    # units, mounts, servers, transfers

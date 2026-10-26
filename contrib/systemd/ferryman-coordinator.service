@@ -3,7 +3,7 @@
 #
 # Unlike the agent it needs no root: it only reads its config and the key
 # files, and writes its state. It runs as the `ferryman` system user
-# (contrib/ferryman.sysusers), sandboxed. Give that user read access:
+# (contrib/systemd/ferryman.sysusers), sandboxed. Give that user read access:
 #   chgrp -R ferryman /etc/ferryman/coordinator.yaml /etc/ferryman/keys
 #   chmod 0640 /etc/ferryman/coordinator.yaml /etc/ferryman/keys/*.json
 #   chmod 0750 /etc/ferryman/keys
