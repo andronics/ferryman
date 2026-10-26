@@ -175,11 +175,53 @@ class RuleWhen(_Model):
         return self
 
 
+class RuleLimit(_Model):
+    count: int = Field(default=3, ge=1)
+    within: float = 3600.0
+
+    @field_validator("within", mode="before")
+    @classmethod
+    def _within(cls, v: object) -> float:
+        return duration(v)
+
+
+Action = Literal["restart", "retry", "run", "tune", "rotate"]
+
+
+class RuleDo(_Model):
+    """What a rule does when it fires (phase 2): restart a unit, retry a
+    failed transfer, run a transfer, re-tune a host, rotate a pool. Targets
+    default to the event's own; agent, unit, transfer and pool take the
+    placeholders {agent} and {subject} (the event's)."""
+
+    action: Action
+    agent: str | None = None
+    unit: str | None = None
+    transfer: str | None = None
+    pool: str | None = None
+    delay: float = 0.0  # wait first; cancelled if the problem closes meanwhile
+    limit: RuleLimit = RuleLimit()  # most actions per rule and target in a window
+    every: float | None = None  # while the problem stays open, act again this often
+    dry_run: bool = False  # record what it would do (action.planned), do nothing
+
+    @field_validator("delay", "every", mode="before")
+    @classmethod
+    def _durations(cls, v: object) -> float | None:
+        return None if v is None else duration(v)
+
+
 class Rule(_Model):
     name: str
     match: RuleMatch = RuleMatch()
     when: RuleWhen | None = None
-    send: list[str] = Field(min_length=1)  # channel names
+    send: list[str] = Field(default_factory=list)  # channel names
+    do: RuleDo | None = None
+
+    @model_validator(mode="after")
+    def _something(self) -> Rule:
+        if not self.send and self.do is None:
+            raise ValueError(f"rule {self.name}: give it send, do, or both")
+        return self
 
 
 class Notifications(_Model):
@@ -1125,6 +1167,11 @@ class Events(_Model):
     silent_after: float = Field(default=120.0, ge=30)
 
 
+class Actions(_Model):
+    # false: every rule's `do` only records what it would do (action.planned).
+    enabled: bool = True
+
+
 class ControllerConfig(_Model):
     listen: Listen = Listen()
     ui: Ui = Ui()
@@ -1133,6 +1180,7 @@ class ControllerConfig(_Model):
     watch_timeout: float = 30.0
     events: Events = Events()
     notify: Notifications = Notifications()
+    actions: Actions = Actions()
     health: Health = Health()
     tuning: Tuning = Tuning()
     defaults: UnitDefaults = UnitDefaults()
@@ -1174,7 +1222,45 @@ class ControllerConfig(_Model):
             except ValidationError as e:
                 raise ValueError(f"agent {name}: {_errors(e)}") from None
         self._sync_overlaps()
+        for rule in self.notify.rules or []:
+            if rule.do is not None:
+                self._check_do(rule)
         return self
+
+    def _check_do(self, rule: Rule) -> None:
+        """An action's target must be workable out from the events it
+        matches, or given, and what's named must exist."""
+        do, kind = rule.do, rule.match.kind or ""
+        assert do is not None
+        family = kind.split(".", 1)[0] if kind else ""
+
+        def fixed(v: str | None) -> str | None:
+            return v if v is not None and "{" not in v else None
+
+        err = f"rule {rule.name}: {do.action}"
+        if do.action == "restart" and do.unit is None and family != "unit":
+            raise ValueError(f"{err} needs a unit: match unit.* events or give unit")
+        if do.action == "retry" and family != "transfer":
+            raise ValueError(f"{err} retries the failed transfer: match transfer.* events")
+        if do.action == "run" and do.transfer is None:
+            raise ValueError(f"{err} needs a transfer")
+        if do.action == "rotate" and do.pool is None and family not in ("pool", "transfer"):
+            raise ValueError(f"{err} needs a pool: match pool.* or transfer.* events or give pool")
+        agent = fixed(do.agent)
+        if agent is not None and agent not in self.agents:
+            raise ValueError(f"{err}: unknown agent {agent!r}")
+        if (pool := fixed(do.pool)) is not None and pool not in self.pools:
+            raise ValueError(f"{err}: unknown pool {pool!r}")
+        if (unit := fixed(do.unit)) is not None:
+            if unit not in self.units:
+                raise ValueError(f"{err}: unknown unit {unit!r}")
+            if agent is not None and unit not in self.agents[agent].units:
+                raise ValueError(f"{err}: unit {unit} is not bound on {agent}")
+        if (transfer := fixed(do.transfer)) is not None:
+            on = [a for a, spec in self.agents.items() if transfer in spec.transfers]
+            if not on or (agent is not None and agent not in on):
+                where = f"on {agent}" if agent else "on any agent"
+                raise ValueError(f"{err}: no transfer {transfer!r} {where}")
 
     def _sync_overlaps(self) -> None:
         """A sync deletes whatever it doesn't have at its destination, so one
