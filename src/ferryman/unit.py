@@ -64,6 +64,8 @@ class UnitSupervisor:
         self.warm: dict[str, Any] | None = None
         self.warm_poll_interval = WARM_POLL
         self.warm_retry_delay = WARM_RETRY_DELAY
+        # Upload chunk size from an applied tuning profile (bytes), if any.
+        self.tuned_chunk: int | None = None
         self._warm_task: asyncio.Task[None] | None = None
         self._restart_task: asyncio.Task[None] | None = None
         # A failure has been reported and the unit has not been ready since.
@@ -89,8 +91,10 @@ class UnitSupervisor:
         The drive-side upload tuning lives here rather than on transfer jobs:
         a job must resolve to the mount's own fs instance (so one `backend set`
         moves both), and only the instance's config can carry backend options.
-        128M chunks: Drive charges a fixed round trip per chunk, and at the 8M
-        default a stream idled about half the time. stop_on_upload_limit makes
+        The chunk size is the unit's own option, else an applied tuning
+        profile's, else 128M: Drive charges a fixed round trip per chunk, and
+        at the 8M default a stream idled about half the time. A bare number
+        is KiB to rclone, hence the B. stop_on_upload_limit makes
         the daily cap a fatal error a job or the mount's stats report, instead
         of hours of silent retries."""
         u = self.unit
@@ -100,7 +104,7 @@ class UnitSupervisor:
             opts["service_account_file"] = str(self.key_path)
             if u.drive_id:
                 opts["team_drive"] = u.drive_id
-            opts["chunk_size"] = "128M"
+            opts["chunk_size"] = f"{self.tuned_chunk}B" if self.tuned_chunk else "128M"
             opts["stop_on_upload_limit"] = "true"
         opts.update(u.options)
         return f"[{stanza or self.name}]\n" + "".join(f"{k} = {v}\n" for k, v in opts.items())

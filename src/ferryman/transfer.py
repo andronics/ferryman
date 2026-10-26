@@ -157,9 +157,8 @@ class TransferRunner:
         pool = agent.pools.get(sup.unit.pool or "")
         attempts = pool.size if pool and pool.rotates else 1
         endpoint, extra = _ENDPOINTS[t.mode]
-        # Eight transfers: at Drive's per-request latency one stream idles
-        # about half the time, eight of them fill the uplink.
-        job_config: dict[str, Any] = {"Transfers": t.transfers, "Checkers": t.checkers,
+        s = agent.tuner.transfer_settings(self.name)
+        job_config: dict[str, Any] = {"Transfers": s["transfers"], "Checkers": s["checkers"],
                                       "BufferSize": "16M", "DryRun": dry_run}  # fmt: skip
         if t.max_delete is not None:
             job_config["MaxDelete"] = t.max_delete

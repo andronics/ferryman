@@ -88,16 +88,19 @@ def build_app(agent: Agent) -> Starlette:
 
     async def tune(request: Request) -> Any:
         body = await _body(request)
-        unit, dry_run = body.get("unit"), bool(body.get("dry_run"))
+        unit, dry_run, apply = body.get("unit"), bool(body.get("dry_run")), body.get("apply")
         if dry_run:
             return await agent.tuner.run(unit, dry_run=True)
         # Checked here too, so a refusal answers the request instead of
         # failing a task nobody waits for.
         agent.tuner.check(unit)
-        task = agent.spawn(agent.tuner.run(unit), "tune")
+        task = agent.spawn(agent.tuner.run(unit, apply=apply), "tune")
         if body.get("wait", True):
             return await asyncio.shield(task)
         return {"started": True}
+
+    async def tune_apply(_: Request) -> Any:
+        return {"applied": await agent.tuner.apply()}
 
     async def pools(_: Request) -> Any:
         out = []
@@ -133,6 +136,7 @@ def build_app(agent: Agent) -> Starlette:
         Route("/v1/transfers/{name}/run", _json(run_transfer), methods=["POST"]),
         Route("/v1/tune", _json(tune_status)),
         Route("/v1/tune", _json(tune), methods=["POST"]),
+        Route("/v1/tune/apply", _json(tune_apply), methods=["POST"]),
         Route("/v1/pools", _json(pools)),
         Route("/v1/pools/{name}/rotate", _json(rotate), methods=["POST"]),
         Route("/v1/throttle", _json(throttle), methods=["POST"]),
