@@ -21,6 +21,8 @@ Type=exec
 User=ferryman
 Group=ferryman
 ExecStart=/usr/local/bin/ferryman controller -c /etc/ferryman/controller.yaml
+# It also re-reads its config by itself when the file changes.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 # In-flight long polls are cut after 2s; agents simply retry.

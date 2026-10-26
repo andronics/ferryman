@@ -1,9 +1,10 @@
 # ferryman on Kubernetes (tested on Talos): the agent as a privileged
-# DaemonSet, and the controller that leases keys to it, so no key file is
-# stored on a node. See the wiki's Deployment page (Talos / Kubernetes).
+# DaemonSet, and the controller that holds every node's config and leases
+# keys to it. See the wiki's Deployment page (Talos / Kubernetes).
 #
 # Before applying:
-#   1. Edit agent/config.yaml and controller/controller.yaml.
+#   1. Edit controller/controller.yaml: the units, and each node's binding
+#      of them (agent/agent.yaml only points the agents at the controller).
 #   2. Create the two secrets this doesn't generate (or SOPS-encrypt them
 #      for Flux): one controller token per node, and the service-account
 #      keys (<client_email>.json each):
@@ -17,6 +18,10 @@
 #        kubectl -n ferryman create secret generic ferryman-agent-tokens --from-file=tokens/
 #        kubectl -n ferryman create secret generic ferryman-keys --from-file=keys/
 #   3. kubectl apply -k contrib/k8s
+#
+# Later edits to controller/controller.yaml: `kubectl apply -k` again. The
+# controller re-reads it once the kubelet has updated the Secret (within
+# a minute or so), and each node applies its part in place.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ferryman
@@ -26,4 +31,4 @@ resources:
   - agent
 images:
   - name: ghcr.io/andronics/ferryman
-    newTag: "0.2.0"
+    newTag: "0.3.0"

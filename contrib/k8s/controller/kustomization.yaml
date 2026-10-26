@@ -5,9 +5,12 @@ resources:
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml
-# controller.yaml becomes a Secret (it holds the agents' token hashes);
-# the hash suffix restarts the controller when it changes.
+# controller.yaml becomes a Secret (it holds the agents' token hashes).
+# No hash suffix: the Secret is updated in place, the kubelet refreshes the
+# mounted file, and the controller reloads it without a restart.
 secretGenerator:
   - name: ferryman-controller-config
+    options:
+      disableNameSuffixHash: true
     files:
       - controller.yaml
