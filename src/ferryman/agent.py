@@ -340,8 +340,8 @@ class Agent:
                 report[sup.name] = sup.state.value
                 continue
             reason = None
-            if sup.unit.mount:
-                path = self.layout.mount_path(sup.name)
+            if sup.unit.mounts:
+                path = sup.mount_paths[0]
                 if not mountutil.is_mounted(path):
                     reason = "not mounted"
                 elif not await mountutil.responsive(path, self.cfg.health.stat_timeout):
@@ -358,7 +358,8 @@ class Agent:
             if reason:
                 report[sup.name] = "restarting"
                 continue
-            report[sup.name] = "healthy"
+            notes = await sup.heal_mounts()
+            report[sup.name] = "; ".join(["healthy", *notes])
             await self._unhandled_cap_hit(sup)
         return report
 

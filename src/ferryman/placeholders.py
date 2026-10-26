@@ -1,6 +1,6 @@
-"""Placeholders in a transfer's `source` and `dest`.
+"""Placeholders in mount paths and in a transfer's `source` and `dest`.
 
-Fixed for the agent's lifetime (source and dest):
+Fixed for the agent's lifetime (mount paths take all but {transfer}):
   {hostname}    the agent's hostname (config `hostname:`, $FERRYMAN_HOSTNAME, or the system's)
   {transfer}    the transfer's name
   {unit}        its unit's name
@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from datetime import datetime
 
 FIXED = frozenset({"hostname", "transfer", "unit", "env"})
+MOUNT = frozenset({"hostname", "unit", "env"})
 TIME = frozenset({"now", "date", "weekday"})
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # strftime directives whose value repeats every week.

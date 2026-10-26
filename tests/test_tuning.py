@@ -353,7 +353,7 @@ async def test_own_settings_win_over_the_profile(
     make_config: Callable[..., Config], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     agent = Agent(make_config(
-        units={"media-tv": {"mountpoint": "media/tv", "pool": "main", "drive_id": "0A",
+        units={"media-tv": {"mounts": [{"path": "/pool/tv"}], "pool": "main", "drive_id": "0A",
                             "options": {"chunk_size": "256M"}}},
         transfers={"media-tv": {"unit": "media-tv", "transfers": 3}},
     ))  # fmt: skip

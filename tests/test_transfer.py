@@ -7,6 +7,8 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from ferryman import mountutil
 from ferryman.agent import Agent
 from ferryman.config import Config
@@ -22,7 +24,7 @@ async def test_move_succeeds(agent: Agent, fake_rclone: FakeRclone, tmp_path: Pa
     assert result["ok"] and result["files"] == 3 and result["bytes"] == 1024
     endpoint, params = next(c for c in fake_rclone.calls if c[0].startswith("sync/"))
     assert endpoint == "sync/move"
-    assert params["srcFs"] == str(tmp_path / "local/media/tv")
+    assert params["srcFs"] == str(tmp_path / "local/media-tv")
     assert params["dstFs"] == "media-tv:"
     assert params["deleteEmptySrcDirs"] is True
     assert params["_group"] == "transfer-media-tv"
@@ -66,7 +68,7 @@ async def test_other_errors_do_not_rotate(agent: Agent, fake_rclone: FakeRclone)
 async def test_missing_source_is_nothing_to_do(
     agent: Agent, fake_rclone: FakeRclone, tmp_path: Path
 ) -> None:
-    (tmp_path / "local/media/tv").rmdir()
+    (tmp_path / "local/media-tv").rmdir()
     result = await agent.transfers["media-tv"].run()
     assert result["ok"] and "does not exist" in result["skipped"]
     assert fake_rclone.calls == []
@@ -139,17 +141,20 @@ async def test_warm_retries_once_on_directory_errors(agent: Agent, fake_rclone: 
     assert fake_rclone.endpoints().count("vfs/refresh") == 4
 
 
-def test_make_dirs_owns_what_it_creates(tmp_path: Path) -> None:
+def test_make_mountpoint_creates_only_the_last_directory(tmp_path: Path) -> None:
     (tmp_path / "remote").mkdir(mode=0o700)
-    target = tmp_path / "remote/media/tv"
+    target = tmp_path / "remote/tv"
     uid, gid = os.getuid(), os.getgid()
-    mountutil.make_dirs(target, uid, gid, 0o2775)
-    for d in (tmp_path / "remote/media", target):
-        st = d.stat()
-        assert (st.st_uid, st.st_gid, st.st_mode & 0o7777) == (uid, gid, 0o2775)
-    # Existing directories keep their mode.
+    mountutil.make_mountpoint(target, uid, gid, 0o2775)
+    st = target.stat()
+    assert (st.st_uid, st.st_gid, st.st_mode & 0o7777) == (uid, gid, 0o2775)
+    # The parent is not touched, and a missing one is an error, not a mkdir -p:
+    # a typo in an absolute path must not build a tree at the filesystem root.
     assert (tmp_path / "remote").stat().st_mode & 0o7777 == 0o700
-    mountutil.make_dirs(target, uid, gid, 0o2775)  # idempotent
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        mountutil.make_mountpoint(tmp_path / "typo/tv", uid, gid, 0o2775)
+    assert not (tmp_path / "typo").exists()
+    mountutil.make_mountpoint(target, uid, gid, 0o2775)  # idempotent
 
 
 async def test_dest_expands_hostname_and_options_reach_the_job(
@@ -157,7 +162,7 @@ async def test_dest_expands_hostname_and_options_reach_the_job(
 ) -> None:
     cfg = make_config(
         hostname="pve-01",
-        units={"backups": {"mountpoint": "backups", "pool": "main", "mount": False}},
+        units={"backups": {"pool": "main"}},
         transfers={"dump": {"unit": "backups", "mode": "sync", "source": str(tmp_path / "dump"),
                             "dest": "proxmox/{hostname}/dump", "exclude": ["*.tmp"],
                             "min_age": "10m", "max_delete": 20}},
@@ -191,7 +196,7 @@ async def test_sync_from_an_empty_source_is_refused(
         agent.units["media-tv"].state = State.READY
         return agent
 
-    (tmp_path / "local/media/tv").mkdir(parents=True)
+    (tmp_path / "local/mirror").mkdir(parents=True)
     agent = build(allow_empty=False)
     result = await agent.transfers["mirror"].run()
     assert not result["ok"] and "is empty" in result["error"]
@@ -207,8 +212,7 @@ async def test_sync_from_an_empty_source_is_refused(
 async def test_a_run_keeps_one_dest_across_rotation_retries(
     make_config: Callable[..., Config], fake_rclone: FakeRclone, tmp_path: Path
 ) -> None:
-    cfg = make_config(units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
-                                          "drive_id": "0A", "mount": False}},
+    cfg = make_config(units={"media-tv": {"pool": "main", "drive_id": "0A"}},
                       transfers={"media-tv": {"unit": "media-tv",
                                               "dest": "in/{date}/{transfer}"}})  # fmt: skip
     agent = Agent(cfg)
@@ -218,7 +222,7 @@ async def test_a_run_keeps_one_dest_across_rotation_retries(
     lease = await agent.pools["main"].lease()
     sup.key, sup.key_path = lease.key, lease.path
     sup.state = State.READY
-    (tmp_path / "local/media/tv").mkdir(parents=True)
+    (tmp_path / "local/media-tv").mkdir(parents=True)
     fake_rclone.job_outcomes = [QUOTA, None]
     async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
         result = await agent.transfers["media-tv"].run()

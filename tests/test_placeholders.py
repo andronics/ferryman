@@ -80,7 +80,9 @@ def test_config_rules(make_config: Callable[..., Config], tmp_path: Path) -> Non
     assert layout.transfer_source("dump") == Path("/srv/pve-01/dump")
     assert layout.transfer_dest("dump", SUNDAY) == "d/sun"
     assert layout.claim_dest("dump") == "d"
-    assert Layout(transfer(source="{unit}")).transfer_source("dump") == tmp_path / "local/media-tv"
+    assert Layout(transfer(source="/srv/{unit}")).transfer_source("dump") == Path("/srv/media-tv")
+    with pytest.raises(ValueError, match="absolute"):
+        transfer(source="{unit}")  # relative once expanded: no roots to resolve it against
 
     transfer(mode="copy", dest="archive/{now:%Y/%m}")  # dated archives are fine for copy
     with pytest.raises(ValueError, match="full copy each time"):
@@ -89,13 +91,19 @@ def test_config_rules(make_config: Callable[..., Config], tmp_path: Path) -> Non
         transfer(source="/srv/{date}")
 
 
-def test_check_placeholders_reports_unset_env(
-    make_config: Callable[..., Config], monkeypatch: pytest.MonkeyPatch
+def test_check_paths_reports_unset_env(
+    make_config: Callable[..., Config], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv("NODE_NAME", raising=False)
-    cfg = make_config(transfers={"dump": {"unit": "media-tv", "dest": "{env:NODE_NAME}"}})
-    assert Layout(cfg).check_placeholders() == [
-        "transfer dump: {env:NODE_NAME}: $NODE_NAME is not set"
+    cfg = make_config(
+        units={"media-tv": {"pool": "main",
+                            "mounts": [{"path": str(tmp_path / "remote/{env:NODE_NAME}")}]}},
+        transfers={"dump": {"unit": "media-tv", "dest": "{env:NODE_NAME}"}},
+    )  # fmt: skip
+    assert Layout(cfg).check_paths() == [
+        "unit media-tv: {env:NODE_NAME}: $NODE_NAME is not set",
+        "transfer dump: {env:NODE_NAME}: $NODE_NAME is not set",
     ]
     monkeypatch.setenv("NODE_NAME", "talos-w2")
-    assert Layout(cfg).check_placeholders() == []
+    assert Layout(cfg).check_paths() == []
+    assert Layout(cfg).mount_paths("media-tv") == [tmp_path / "remote/talos-w2"]
