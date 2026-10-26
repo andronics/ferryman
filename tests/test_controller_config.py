@@ -297,7 +297,17 @@ def test_controller_example_is_valid_and_complete() -> None:
     """contrib/controller.example.yaml loads and mentions every setting of
     the controller's own models, so it cannot fall behind the code."""
     cfg = ControllerConfig.load(EXAMPLE)
-    for section in ("listen", "ui", "rclone", "events", "notify", "health", "tuning", "defaults"):
+    for section in (
+        "listen",
+        "ui",
+        "rclone",
+        "events",
+        "notify",
+        "actions",
+        "health",
+        "tuning",
+        "defaults",
+    ):
         value = getattr(cfg, section)
         assert value == type(value)(), f"{section} differs from its defaults"
     raw = yaml.safe_load(EXAMPLE.read_text())
@@ -328,3 +338,54 @@ def test_controller_example_is_valid_and_complete() -> None:
         problems = Layout(flat).check_paths()
         assert [p for p in problems if not p.endswith("does not exist")] == [], agent
     assert cfg.agent_pools("emby-01") == ["uploads"]
+
+
+# ------------------------------------------------------------ rules that act
+
+
+def with_rules(*rules: dict[str, Any]) -> dict[str, Any]:
+    return base(
+        notify={"channels": {"ops": {"webhook": {"url": "http://h"}}}, "rules": list(rules)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("do", "match", "message"),
+    [
+        ({"action": "restart"}, {"kind": "transfer.failed"}, "restart needs a unit"),
+        ({"action": "retry"}, {"kind": "unit.failed"}, "match transfer"),
+        ({"action": "run"}, {}, "run needs a transfer"),
+        ({"action": "rotate"}, {"kind": "unit.failed"}, "rotate needs a pool"),
+        ({"action": "tune", "agent": "nope"}, {}, "unknown agent 'nope'"),
+        ({"action": "restart", "unit": "nope"}, {}, "unknown unit 'nope'"),
+        ({"action": "restart", "unit": "films", "agent": "emby-01"}, {}, "not bound on emby-01"),
+        ({"action": "run", "transfer": "tv-up", "agent": "emby-01"}, {}, "no transfer 'tv-up' on"),
+        ({"action": "rotate", "pool": "nope"}, {}, "unknown pool"),
+        ({"action": "restart", "delay": "soon"}, {"kind": "unit.failed"}, "invalid duration"),
+    ],
+)
+def test_actions_are_checked_at_load(
+    do: dict[str, Any], match: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        load(with_rules({"name": "r", "match": match, "do": do}))
+
+
+def test_actions_that_load() -> None:
+    cfg = load(with_rules(
+        {"name": "heal", "match": {"kind": "unit.failed"}, "when": {"count": 3, "within": "15m"},
+         "send": ["ops"], "do": {"action": "restart", "delay": "1m"}},
+        {"name": "retry", "match": {"kind": "transfer.failed"}, "do": {"action": "retry"}},
+        {"name": "catch-up", "match": {"kind": "unit.recovered"},
+         "do": {"action": "run", "transfer": "tv-up", "agent": "{agent}"}},
+        {"name": "quota", "match": {"kind": "transfer.failed"}, "do": {"action": "rotate"}},
+    ))  # fmt: skip
+    heal = cfg.notify.rules[0].do if cfg.notify.rules else None
+    assert heal is not None and heal.delay == 60 and heal.limit.count == 3
+    assert heal.limit.within == 3600 and heal.every is None
+    assert cfg.actions.enabled
+
+
+def test_a_rule_sends_or_does() -> None:
+    with pytest.raises(ValidationError, match="give it send, do, or both"):
+        load(with_rules({"name": "nothing", "match": {"kind": "unit.failed"}}))

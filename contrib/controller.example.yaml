@@ -69,6 +69,29 @@ notify:
   #   - name: quiet-agent         # globs: kind, agent ("controller": its own), subject
   #     match: {kind: agent.silent, agent: controller}
   #     send: [ha]
+  #
+  # A rule can also act (`do`, with or instead of `send`): restart a unit,
+  # retry a failed transfer, run a transfer, re-tune a host, rotate a pool.
+  # Targets default to the event's own; agent/unit/transfer/pool take
+  # {agent} and {subject}. Never on events that arrived late (a backlog).
+  #   - name: heal
+  #     match: {kind: unit.failed}
+  #     when: {count: 3, within: 15m}
+  #     send: [ops]
+  #     do:
+  #       action: restart         # restart | retry | run | tune | rotate
+  #       delay: 1m               # cancelled if the unit recovers meanwhile
+  #       limit: {count: 3, within: 1h}   # most actions per target; then action.limited
+  #       every: null             # act again while the problem stays open; null: once
+  #       dry_run: false          # true: only record what it would do
+  #   - name: catch-up
+  #     match: {kind: unit.recovered, subject: media-tv}
+  #     do: {action: run, transfer: tv-staging, agent: "{agent}"}
+
+# false: every rule's `do` only records what it would have done
+# (action.planned): a kill switch, and a way to try new rules.
+actions:
+  enabled: true
 
 # Every agent's health check.
 health:
