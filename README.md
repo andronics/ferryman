@@ -91,7 +91,7 @@ ferryman pool                                      # keys: current, exhausted, f
 
 ### Or with Docker
 
-The image (`ghcr.io/andronics/ferryman`, amd64 and arm64) bundles a pinned rclone and FUSE. [`docker-compose.yml`](docker-compose.yml) runs the agent privileged on the host network, with your mount paths' parent bound `rshared` at the same path, so the mounts show on the host:
+The image (`ghcr.io/andronics/ferryman`, amd64 and arm64) bundles a pinned rclone and FUSE. [`contrib/docker/docker-compose.yml`](contrib/docker/docker-compose.yml) runs the agent privileged on the host network, with your mount paths' parent bound `rshared` at the same path, so the mounts show on the host:
 
 ```bash
 docker compose up -d                               # the agent; edit the volumes first

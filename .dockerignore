@@ -32,7 +32,7 @@ tests/
 scripts/
 *.md
 !README.md
-docker-compose*.yml
+contrib/docker/
 
 # CI/CD
 .github/

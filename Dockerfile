@@ -1,6 +1,6 @@
 # ferryman Dockerfile - Multi-stage build
 # One image for both the agent (root: FUSE, bind mounts) and the coordinator
-# (drops to PUID:PGID). See docker-compose.yml for how to run each.
+# (drops to PUID:PGID). See contrib/docker/docker-compose.yml for how to run each.
 
 # ============================================================
 # Stage 1: Builder
@@ -91,7 +91,7 @@ ENV FERRYMAN_CONFIG=/etc/ferryman/config.yaml \
     FERRYMAN_COORDINATOR_CONFIG=/etc/ferryman/coordinator.yaml
 
 # Health check: the agent answers on its API socket (the coordinator
-# service overrides this in docker-compose.yml)
+# service overrides this in contrib/docker/docker-compose.yml)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD ferryman status > /dev/null || exit 1
 
