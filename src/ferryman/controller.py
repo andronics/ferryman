@@ -68,6 +68,9 @@ PROBE_TICK = 60.0
 CONFIG_TICK = 10.0
 # How often agents' silence and pools' exhaustion are looked at.
 WATCH_TICK = 30.0
+# A command its agent doesn't collect in this long expires: an agent that was
+# away must not carry out, much later, what was meant for then.
+COMMAND_TTL = 600.0
 
 
 def token_hash(token: str) -> str:
@@ -341,6 +344,7 @@ class Controller:
             try:
                 self.check_agents()
                 self.check_pools()
+                self.expire_commands()
                 if time.time() - compacted > 86400:
                     compacted = time.time()
                     self.events.compact()  # drop what's past events.retention_days
@@ -368,12 +372,15 @@ class Controller:
             self.events.emit("agent.config_applied", agent, now_in, "info", resolves=True)
 
     async def queue(self, agent: str, action: str, target: str, by: str,
-                    **args: Any) -> dict[str, Any]:  # fmt: skip
+                    rule: str | None = None, **args: Any) -> dict[str, Any]:  # fmt: skip
+        """A command for an agent: `by` a user of the UI, or a `rule`."""
         if agent not in self.cfg.agents:
             raise KeyError(agent)
+        now = time.time()
         cmd = {"id": next(self._command_ids), "agent": agent, "action": action,
-               "target": target, "args": args, "by": by, "state": "pending",
-               "created": time.time(), "result": None}  # fmt: skip
+               "target": target, "args": args, "by": f"rule:{rule}" if rule else by,
+               "rule": rule, "state": "pending", "created": now, "expires": now + COMMAND_TTL,
+               "result": None}  # fmt: skip
         self.commands.append(cmd)
         log.info("%s: %s %s on %s (command %d)", by, action, target, agent, cmd["id"])
         async with self._commands_changed[agent]:
@@ -381,7 +388,21 @@ class Controller:
         return cmd
 
     def _pending(self, agent: str) -> list[dict[str, Any]]:
+        self.expire_commands()
         return [c for c in self.commands if c["agent"] == agent and c["state"] == "pending"]
+
+    def expire_commands(self) -> None:
+        now = time.time()
+        for c in self.commands:
+            if c["state"] == "pending" and c.get("expires", now) < now:
+                c["state"] = "expired"
+                c["finished"] = now
+                what = f"{c['action']} {c['target']} on {c['agent']}"
+                log.warning("command %d expired: %s was never collected", c["id"], what)
+                if c.get("rule"):
+                    self.events.emit("action.expired", c["agent"],
+                                     f"{what} (rule {c['rule']}): the agent never collected it",
+                                     "warning")  # fmt: skip
 
     async def take(self, agent: str, timeout: float) -> list[dict[str, Any]]:
         """An agent's pending commands, waiting up to `timeout` for one."""
@@ -400,6 +421,13 @@ class Controller:
                 c["state"] = "done" if result.get("ok") else "failed"
                 c["result"] = result
                 c["finished"] = time.time()
+                if c.get("rule"):
+                    what = f"{c['action']} {c['target']} on {agent} (rule {c['rule']})"
+                    if result.get("ok"):
+                        self.events.emit("action.done", agent, what, "info")
+                    else:
+                        self.events.emit("action.failed", agent,
+                                         f"{what}: {result.get('error')}", "error")  # fmt: skip
                 return
         raise KeyError(f"command {cmd_id}")
 
