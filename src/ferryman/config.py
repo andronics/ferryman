@@ -249,6 +249,10 @@ class Mount(_Model):
     path: str
     allow_other: bool = True  # other users (a media server) may use the mount
     default_permissions: bool = True  # the kernel enforces the mode bits
+    # A kernel bind of the unit's writable mount, remounted ro: same files
+    # and cache, writes refused (root only). If every mount is read_only,
+    # the first is rclone's own, with --read-only, and the rest bind to it.
+    read_only: bool = False
 
     @field_validator("path")
     @classmethod
@@ -292,10 +296,34 @@ class Unit(_Model):
     def _mode(cls, v: object) -> object:
         return _cache_mode(v)
 
+    @property
+    def primary(self) -> int:
+        """Index of the mount the process itself makes: the first writable
+        one (the read_only ones bind to it), else the first."""
+        return next((i for i, m in enumerate(self.mounts) if not m.read_only), 0)
+
     @model_validator(mode="after")
     def _drive_needs_pool(self) -> Unit:
         if self.backend == "drive" and not self.pool:
             raise ValueError("drive units need a pool")
+        return self
+
+    @model_validator(mode="after")
+    def _binds_inherit(self) -> Unit:
+        # A bind mount shares the FUSE mount it binds: its allow_other and
+        # default_permissions are that mount's, whatever it says.
+        if not self.mounts:
+            return self
+        p = self.mounts[self.primary]
+        for i, m in enumerate(self.mounts):
+            if i == self.primary or not m.read_only:
+                continue
+            for opt in ("allow_other", "default_permissions"):
+                if getattr(m, opt) != getattr(p, opt):
+                    raise ValueError(
+                        f"read_only mount {m.path} binds {p.path}, so its {opt} is "
+                        f"{p.path}'s ({getattr(p, opt)}): leave it out or set it there"
+                    )
         return self
 
 

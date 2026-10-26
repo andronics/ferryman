@@ -172,3 +172,48 @@ async def test_backup_sync_through_an_rcd_unit(
         assert sorted(p.name for p in target.iterdir()) == ["vzdump-102.vma.zst"]
     finally:
         await agent.stop()
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="read-only mounts are bind mounts: root only")
+async def test_read_only_bind_shares_the_mount_and_survives_a_crash(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    backing = tmp_path / "drive"
+    backing.mkdir()
+    (backing / "a.txt").write_text("a\n")
+    (tmp_path / "remote").mkdir()
+    cfg = make_config(
+        units={"docs": {"backend": "alias", "options": {"remote": str(backing)}, "warm": False,
+                        "mounts": [{"path": str(tmp_path / "remote/ro"), "read_only": True},
+                                   {"path": str(tmp_path / "remote/rw")}]}},
+        transfers={},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    sup = agent.units["docs"]
+    ro, rw = agent.layout.mount_paths("docs")
+    try:
+        await agent.start()
+        await wait_for(lambda: sup.ready)
+        assert sup.primary_path == rw
+        assert [m["state"] for m in sup.status()["mounts"]] == ["mounted", "mounted"]
+        await asyncio.to_thread((rw / "new.txt").write_text, "new\n")
+        assert await asyncio.to_thread((ro / "new.txt").read_text) == "new\n"
+        with pytest.raises(OSError, match="Read-only file system"):
+            await asyncio.to_thread((ro / "w.txt").write_text, "x")
+
+        # The bind dies with the process; the restart makes it again.
+        old_pid = sup.pid
+        assert old_pid
+        os.kill(old_pid, signal.SIGKILL)
+        await wait_for(lambda: not sup.ready)
+        await wait_for(lambda: sup.ready and sup.pid != old_pid)
+        assert await asyncio.to_thread((ro / "a.txt").read_text) == "a\n"
+
+        # Lost on its own: re-bound in place.
+        assert await mountutil.unbind(ro)
+        health = await agent.check_health()
+        assert health["docs"] == f"healthy; {ro} not mounted: re-mounted", health
+        assert await asyncio.to_thread((ro / "a.txt").read_text) == "a\n"
+    finally:
+        await agent.stop()
+    assert not mountutil.is_mounted(ro) and not mountutil.is_mounted(rw)

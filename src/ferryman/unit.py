@@ -90,6 +90,16 @@ class UnitSupervisor:
         return self.layout.mount_paths(self.name)
 
     @property
+    def primary_path(self) -> Path:
+        """Where the process's own `rclone mount` is (Unit.primary)."""
+        return self.mount_paths[self.unit.primary]
+
+    def _joined(self) -> list[tuple[Mount, Path]]:
+        """The mounts that join the process's own: rc mounts and read-only binds."""
+        pairs = zip(self.unit.mounts, self.mount_paths, strict=True)
+        return [(m, p) for i, (m, p) in enumerate(pairs) if i != self.unit.primary]
+
+    @property
     def ready(self) -> bool:
         return self.state is State.READY
 
@@ -153,9 +163,9 @@ class UnitSupervisor:
         #
         # --vfs-cache-max-size is per mount, so the caps don't bound total
         # disk use; --vfs-cache-min-free-space guards the shared cache disk.
-        primary = self.unit.mounts[0]
+        primary = self.unit.mounts[self.unit.primary]
         argv = [
-            self.cfg.rclone.binary, "mount", f"{n}:", str(self.mount_paths[0]),
+            self.cfg.rclone.binary, "mount", f"{n}:", str(self.primary_path),
             *common,
             "--rc",
             "--allow-non-empty",
@@ -175,6 +185,9 @@ class UnitSupervisor:
             argv.append("--allow-other")
         if primary.default_permissions:
             argv.append("--default-permissions")
+        if primary.read_only:
+            # Every mount is read_only: the whole VFS is (the rest bind to it).
+            argv.append("--read-only")
         if uid is not None:
             argv += ["--uid", str(uid)]
         if gid is not None:
@@ -200,11 +213,18 @@ class UnitSupervisor:
         proc = self._proc
         if proc and proc.returncode is None:
             if self.unit.mounts and was_ready:
-                # rclone mount exits on its own once its own mountpoint is
-                # unmounted, so that one goes last: extras unmounted after it
-                # would be left as dead endpoints.
-                for path in reversed(self.mount_paths):
-                    await mountutil.unmount(path)
+                # Binds first: they hold the process's FUSE connection open,
+                # so rclone would not exit. Then the rc mounts, then the
+                # process's own, which ends it: anything still mounted after
+                # that would be left a dead endpoint.
+                joined = self._joined()
+                for mount, path in joined:
+                    if mount.read_only:
+                        await mountutil.unbind(path)
+                for mount, path in joined:
+                    if not mount.read_only:
+                        await mountutil.unmount(path)
+                await mountutil.unmount(self.primary_path)
             else:
                 # Still starting (nothing to unmount yet) or an rcd, which
                 # never exits by itself: ask it to stop now rather than wait.
@@ -251,8 +271,14 @@ class UnitSupervisor:
             "key": self.key,
             "pool": self.unit.pool,
             "mounts": [
-                {"path": str(p), "primary": i == 0, "state": self.mount_states.get(str(p), "down")}
-                for i, p in enumerate(self.mount_paths)
+                {
+                    "path": str(p),
+                    "primary": i == self.unit.primary,
+                    "kind": "rclone" if i == self.unit.primary else "bind" if m.read_only else "rc",
+                    "read_only": m.read_only,
+                    "state": self.mount_states.get(str(p), "down"),
+                }
+                for i, (m, p) in enumerate(zip(self.unit.mounts, self.mount_paths, strict=True))
             ],
             "restarts": self.restarts,
             "last_error": self.last_error,
@@ -305,7 +331,7 @@ class UnitSupervisor:
         for path in paths:
             await mountutil.clear_stale(path, self.cfg.health.stat_timeout)
         if paths:
-            self._make_mountpoint(paths[0])
+            self._make_mountpoint(self.primary_path)
         if self.pool is not None:
             lease = await self.pool.lease()
             self.key, self.key_path = lease.key, lease.path
@@ -342,16 +368,16 @@ class UnitSupervisor:
                 raise RuntimeError(
                     f"rclone exited with {proc.returncode} during startup (see {L.log_file(n)})"
                 )
-            if (not paths or mountutil.is_mounted(paths[0])) and await self.rc.alive():
+            if (not paths or mountutil.is_mounted(self.primary_path)) and await self.rc.alive():
                 break
             if time.monotonic() > deadline:
                 raise RuntimeError(f"not ready after {READY_TIMEOUT:.0f}s")
             await asyncio.sleep(0.5)
 
         if paths:
-            self.mount_states[str(paths[0])] = "mounted"
-            for mount, path in zip(self.unit.mounts[1:], paths[1:], strict=True):
-                await self.attach(mount, path)
+            self.mount_states[str(self.primary_path)] = "mounted"
+            for mount, path in self._joined():
+                await self.join(mount, path)
         self._set(State.READY)
         self.last_error = None
         log.info("unit %s: ready", n)
@@ -369,36 +395,56 @@ class UnitSupervisor:
         uid, gid, _, _ = resolved(self.cfg, self.name)
         mountutil.make_mountpoint(path, uid, gid, self.cfg.defaults.dir_mode)
 
-    async def attach(self, mount: Mount, path: Path) -> bool:
-        """Add an extra mount to the running process. No VFS options are
-        passed, so rclone reuses the VFS the process's own mount made from
-        its flags: one cache and one view for every path. (A VFS option that
-        differed would make a second VFS on the same cache directory.)"""
+    async def join(self, mount: Mount, path: Path) -> bool:
+        """Join a mount to the running process: over rc, or as a read-only
+        bind of the process's own mount. Either way it shares the process's
+        connection and VFS: one cache and one view for every path."""
         key = str(path)
-        with contextlib.suppress(RcError):
-            # A mount that died leaves rclone's record of it behind.
-            await self.rc.call("mount/unmount", mountPoint=key)
         try:
-            await mountutil.clear_stale(path, self.cfg.health.stat_timeout)
-            self._make_mountpoint(path)
-            await self.rc.call(
-                "mount/mount", fs=f"{self.name}:", mountPoint=key,
-                mountOpt={"AllowOther": mount.allow_other,
-                          "DefaultPermissions": mount.default_permissions,
-                          "AllowNonEmpty": True},
-            )  # fmt: skip
+            if mount.read_only:
+                await self._bind(path)
+            else:
+                await self._rc_mount(mount, path)
         except (RcError, OSError) as e:
             self.mount_states[key] = f"failed: {e}"
             self._mark_lost(key, f"could not mount: {e}")
             log.error("unit %s: could not mount %s: %s", self.name, path, e)
             return False
         self.mount_states[key] = "mounted"
-        log.info("unit %s: mounted %s", self.name, path)
+        log.info("unit %s: mounted %s%s", self.name, path, " (read-only bind)" * mount.read_only)
         if key in self._lost:
             self._lost.discard(key)
-            self.emit(Event("mount.recovered", f"{self.name}:{key}", "mounted again", "info",
-                            resolves=True))  # fmt: skip
+            self.emit(
+                Event("mount.recovered", f"{self.name}:{key}", "mounted again", "info",
+                      resolves=True)
+            )  # fmt: skip
         return True
+
+    async def _rc_mount(self, mount: Mount, path: Path) -> None:
+        # No VFS options: rclone then reuses the VFS the process's own mount
+        # made from its flags. (One that differed would make a second VFS on
+        # the same cache directory.)
+        key = str(path)
+        with contextlib.suppress(RcError):
+            # A mount that died leaves rclone's record of it behind.
+            await self.rc.call("mount/unmount", mountPoint=key)
+        await mountutil.clear_stale(path, self.cfg.health.stat_timeout)
+        self._make_mountpoint(path)
+        await self.rc.call(
+            "mount/mount", fs=f"{self.name}:", mountPoint=key,
+            mountOpt={"AllowOther": mount.allow_other,
+                      "DefaultPermissions": mount.default_permissions,
+                      "AllowNonEmpty": True},
+        )  # fmt: skip
+
+    async def _bind(self, path: Path) -> None:
+        if os.geteuid() != 0:
+            raise OSError("read_only mounts are kernel bind mounts, which need root")
+        # A bind of an earlier process is dead ("Transport endpoint is not
+        # connected") and stays dead: it points at that process's mount.
+        await mountutil.unbind(path)
+        self._make_mountpoint(path)
+        await mountutil.bind_read_only(self.primary_path, path)
 
     def _mark_lost(self, key: str, why: str) -> None:
         if key not in self._lost:
@@ -406,22 +452,19 @@ class UnitSupervisor:
             self.emit(Event("mount.lost", f"{self.name}:{key}", why))
 
     async def heal_mounts(self) -> list[str]:
-        """Check the extra mounts of a healthy unit and re-add any that is
+        """Check the joined mounts of a healthy unit and re-join any that is
         gone or no longer answers, without touching the process: its
         transfers, servers and caches carry on. (The process's own mount is
         the health check's: losing it restarts the unit.)"""
         notes = []
-        for mount, path in zip(self.unit.mounts[1:], self.mount_paths[1:], strict=True):
-            if mountutil.is_mounted(path) and await mountutil.responsive(
-                path, self.cfg.health.stat_timeout
-            ):
+        for mount, path in self._joined():
+            mounted = mountutil.is_mounted(path)
+            if mounted and await mountutil.responsive(path, self.cfg.health.stat_timeout):
                 continue
-            why = "not answering" if mountutil.is_mounted(path) else "not mounted"
+            why = "not answering" if mounted else "not mounted"
             log.warning("unit %s: mount %s %s: re-mounting", self.name, path, why)
             self._mark_lost(str(path), why)
-            if mountutil.is_mounted(path):
-                await mountutil.detach(path)
-            ok = await self.attach(mount, path)
+            ok = await self.join(mount, path)
             notes.append(f"{path} {why}: {'re-mounted' if ok else 'failed'}")
         return notes
 
@@ -499,9 +542,12 @@ class UnitSupervisor:
         # Whatever is left at the mount paths belonged to the process that
         # just died, so it is a dead endpoint: detach it now rather than
         # leave "Transport endpoint is not connected" for the next start.
-        for path in self.mount_paths:
+        for mount, path in zip(self.unit.mounts, self.mount_paths, strict=True):
             if mountutil.is_mounted(path):
-                await mountutil.detach(path)
+                if mount.read_only and os.geteuid() == 0:
+                    await mountutil.unbind(path)
+                else:
+                    await mountutil.detach(path)
         self.mount_states = {}
 
 

@@ -191,7 +191,7 @@ def status(ctx: typer.Context) -> None:
         if mounts:
             typer.echo(f"\n{'MOUNT':48} {'UNIT':24} STATE")
             for unit, m in mounts:
-                state = m["state"] + (" (primary)" if m["primary"] else "")
+                state = f"{m['state']} ({m.get('kind', '?')}{', ro' if m.get('read_only') else ''})"
                 typer.echo(f"{m['path']:48} {unit:24} {state}")
         # Read settings only where they differ from ferryman's built-ins.
         tuned = [(u["unit"], {k: v for k, v in (u.get("read") or {}).items()

@@ -28,7 +28,7 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_unit_state": ("gauge", "The unit's supervisor state (1 for the current one)."),
     "ferryman_unit_state_since_timestamp_seconds": ("gauge", "When the unit entered its state."),
     "ferryman_unit_restarts_total": ("counter", "Restarts of the unit's process."),
-    "ferryman_unit_mount_up": ("gauge", "1 if the mount path is mounted (label primary)."),
+    "ferryman_unit_mount_up": ("gauge", "1 if the mount path is mounted (kind rclone/rc/bind)."),
     "ferryman_unit_warm_success": ("gauge", "1 if the last dir-cache warm-up worked."),
     "ferryman_unit_warm_duration_seconds": ("gauge", "How long the last warm-up took."),
     "ferryman_rclone_speed_bytes": ("gauge", "Current transfer rate of the process, bytes/s."),
@@ -130,10 +130,9 @@ async def agent_metrics(agent: Agent) -> str:
             m.add("ferryman_unit_state", int(sup.state is state), unit=name, state=state.value)
         m.add("ferryman_unit_state_since_timestamp_seconds", sup.since, unit=name)
         m.add("ferryman_unit_restarts_total", sup.restarts, unit=name)
-        for i, path in enumerate(sup.mount_paths):
-            up = sup.ready and sup.mount_states.get(str(path)) == "mounted"
-            m.add("ferryman_unit_mount_up", int(up), unit=name, path=str(path),
-                  primary=str(i == 0).lower())  # fmt: skip
+        for mt in sup.status()["mounts"]:
+            up = sup.ready and mt["state"] == "mounted"
+            m.add("ferryman_unit_mount_up", int(up), unit=name, path=mt["path"], kind=mt["kind"])
         w = sup.warm
         if w and w["state"] in ("done", "failed"):
             m.add("ferryman_unit_warm_success", int(w["state"] == "done"), unit=name)

@@ -38,6 +38,42 @@ def is_mounted(path: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> bo
     return False
 
 
+async def _run_err(*argv: str, timeout: float) -> tuple[int | None, str]:
+    """Exit code (None on timeout) and stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        proc.kill()
+        return None, "timed out"
+    return proc.returncode, err.decode(errors="replace").strip()
+
+
+async def bind_read_only(source: Path, target: Path, timeout: float = 30.0) -> None:
+    """Bind `source` at `target`, then make the bind read-only (two steps:
+    the ro flag on the first one is ignored). Root only. The bind shares
+    source's FUSE connection, so it dies with source's process and has to
+    be made again after a restart."""
+    for argv in (("mount", "--bind", str(source), str(target)),
+                 ("mount", "-o", "remount,bind,ro", str(target))):  # fmt: skip
+        code, err = await _run_err(*argv, timeout=timeout)
+        if code != 0:
+            if is_mounted(target):
+                await _run("umount", "-l", str(target), timeout=timeout)
+            raise OSError(f"{' '.join(argv)}: {err or f'exit {code}'}")
+
+
+async def unbind(target: Path, timeout: float = 30.0) -> bool:
+    """Unmount a bind, lazily if it is busy or dead."""
+    if not is_mounted(target):
+        return True
+    if await _run("umount", str(target), timeout=timeout) == 0:
+        return True
+    return await _run("umount", "-l", str(target), timeout=timeout) == 0
+
+
 async def _run(*argv: str, timeout: float) -> int | None:
     """Exit code, or None if it timed out (the process is killed)."""
     proc = await asyncio.create_subprocess_exec(

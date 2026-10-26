@@ -341,7 +341,7 @@ class Agent:
                 continue
             reason = None
             if sup.unit.mounts:
-                path = sup.mount_paths[0]
+                path = sup.primary_path
                 if not mountutil.is_mounted(path):
                     reason = "not mounted"
                 elif not await mountutil.responsive(path, self.cfg.health.stat_timeout):
