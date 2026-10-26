@@ -1,4 +1,4 @@
-# Pool rotation state and granted claims. Small; the default StorageClass.
+# Pool rotation state and probes. Small; the default StorageClass.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

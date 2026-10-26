@@ -538,7 +538,7 @@ def controller(
         _die(f"config not found: {config}")
     except ValueError as e:
         _die(f"invalid config {config}:\n{e}")
-    run(cfg)
+    run(cfg, config)
 
 
 @app.command()

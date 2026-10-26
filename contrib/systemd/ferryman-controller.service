@@ -12,7 +12,7 @@
 # elsewhere: the system's if it is >= 3.13, otherwise one uv installs
 # outside home (UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv ...).
 [Unit]
-Description=ferryman controller: shared service-account key pools, claims and web UI
+Description=ferryman controller: agents' config, shared service-account key pools and web UI
 Wants=network-online.target
 After=network-online.target
 
@@ -26,7 +26,7 @@ RestartSec=5
 # In-flight long polls are cut after 2s; agents simply retry.
 TimeoutStopSec=15
 
-# The config's default `state:` (pool rotation state, claims).
+# The config's default `state:` (pool rotation state, probes).
 StateDirectory=ferryman-controller
 StateDirectoryMode=0700
 UMask=0077

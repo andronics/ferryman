@@ -133,10 +133,6 @@ class TransferRunner:
 
     async def _run(self, dry_run: bool) -> dict[str, Any]:
         t, agent = self.t, self.agent
-        # Before anything else, so a blocked transfer shows as failing even
-        # while it has nothing to move.
-        if why := agent.claim_blocks.get(self.name):
-            raise TransferError(why)
         src = agent.layout.transfer_source(self.name)
         # Most units never have anything staged, so a missing source is the
         # normal "nothing to do" case, not a failure.

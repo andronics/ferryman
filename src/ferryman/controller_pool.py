@@ -136,7 +136,7 @@ class ControllerPool:
 
     async def lease(self) -> Lease:
         try:
-            lease = self._store(await self.client.request("GET", f"/v1/pools/{self.name}/lease"))
+            lease = self._store(await self.client.request("GET", f"/v2/pools/{self.name}/lease"))
             self._up()
             return lease
         except PoolExhausted:
@@ -151,7 +151,7 @@ class ControllerPool:
 
     async def exhausted(self, expected: str | None = None) -> Lease:
         body = await self.client.request(
-            "POST", f"/v1/pools/{self.name}/exhausted", json={"expected": expected}
+            "POST", f"/v2/pools/{self.name}/exhausted", json={"expected": expected}
         )
         return self._store(body)
 
@@ -162,7 +162,7 @@ class ControllerPool:
         self._lease = None
 
     async def info(self) -> dict[str, Any]:
-        info: dict[str, Any] = await self.client.request("GET", f"/v1/pools/{self.name}")
+        info: dict[str, Any] = await self.client.request("GET", f"/v2/pools/{self.name}")
         return info
 
     async def watch(self, on_change: Callable[[ControllerPool, Lease], Awaitable[None]]) -> None:
@@ -175,7 +175,7 @@ class ControllerPool:
             try:
                 body = await self.client.request(
                     "GET",
-                    f"/v1/pools/{self.name}/watch",
+                    f"/v2/pools/{self.name}/watch",
                     params={"epoch": epoch},
                     # The server answers within its own watch timeout (30s by default).
                     timeout=self.client.timeout + 60,

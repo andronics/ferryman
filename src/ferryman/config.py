@@ -721,11 +721,6 @@ class Layout:
         """The dest for a run starting at `now` (default: now)."""
         return ph.expand(self.cfg.transfers[name].dest, self._placeholders(name), now)
 
-    def claim_dest(self, name: str) -> str:
-        """What a controller claim covers: the part of the dest that is the
-        same on every run (all of it, unless it has time placeholders)."""
-        return ph.fixed_prefix(self.cfg.transfers[name].dest, self._placeholders(name))
-
     def check_paths(self) -> list[str]:
         """Problems with the paths as they expand on this host, for `verify`
         and agent startup: placeholders that don't expand (an unset
@@ -797,10 +792,6 @@ class Layout:
     def leased_keys(self, pool: str) -> Path:
         # Keys leased from the controller, on the runtime (tmpfs) dir only.
         return self.cfg.paths.runtime / "keys" / pool
-
-    @property
-    def claims_file(self) -> Path:
-        return self.cfg.paths.state / "claims.json"
 
 
 def read_settings(cfg: Config, unit: str) -> dict[str, dict[str, str]]:

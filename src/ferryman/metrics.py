@@ -44,7 +44,6 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_tune_limit": ("gauge", "What limited the profile's rate (1 for it)."),
     "ferryman_tune_timestamp_seconds": ("gauge", "When the profile was measured."),
     "ferryman_transfer_running": ("gauge", "1 while the transfer runs."),
-    "ferryman_transfer_blocked": ("gauge", "1 if the controller refused the transfer's claim."),
     "ferryman_transfer_last_success": ("gauge", "1 if the transfer's last run succeeded."),
     "ferryman_transfer_last_run_timestamp_seconds": ("gauge", "When the last run finished."),
     "ferryman_transfer_last_success_timestamp_seconds": (
@@ -74,7 +73,6 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_agent_last_report_timestamp_seconds": ("gauge", "When the agent last reported."),
     "ferryman_agent_units": ("gauge", "Units the agent runs."),
     "ferryman_agent_units_ready": ("gauge", "Of the agent's units, those ready."),
-    "ferryman_claims": ("gauge", "Transfer claims granted to the agent."),
 }
 
 
@@ -161,7 +159,6 @@ async def agent_metrics(agent: Agent) -> str:
 
     for name, tr in agent.transfers.items():
         m.add("ferryman_transfer_running", int(tr.running), transfer=name)
-        m.add("ferryman_transfer_blocked", int(name in agent.claim_blocks), transfer=name)
         if tr.last and not tr.last.get("dry_run"):
             m.add("ferryman_transfer_last_success", int(bool(tr.last["ok"])), transfer=name)
             m.add("ferryman_transfer_last_run_timestamp_seconds", tr.last["finished"],
@@ -215,6 +212,4 @@ def controller_metrics(co: Controller) -> str:
         units = rep["report"].get("status", {}).get("units", [])
         m.add("ferryman_agent_units", len(units), agent=name)
         m.add("ferryman_agent_units_ready", sum(u["state"] == "ready" for u in units), agent=name)
-    for agent, claims in co._read_claims().items():
-        m.add("ferryman_claims", len(claims), agent=agent)
     return m.render()
