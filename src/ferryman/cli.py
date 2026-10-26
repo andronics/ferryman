@@ -324,6 +324,86 @@ def throttle(ctx: typer.Context, pattern: str, rate: str) -> None:
     ctx.obj.show(rows, render)
 
 
+def _profile(p: dict[str, Any]) -> None:
+    typer.echo(f"{'CHUNK':>7} {'XFERS':>5} {'RATE':>11} {'PER STREAM':>11} {'RUNS':>18} "
+               f"{'CPU':>5} {'RSS':>7}")  # fmt: skip
+    for r in p["probes"]:
+        runs = "/".join(f"{iec(x)}" for x in r["runs"])
+        mark = "  <- chosen" if (r["chunk"], r["transfers"]) == (p["chunk_size"], p["transfers"]) \
+            else ""  # fmt: skip
+        flags = " rate-limited" if r["rate_limited"] else " noisy" if r["noisy"] else ""
+        cpu = f"{r['cpu']:.2f}" if r["cpu"] is not None else "-"
+        rss = iec(r["rss"]) if r["rss"] is not None else "-"
+        typer.echo(f"{iec(r['chunk']):>7} {r['transfers']:>5} {iec(r['rate']) + '/s':>11} "
+                   f"{iec(r['per_stream']) + '/s':>11} {runs:>18} {cpu:>5} {rss:>7}"
+                   f"{flags}{mark}")  # fmt: skip
+    when = time.strftime("%F %T", time.localtime(p["at"]))
+    typer.echo(
+        f"\nchosen: {iec(p['chunk_size'])} chunks x {p['transfers']} transfers, "
+        f"{iec(p['rate'])}/s (needs {iec(p['chunk_size'] * p['transfers'])} of buffers)"
+    )
+    typer.echo(f"limit:  {p['limit']}: {p['detail']}")
+    typer.echo(f"chunks: one stream ran {p['chunk_gain']:.2f}x faster at the chosen chunk size "
+               "than at the smallest")  # fmt: skip
+    if p["noisy"]:
+        typer.echo("noisy:  repeats of a probe differed by more than 20%; worth re-running")
+    typer.echo(f"ran:    {when} via {p['unit']} on {p['key']}, rclone {p['rclone']}, "
+               f"{iec(p['bytes_used'])} uploaded")  # fmt: skip
+
+
+@app.command()
+def tune(
+    ctx: typer.Context,
+    unit: Annotated[str | None, typer.Option(help="Drive unit whose drive and key to use")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show the probe plan only")] = False,
+    show: Annotated[bool, typer.Option("--show", help="Show the stored profile")] = False,
+    wait: Annotated[bool, typer.Option(help="Wait for the result")] = True,
+) -> None:
+    """Measure Drive upload throughput and pick the chunk size and transfers.
+
+    Probes upload random data (counted against the key's daily cap) into a
+    scratch folder on the unit's drive, which is trashed afterwards."""
+    if show:
+        st = ctx.obj.request("GET", "/v1/tune")
+
+        def render_status(s: dict[str, Any]) -> None:
+            if s["running"]:
+                typer.echo(f"tune running: {s['progress'] or 'starting'}\n")
+            if s["last"] and not s["last"]["ok"]:
+                typer.echo(f"last tune failed: {s['last']['error']}\n")
+            if s["profile"]:
+                _profile(s["profile"])
+            elif not s["running"]:
+                typer.echo("no tuning profile yet (run `ferryman tune`)")
+
+        ctx.obj.show(st, render_status)
+        return
+    body = {"unit": unit, "dry_run": dry_run, "wait": wait}
+    if not dry_run and wait and not ctx.obj.as_json:
+        typer.echo("tuning; this takes a few minutes (`ferryman tune --show` for progress)",
+                   err=True)  # fmt: skip
+    result = ctx.obj.request("POST", "/v1/tune", json=body)
+
+    def render(r: dict[str, Any]) -> None:
+        if r.get("dry_run"):
+            p = r["plan"]
+            typer.echo(f"via unit {p['unit']} on {p['key']}")
+            typer.echo(f"chunk sizes: {', '.join(iec(c) for c in p['chunk_sizes'])}")
+            typer.echo(f"transfers:   {', '.join(map(str, p['transfers']))}")
+            typer.echo(
+                f"at most {p['max_probe_runs']} probe runs ({p['repeats']} per setting), "
+                f"{iec(p['max_bytes'])} uploaded, {p['max_seconds'] / 60:.0f} min"
+            )
+        elif r.get("started"):
+            typer.echo("tune started")
+        elif r["ok"]:
+            _profile(r["profile"])
+        else:
+            _die(f"tune failed: {r['error']}")
+
+    ctx.obj.show(result, render)
+
+
 @app.command()
 def health(ctx: typer.Context) -> None:
     """Run the health check now."""

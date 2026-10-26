@@ -21,6 +21,7 @@ from starlette.routing import Route
 from .metrics import CONTENT_TYPE, agent_metrics
 from .pool import PoolError
 from .transfer import TransferBusy
+from .tuning import TuneError
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -38,7 +39,7 @@ def _json(handler: Handler) -> Callable[[Request], Awaitable[JSONResponse]]:
             return JSONResponse({"error": f"not found: {e.args[0]}"}, status_code=404)
         except TransferBusy as e:
             return JSONResponse({"error": str(e)}, status_code=409)
-        except PoolError as e:
+        except (PoolError, TuneError) as e:
             return JSONResponse({"error": str(e)}, status_code=409)
 
     return wrapped
@@ -82,6 +83,22 @@ def build_app(agent: Agent) -> Starlette:
             return await asyncio.shield(task)
         return {"started": True, "transfer": tr.name}
 
+    async def tune_status(_: Request) -> Any:
+        return agent.tuner.status()
+
+    async def tune(request: Request) -> Any:
+        body = await _body(request)
+        unit, dry_run = body.get("unit"), bool(body.get("dry_run"))
+        if dry_run:
+            return await agent.tuner.run(unit, dry_run=True)
+        # Checked here too, so a refusal answers the request instead of
+        # failing a task nobody waits for.
+        agent.tuner.check(unit)
+        task = agent.spawn(agent.tuner.run(unit), "tune")
+        if body.get("wait", True):
+            return await asyncio.shield(task)
+        return {"started": True}
+
     async def pools(_: Request) -> Any:
         out = []
         for p in agent.pools.values():
@@ -114,6 +131,8 @@ def build_app(agent: Agent) -> Starlette:
         Route("/v1/jobs", _json(jobs)),
         Route("/v1/units/{name}/restart", _json(restart), methods=["POST"]),
         Route("/v1/transfers/{name}/run", _json(run_transfer), methods=["POST"]),
+        Route("/v1/tune", _json(tune_status)),
+        Route("/v1/tune", _json(tune), methods=["POST"]),
         Route("/v1/pools", _json(pools)),
         Route("/v1/pools/{name}/rotate", _json(rotate), methods=["POST"]),
         Route("/v1/throttle", _json(throttle), methods=["POST"]),

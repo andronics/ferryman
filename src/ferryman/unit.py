@@ -83,7 +83,7 @@ class UnitSupervisor:
 
     # ------------------------------------------------------------------ config
 
-    def render_conf(self) -> str:
+    def render_conf(self, stanza: str | None = None) -> str:
         """The unit's rclone.conf stanza, authenticated by the pool's current key.
 
         The drive-side upload tuning lives here rather than on transfer jobs:
@@ -103,7 +103,7 @@ class UnitSupervisor:
             opts["chunk_size"] = "128M"
             opts["stop_on_upload_limit"] = "true"
         opts.update(u.options)
-        return f"[{self.name}]\n" + "".join(f"{k} = {v}\n" for k, v in opts.items())
+        return f"[{stanza or self.name}]\n" + "".join(f"{k} = {v}\n" for k, v in opts.items())
 
     def write_conf(self) -> None:
         path = self.layout.rclone_conf(self.name)

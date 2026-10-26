@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,10 @@ class FakeRclone:
         self.refresh_results: list[dict[str, str]] = []
         self.jobs: dict[int, dict[str, Any]] = {}
         self.last_error: str | None = None
+        # Tune probes (sync/copy into "tune,chunk_size=N:"): bytes/s for a
+        # (chunk, transfers) setting, and an error to report, if any.
+        self.tune_rate: Callable[[int, int], float] = lambda c, t: 1e6 * t
+        self.tune_error: str | None = None
 
     def endpoints(self) -> list[str]:
         return [e for e, _ in self.calls]
@@ -80,6 +85,28 @@ class FakeRclone:
         return Starlette(routes=[Route("/{path:path}", handle, methods=["POST"])])
 
     def respond(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+        if endpoint == "sync/copy" and str(params.get("dstFs", "")).startswith("tune,"):
+            jobid = len(self.jobs) + 1
+            spec = params["dstFs"].split("chunk_size=", 1)[1].split(":", 1)[0]
+            assert spec.endswith("B"), "a bare chunk size is KiB to rclone"
+            chunk = int(spec.removesuffix("B"))
+            rate = self.tune_rate(chunk, params["_config"]["Transfers"])
+            transfers = params["_config"]["Transfers"]
+            self.jobs[jobid] = {"finished": False, "success": False, "error": "",
+                                "group": params["_group"], "start": time.monotonic(),
+                                "rate": rate, "transfers": transfers}  # fmt: skip
+            return {"jobid": jobid}
+        if endpoint == "core/stats" and str(params.get("group", "")).startswith("tune-"):
+            job = next(j for j in self.jobs.values() if j.get("group") == params["group"])
+            end = job.get("stopped") or time.monotonic()
+            per = job["rate"] / job["transfers"]
+            return {"bytes": int(job["rate"] * (end - job["start"])), "errors": 0,
+                    "lastError": self.tune_error,
+                    "transferring": [{"speed": per}] * job["transfers"]}  # fmt: skip
+        if endpoint == "job/stop":
+            job = self.jobs[int(params["jobid"])]
+            job.update(finished=True, stopped=job.get("stopped") or time.monotonic())
+            return {}
         if endpoint.startswith("sync/"):
             jobid = len(self.jobs) + 1
             outcome = self.job_outcomes.pop(0) if self.job_outcomes else None

@@ -96,6 +96,58 @@ class UnitDefaults(_Model):
     dir_mode: int = 0o775
 
 
+_SIZE = re.compile(r"^(\d+)([KMGT]?)$")
+
+
+def parse_size(v: str | int) -> int:
+    """rclone-style size ("128M", "2G") in bytes; suffixes are binary."""
+    if isinstance(v, int):
+        return v
+    m = _SIZE.match(v.strip().upper().removesuffix("I").removesuffix("B"))
+    if not m:
+        raise ValueError(f"invalid size {v!r} (e.g. 128M, 2G)")
+    return int(m[1]) << (10 * " KMGT".index(m[2] or " "))
+
+
+class Tuning(_Model):
+    """`ferryman tune`: probes Drive uploads at increasing chunk sizes, then
+    increasing transfers, and keeps the cheapest setting near the best rate.
+    Probe bytes count against the key's daily upload cap like any upload."""
+
+    budget: str = "32G"  # most a whole tune may upload
+    probe_bytes: str = "2G"  # most one probe may upload
+    max_memory: str = "2G"  # transfers x chunk size never exceeds this
+    warmup: float = Field(default=3.0, ge=0)  # seconds discarded at each probe's start
+    window: float = Field(default=15.0, gt=0)  # seconds measured after it
+    # Each probe runs this often and keeps its best rate: the path to Google
+    # varies by tens of percent between identical back-to-back runs.
+    repeats: int = Field(default=2, ge=1)
+    chunk_sizes: list[str] = Field(default_factory=lambda: ["8M", "16M", "32M", "64M", "128M",
+                                                            "256M"])  # fmt: skip
+    transfers: list[int] = Field(default_factory=lambda: [1, 2, 4, 8, 12, 16])
+
+    @field_validator("budget", "probe_bytes", "max_memory")
+    @classmethod
+    def _size(cls, v: str) -> str:
+        parse_size(v)
+        return v
+
+    @field_validator("chunk_sizes")
+    @classmethod
+    def _chunks(cls, v: list[str]) -> list[str]:
+        sizes = [parse_size(s) for s in v]
+        if not sizes or sizes != sorted(set(sizes)):
+            raise ValueError("chunk_sizes must be ascending and distinct")
+        return v
+
+    @field_validator("transfers")
+    @classmethod
+    def _steps(cls, v: list[int]) -> list[int]:
+        if not v or v[0] != 1 or v != sorted(set(v)):
+            raise ValueError("transfers must be ascending, distinct and start at 1")
+        return v
+
+
 class Pool(_Model):
     # A local pool names its keys by client_email; each is <keys_dir>/<key>.json.
     # A coordinator pool (`coordinator: true`) has neither: the coordinator
@@ -227,6 +279,7 @@ class Config(_Model):
     health: Health = Health()
     notify: Notify = Notify()
     defaults: UnitDefaults = UnitDefaults()
+    tuning: Tuning = Tuning()
     pools: dict[str, Pool] = Field(default_factory=dict)
     units: dict[str, Unit] = Field(default_factory=dict)
     transfers: dict[str, Transfer] = Field(default_factory=dict)
@@ -300,6 +353,23 @@ class Layout:
 
     def log_file(self, unit: str) -> Path:
         return self.cfg.paths.logs / f"{unit}.log"
+
+    @property
+    def tune_dir(self) -> Path:
+        # The probe process's conf and rc socket (unit names cannot start with ".").
+        return self.cfg.paths.runtime / ".tune"
+
+    @property
+    def tune_source(self) -> Path:
+        # Probe source data: random, so nothing on the path can compress it.
+        return self.cfg.paths.cache / ".tune"
+
+    @property
+    def tune_log(self) -> Path:
+        return self.cfg.paths.logs / "tune.log"
+
+    def tune_profile(self, backend: str) -> Path:
+        return self.cfg.paths.state / "tuning" / f"{backend}.json"
 
     def pool_state(self, pool: str) -> Path:
         return self.cfg.paths.state / "pools" / f"{pool}.json"
