@@ -195,3 +195,21 @@ def test_mount_argv_carries_read_settings(make_config: Callable[..., Config]) ->
     assert flag("--vfs-read-ahead") == "0"
     # mount_args still come last, so they still win.
     assert argv[-1] == "--buffer-size=1M"
+
+
+def test_bare_off_cache_mode_means_off(tmp_path: Path) -> None:
+    # YAML 1.1 turns a bare `off` into false.
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "roots: {local: /l, remote: /r}\n"
+        "pools: {p: {keys_dir: /k, keys: [a]}}\n"
+        "defaults: {vfs_cache_mode: off}\n"
+        "units:\n  m: {mountpoint: m, pool: p, vfs_cache_mode: off}\n"
+        "  n: {mountpoint: n, pool: p}\n"
+    )
+    cfg = Config.load(path)
+    assert cfg.defaults.vfs_cache_mode == "off"
+    assert cfg.units["m"].vfs_cache_mode == "off"
+    path.write_text(path.read_text().replace("vfs_cache_mode: off}", "vfs_cache_mode: on}"))
+    with pytest.raises(ValidationError, match="vfs_cache_mode"):
+        Config.load(path)  # true has no meaning: still an error

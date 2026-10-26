@@ -93,6 +93,11 @@ CacheMode = Literal["off", "minimal", "writes", "full"]
 READ_SETTINGS = ("buffer_size", "vfs_cache_mode", "vfs_read_chunk_size", "vfs_read_ahead")
 
 
+def _cache_mode(v: object) -> object:
+    # YAML 1.1 reads a bare `off` as false; that can only mean "off" here.
+    return "off" if v is False else v
+
+
 def _rclone_size(v: str | None) -> str | None:
     if v is not None and not _RCLONE_SIZE.match(v):
         raise ValueError(f"size {v!r} needs a unit suffix (16M, 1G); a bare number is KiB "
@@ -124,6 +129,11 @@ class UnitDefaults(_Model):
     def _sizes(cls, v: str) -> str:
         _rclone_size(v)
         return v
+
+    @field_validator("vfs_cache_mode", mode="before")
+    @classmethod
+    def _mode(cls, v: object) -> object:
+        return _cache_mode(v)
 
 
 _SIZE = re.compile(r"^(\d+)([KMGT]?)$")
@@ -255,6 +265,11 @@ class Unit(_Model):
     @classmethod
     def _sizes(cls, v: str | None) -> str | None:
         return _rclone_size(v)
+
+    @field_validator("vfs_cache_mode", mode="before")
+    @classmethod
+    def _mode(cls, v: object) -> object:
+        return _cache_mode(v)
 
     @field_validator("mountpoint")
     @classmethod
