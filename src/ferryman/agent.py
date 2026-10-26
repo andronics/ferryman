@@ -52,7 +52,7 @@ class Agent:
         if start and start.rejected:
             self.config_state["state"] = "rejected"
         self.layout = Layout(cfg)
-        self.notifier = Notifier(cfg.notify, self.layout.hostname)
+        self.notifier = Notifier(self.layout.hostname)
         # Agents notify no one: with a controller, every event goes into the
         # outbox, delivered to the controller in order, outages included.
         self.outbox: Outbox | None = None

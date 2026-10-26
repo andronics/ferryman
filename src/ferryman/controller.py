@@ -51,6 +51,7 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
+from .alerts import Alerts
 from .config import ControllerConfig, parse_size
 from .events import EventStore
 from .metrics import CONTENT_TYPE, controller_metrics
@@ -92,6 +93,9 @@ class Controller:
         self._slices: dict[str, dict[str, Any]] = {}
         self._apply(cfg)
         self.events = EventStore(cfg.state, cfg.events.retention_days * 86400.0)
+        # Only the controller notifies: its rules over every event.
+        self.alerts = Alerts(cfg.notify, cfg.state, bound=self.bound_to)
+        self.events.listeners.append(self.alerts.on_event)
         self.started = time.time()
         # Problems the controller has raised and not yet seen end.
         self._silent: set[str] = set()
@@ -125,11 +129,16 @@ class Controller:
             self._commands_changed.setdefault(name, asyncio.Condition())
         self._slices = {name: cfg.slice(name) for name in cfg.agents}
 
+    def bound_to(self, unit: str) -> set[str]:
+        """The agents a unit is bound on."""
+        return {name for name, a in self.cfg.agents.items() if unit in a.units}
+
     async def reload(self, cfg: ControllerConfig) -> list[str]:
         """Put a new config in force and wake every agent whose slice changed.
         Returns those agents."""
         before = {a: s["version"] for a, s in self._slices.items()}
         self._apply(cfg)
+        self.alerts.update(cfg.notify)
         self.config_error = None
         changed = [a for a, s in self._slices.items() if before.get(a) != s["version"]]
         async with self._config_changed:
@@ -405,6 +414,7 @@ class Controller:
             "pools": [p.describe() for p in self.pools.values()],
             "config_error": self.config_error,
             "events": self.events.latest(200),
+            "alerts": self.alerts.describe(),
             "commands": list(self.commands)[::-1],
             "tune_locks": {u: h for u, h in self.tune_locks.items() if h["until"] > time.time()},
         }
@@ -469,7 +479,9 @@ def build_app(co: Controller) -> Starlette:
 
     async def post_events(request: Request, agent: str) -> Any:
         body = await request.json()
-        return {"acked": co.events.ingest(agent, str(body["outbox"]), body["events"])}
+        acked = co.events.ingest(agent, str(body["outbox"]), body["events"])
+        co.alerts.end_batch(agent)
+        return {"acked": acked}
 
     async def put_report(request: Request, agent: str) -> Any:
         co.report(agent, await request.json())
@@ -498,6 +510,7 @@ def build_app(co: Controller) -> Starlette:
             asyncio.create_task(co.probe_loop()),
             asyncio.create_task(co.config_loop()),
             asyncio.create_task(co.watch_loop()),
+            asyncio.create_task(co.alerts.run()),
         ]
         loop = asyncio.get_running_loop()
 

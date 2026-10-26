@@ -15,7 +15,7 @@ import pytest
 from ferryman import events as ev
 from ferryman.agent import Agent
 from ferryman.bootstrap import start_config
-from ferryman.config import AgentBootstrap
+from ferryman.config import AgentBootstrap, Notifications
 from ferryman.controller import Controller, build_app
 from ferryman.events import EventStore, Outbox
 from ferryman.notify import Event
@@ -185,3 +185,18 @@ async def test_an_exhausted_pool_and_its_recovery(tmp_path: Path) -> None:
     pool.clock = lambda: time.time() + 2 * 86400  # the window has passed
     co.check_pools()
     assert kinds(co) == ["pool.exhausted", "pool.recovered"]
+
+
+async def test_a_backlog_through_the_api_is_summed_up(tmp_path: Path) -> None:
+    notify = Notifications.model_validate({"channels": {"ops": {"webhook": {"url": "http://h"}}}})
+    co = Controller(controller_config(tmp_path).model_copy(update={"notify": notify}))
+    c = client(httpx.ASGITransport(app=build_app(co)))
+    t0 = time.time() - 3600  # an hour-old backlog
+    batch = [
+        {"seq": 1, **Event("unit.failed", "backups", "down", "error", at=t0).__dict__},
+        {"seq": 2, **Event("unit.recovered", "backups", "up", "info", True, at=t0 + 60).__dict__},
+    ]
+    r = await c.request("POST", "/v2/events", json={"outbox": "x", "events": batch})
+    assert r == {"acked": 2}
+    assert [i["what"] for i in co.alerts.queues["ops"]] == ["summary"]
+    assert co.alerts.problems == {}
