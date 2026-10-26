@@ -29,7 +29,6 @@ graphify-out/
 
 # Not needed in the image
 tests/
-spike/
 scripts/
 *.md
 !README.md

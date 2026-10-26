@@ -1,0 +1,108 @@
+# The agent, one pod per node. Its mounts appear on the node under
+# /var/lib/drive; pods that read them mount that hostPath with
+# HostToContainer propagation (the parent, not a single mount: a remount
+# after an agent restart reaches them only through the parent):
+#
+#   volumeMounts:
+#     - {name: drive, mountPath: /media/drive, mountPropagation: HostToContainer, readOnly: true}
+#   volumes:
+#     - {name: drive, hostPath: {path: /var/lib/drive, type: Directory}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferryman-agent
+  labels:
+    app.kubernetes.io/name: ferryman
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferryman
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferryman
+        app.kubernetes.io/component: agent
+    spec:
+      # The agent unmounts in parallel and detaches a busy mount lazily
+      # within 90s; the default 30s would kill it mid-way.
+      terminationGracePeriodSeconds: 120
+      # Servers (serve:) listen in the pod's network: expose them with a
+      # Service, or set hostNetwork: true (an FTP server's passive_port range
+      # is simplest that way) together with dnsPolicy: ClusterFirstWithHostNet.
+      initContainers:
+        # Each node's agent has its own coordinator token: copy this node's
+        # out of the ferryman-agent-tokens Secret (one key per node name).
+        - name: token
+          image: ghcr.io/andronics/ferryman
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ ! -f "/tokens/$NODE" ]; then
+                echo "ferryman-agent-tokens has no token for node $NODE" >&2
+                exit 1
+              fi
+              cp "/tokens/$NODE" /token/token
+              chmod 0400 /token/token
+          env:
+            - name: NODE
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          volumeMounts:
+            - {name: tokens, mountPath: /tokens, readOnly: true}
+            - {name: token, mountPath: /token}
+      containers:
+        - name: agent
+          image: ghcr.io/andronics/ferryman
+          args: ["agent"]
+          securityContext:
+            privileged: true          # FUSE, and root for read_only binds
+          env:
+            - name: FERRYMAN_HOSTNAME # {hostname}: the node, not the pod
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: TZ                # cron schedules and time placeholders
+              value: Europe/London
+          ports:
+            - {name: api, containerPort: 8470}
+          readinessProbe:             # every unit ready
+            httpGet: {path: /readyz, port: api}
+            periodSeconds: 10
+          livenessProbe:              # the agent answers at all
+            httpGet: {path: /healthz, port: api}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/ferryman, readOnly: true}
+            - {name: token, mountPath: /run/secrets/ferryman, readOnly: true}
+            - {name: runtime, mountPath: /run/ferryman}
+            - {name: state, mountPath: /var/lib/ferryman}
+            - {name: cache, mountPath: /var/cache/ferryman}
+            - {name: logs, mountPath: /var/log/ferryman}
+            # The mounts' parent: Bidirectional, so mounts made here reach
+            # the node. /var/mnt is read-only to the kubelet on Talos.
+            - {name: drive, mountPath: /var/lib/drive, mountPropagation: Bidirectional}
+      volumes:
+        - name: config
+          secret: {secretName: ferryman-config}
+        - name: tokens
+          secret: {secretName: ferryman-agent-tokens}
+        - name: token
+          emptyDir: {medium: Memory}
+        - name: runtime               # sockets, rendered rclone.conf, leased keys
+          emptyDir: {medium: Memory}
+        - name: state
+          hostPath: {path: /var/lib/ferryman, type: DirectoryOrCreate}
+        - name: cache
+          hostPath: {path: /var/cache/ferryman, type: DirectoryOrCreate}
+        - name: logs
+          hostPath: {path: /var/log/ferryman, type: DirectoryOrCreate}
+        - name: drive
+          hostPath: {path: /var/lib/drive, type: DirectoryOrCreate}

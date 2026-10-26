@@ -1,0 +1,15 @@
+# Agents reach the coordinator at http://ferryman-coordinator:8470; point
+# Traefik (with forward-auth for the UI) at it too.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferryman-coordinator
+  labels:
+    app.kubernetes.io/name: ferryman
+    app.kubernetes.io/component: coordinator
+spec:
+  selector:
+    app.kubernetes.io/name: ferryman
+    app.kubernetes.io/component: coordinator
+  ports:
+    - {name: http, port: 8470, targetPort: http}

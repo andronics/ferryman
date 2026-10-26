@@ -1,0 +1,64 @@
+# The coordinator: one replica (its state is a file on an RWO volume), as
+# a non-root user, read-only root filesystem, no capabilities.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferryman-coordinator
+  labels:
+    app.kubernetes.io/name: ferryman
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                    # never two writers on the state
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferryman
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferryman
+        app.kubernetes.io/component: coordinator
+    spec:
+      # In-flight long polls are cut after 2s; agents retry.
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000               # the image's ferryman user
+        runAsGroup: 1000
+        fsGroup: 1000                 # the state volume and secrets readable
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: coordinator
+          image: ghcr.io/andronics/ferryman
+          args: ["coordinator"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          env:
+            - name: TZ
+              value: Europe/London
+          ports:
+            - {name: http, containerPort: 8470}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 20m, memory: 96Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/ferryman, readOnly: true}
+            - {name: keys, mountPath: /etc/ferryman-keys, readOnly: true}
+            - {name: state, mountPath: /var/lib/ferryman-coordinator}
+      volumes:
+        - name: config
+          secret: {secretName: ferryman-coordinator-config, defaultMode: 0440}
+        - name: keys
+          secret: {secretName: ferryman-keys, defaultMode: 0440}
+        - name: state
+          persistentVolumeClaim: {claimName: ferryman-coordinator-state}
