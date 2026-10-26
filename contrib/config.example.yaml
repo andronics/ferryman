@@ -147,6 +147,25 @@ units:
     vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
     vfs_cache_mode: full          # keep cached re-reads (writes would stop caching reads)
     vfs_read_ahead: "0"           # status shows each value's source: unit, defaults or built-in
+  media-photos:                   # no mounts, served instead: Drive over WebDAV/FTP, no FUSE
+    drive_id: 0AEEEEEEEEEEEEEEEEE
+    pool: uploads
+    serve:                        # servers inside the unit's process: same cache and key
+      - type: webdav              # dlna ftp http nfs restic s3 sftp webdav
+        addr: 127.0.0.1:8081      # required and unique: host:port (":8081" for every address)
+        htpasswd: /etc/ferryman/secrets/photos.htpasswd  # http, webdav, restic
+        cert: /etc/ferryman/tls/photos.crt                # TLS: https (ftp: implicit FTPS)
+        key: /etc/ferryman/tls/photos.key
+      - type: ftp
+        addr: 0.0.0.0:2121        # beyond loopback: authentication required
+        passive_port: 30000-30099 # ftp only, required; ranges may not overlap
+        user: photos              # with pass_file (s3: access key id + secret key)
+        pass_file: /etc/ferryman/secrets/photos-ftp      # read at start; mode 0600
+        options:                  # passed to rclone as-is (its flag names, _ for -);
+          public_ip: 10.0.100.5   #   VFS settings are refused: they are the unit's
+      - type: dlna                # no auth exists for dlna/nfs: beyond loopback only with
+        addr: :7879
+        allow_unauthenticated: true
   backups:                        # no mounts: no FUSE, just `rclone rcd` for transfers
     drive_id: 0ACCCCCCCCCCCCCCCCC
     pool: uploads

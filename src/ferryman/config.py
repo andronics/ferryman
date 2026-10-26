@@ -9,6 +9,7 @@ from `paths` through `Layout`.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import socket
@@ -263,6 +264,117 @@ class Mount(_Model):
         return v
 
 
+ServeType = Literal["dlna", "ftp", "http", "nfs", "restic", "s3", "sftp", "webdav"]
+_HTPASSWD_TYPES = frozenset({"http", "webdav", "restic"})
+_TLS_TYPES = frozenset({"ftp", "http", "restic", "s3", "webdav"})
+_NO_AUTH_TYPES = frozenset({"dlna", "nfs"})  # rclone has no auth for these
+# Options a server may not set: the VFS ones would give it its own VFS (a
+# second cache on the unit's cache dir, and rc vfs/* calls that fail as
+# ambiguous); the rest are this model's fields.
+_SERVE_RESERVED = frozenset({
+    "fs", "type", "addr", "user", "pass", "htpasswd", "cert", "key", "passive_port", "auth_key",
+    "buffer_size", "read_only", "uid", "gid", "umask", "dir_perms", "file_perms", "link_perms",
+    "dir_cache_time", "poll_interval", "no_modtime", "no_seek", "no_checksum", "links",
+    "case_insensitive", "vfs_case_insensitive", "attr_timeout",
+})  # fmt: skip
+_ADDR = re.compile(r"^(?P<host>\[[0-9a-fA-F:.]*\]|[^:\[\]]*):(?P<port>\d{1,5})$")
+_PORT_RANGE = re.compile(r"^(\d{1,5})-(\d{1,5})$")
+
+
+def _loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False  # a name: it could resolve anywhere
+
+
+_WILDCARD = frozenset({"", "0.0.0.0", "[::]"})
+
+
+class Serve(_Model):
+    """A server started inside the unit's process (`serve/start`). It shares
+    the process's connection and VFS: the unit's read settings, uid/gid and
+    cache apply to it, and key rotation moves it with everything else."""
+
+    type: ServeType
+    addr: str  # host:port; required, since every type's default port would clash
+    user: str | None = None
+    # File holding the password (s3: the secret key, `user` the access key).
+    # Read when the server starts, so it never sits in the config.
+    pass_file: Path | None = None
+    htpasswd: Path | None = None  # http, webdav, restic
+    cert: Path | None = None  # TLS; ftp is then FTPS with implicit TLS (ftps://)
+    key: Path | None = None
+    passive_port: str | None = None  # ftp: data port range "30000-30099", required
+    # nfs and dlna have no auth: beyond loopback only with this set.
+    allow_unauthenticated: bool = False
+    # Passed to serve/start as-is (rclone's flag names, '-' as '_').
+    options: dict[str, str | int | bool | list[str]] = Field(default_factory=dict)
+
+    @property
+    def authenticated(self) -> bool:
+        if self.htpasswd is not None:
+            return True
+        if self.type == "sftp" and "authorized_keys" in self.options:
+            return True
+        return self.user is not None and self.pass_file is not None
+
+    @property
+    def host_port(self) -> tuple[str, int]:
+        m = _ADDR.match(self.addr)
+        assert m
+        return m["host"], int(m["port"])
+
+    @property
+    def passive_range(self) -> tuple[int, int] | None:
+        if self.passive_port is None:
+            return None
+        m = _PORT_RANGE.match(self.passive_port)
+        assert m
+        return int(m[1]), int(m[2])
+
+    @model_validator(mode="after")
+    def _shape(self) -> Serve:
+        m = _ADDR.match(self.addr)
+        if not m or not 0 < int(m["port"]) < 65536:
+            raise ValueError(f"{self.type} serve: addr {self.addr!r} must be host:port "
+                             "(127.0.0.1:8081, :8081 for every address)")  # fmt: skip
+        if (self.user is None) != (self.pass_file is None):
+            raise ValueError(f"{self.type} serve: user and pass_file go together")
+        if self.htpasswd is not None and self.type not in _HTPASSWD_TYPES:
+            raise ValueError(f"{self.type} serve: htpasswd is for http, webdav and restic")
+        if (self.cert is None) != (self.key is None):
+            raise ValueError(f"{self.type} serve: cert and key go together")
+        if self.cert is not None and self.type not in _TLS_TYPES:
+            raise ValueError(f"{self.type} serve: cert/key are for {', '.join(sorted(_TLS_TYPES))}")
+        if self.type in _NO_AUTH_TYPES and (self.user or self.htpasswd):
+            raise ValueError(f"{self.type} serve: rclone has no authentication for {self.type}")
+        if self.type == "ftp":
+            r = _PORT_RANGE.match(self.passive_port or "")
+            if not r or not 0 < int(r[1]) <= int(r[2]) < 65536:
+                raise ValueError("ftp serve: passive_port must be a range like 30000-30099 "
+                                 "(each FTP server needs its own)")  # fmt: skip
+        elif self.passive_port is not None:
+            raise ValueError(f"{self.type} serve: passive_port is for ftp only")
+        reserved = sorted(k for k in self.options if k in _SERVE_RESERVED or k.startswith("vfs_"))
+        if reserved:
+            raise ValueError(
+                f"{self.type} serve: options {', '.join(reserved)} can't be set here: VFS "
+                "settings are the unit's (one per server would split its cache), and the "
+                "others are serve fields"
+            )
+        host = m["host"]
+        if not _loopback(host) and not self.authenticated and not self.allow_unauthenticated:
+            raise ValueError(
+                f"{self.type} serve on {self.addr} is reachable beyond this host without "
+                "authentication: add user + pass_file (or htpasswd), bind it to 127.0.0.1, "
+                "or set allow_unauthenticated: true"
+            )
+        return self
+
+
 class Unit(_Model):
     backend: str = "drive"
     pool: str | None = None
@@ -272,6 +384,8 @@ class Unit(_Model):
     # The first is the process's own `rclone mount`; the rest are added to it
     # over rc. None: no FUSE, the process is an `rclone rcd`.
     mounts: list[Mount] = Field(default_factory=list)
+    # Servers inside the unit's process; see Serve.
+    serve: list[Serve] = Field(default_factory=list)
     uid: int | None = None
     gid: int | None = None
     cache_max_size: str | None = None
@@ -444,17 +558,42 @@ class Config(_Model):
             if unit.pool and unit.pool not in self.pools:
                 raise ValueError(f"unit {name}: unknown pool {unit.pool!r}")
             set_here = [k for k in READ_SETTINGS if getattr(unit, k) is not None]
-            if not unit.mounts and set_here:
-                raise ValueError(f"unit {name}: {', '.join(set_here)} only apply to mounts")
+            if not (unit.mounts or unit.serve) and set_here:
+                raise ValueError(f"unit {name}: {', '.join(set_here)} only apply to mounts "
+                                 "and servers")  # fmt: skip
             r = read_settings(self, name)
-            if unit.mounts and r["vfs_read_ahead"]["value"] != "0" and \
+            if any(s.type == "nfs" for s in unit.serve) and \
+                    r["vfs_cache_mode"]["value"] not in ("writes", "full"):  # fmt: skip
+                raise ValueError(f"unit {name}: an nfs server needs vfs_cache_mode writes or "
+                                 "full (rclone serves it read-only otherwise)")  # fmt: skip
+            if (unit.mounts or unit.serve) and r["vfs_read_ahead"]["value"] != "0" and \
                     r["vfs_cache_mode"]["value"] != "full":  # fmt: skip
                 raise ValueError(f"unit {name}: vfs_read_ahead only applies with "
                                  "vfs_cache_mode: full")  # fmt: skip
+        self._check_ports()
         for name, t in self.transfers.items():
             if t.unit not in self.units:
                 raise ValueError(f"transfer {name}: unknown unit {t.unit!r}")
         return self
+
+    def _check_ports(self) -> None:
+        """Two servers on one port would make rclone panic (a nil pointer,
+        not an "address in use"), so overlaps are refused here: the same
+        port on the same or a wildcard host, or inside an FTP passive range."""
+        taken: list[tuple[str, int, int, str]] = []  # host, first, last port, who
+        for name, unit in self.units.items():
+            for s in unit.serve:
+                who = f"unit {name}'s {s.type} serve"
+                host, port = s.host_port
+                ranges = [(port, port)]
+                if (pr := s.passive_range) is not None:
+                    ranges.append(pr)
+                for lo, hi in ranges:
+                    for h2, lo2, hi2, who2 in taken:
+                        if lo <= hi2 and lo2 <= hi and (h2 == host or {h2, host} & _WILDCARD):
+                            raise ValueError(f"{who} ({host}:{lo}-{hi}) overlaps {who2}'s "
+                                             f"({h2}:{lo2}-{hi2})")  # fmt: skip
+                    taken.append((host, lo, hi, who))
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -560,6 +699,17 @@ class Layout:
             for b, ub in mounts.items():
                 if a != b and a.is_relative_to(b):
                     problems.append(f"unit {ua}: mount path {a} is inside unit {ub}'s mount {b}")
+        for unit, u in self.cfg.units.items():
+            for sv in u.serve:
+                for label, f in (("pass_file", sv.pass_file), ("htpasswd", sv.htpasswd),
+                                 ("cert", sv.cert), ("key", sv.key)):  # fmt: skip
+                    where = f"unit {unit}: {sv.type} serve on {sv.addr}: {label} {f}"
+                    if f is None:
+                        continue
+                    if not f.is_file():
+                        problems.append(f"{where} does not exist")
+                    elif label in ("pass_file", "key") and f.stat().st_mode & 0o004:
+                        problems.append(f"{where} is readable by everyone")
         for name in self.cfg.transfers:
             try:
                 src = self.transfer_source(name)

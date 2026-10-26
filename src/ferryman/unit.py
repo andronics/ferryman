@@ -15,13 +15,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import socket
 import time
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import mountutil
-from .config import Config, Layout, Mount, Unit, read_settings, resolved
+from .config import Config, Layout, Mount, Serve, Unit, read_settings, resolved
 from .notify import Emit, Event, discard
 from .rc import RcClient, RcError
 
@@ -70,7 +71,11 @@ class UnitSupervisor:
         self.tuned_chunk: int | None = None
         # Mount path -> "mounted", "down" or "failed: <why>" (status, metrics).
         self.mount_states: dict[str, str] = {}
-        # Extra mounts reported lost and not mounted since.
+        # Servers: index in unit.serve -> rclone's id, and -> "running",
+        # "down" or "failed: <why>".
+        self.serve_ids: dict[int, str] = {}
+        self.serve_states: dict[int, str] = {}
+        # Mounts and servers reported lost and not back since.
         self._lost: set[str] = set()
         self._warm_task: asyncio.Task[None] | None = None
         self._restart_task: asyncio.Task[None] | None = None
@@ -212,6 +217,9 @@ class UnitSupervisor:
         self._set(State.STOPPING)
         proc = self._proc
         if proc and proc.returncode is None:
+            if self.unit.serve and was_ready:
+                with contextlib.suppress(RcError):
+                    await self.rc.call("serve/stopall")
             if self.unit.mounts and was_ready:
                 # Binds first: they hold the process's FUSE connection open,
                 # so rclone would not exit. Then the rc mounts, then the
@@ -280,10 +288,16 @@ class UnitSupervisor:
                 }
                 for i, (m, p) in enumerate(zip(self.unit.mounts, self.mount_paths, strict=True))
             ],
+            "serves": [
+                {"type": sv.type, "addr": sv.addr, "state": self.serve_states.get(i, "down")}
+                for i, sv in enumerate(self.unit.serve)
+            ],
             "restarts": self.restarts,
             "last_error": self.last_error,
             "warm": self.warm,
-            "read": read_settings(self.cfg, self.name) if self.unit.mounts else None,
+            "read": read_settings(self.cfg, self.name)
+            if self.unit.mounts or self.unit.serve
+            else None,
         }
 
     def _set(self, state: State) -> None:
@@ -378,13 +392,18 @@ class UnitSupervisor:
             self.mount_states[str(self.primary_path)] = "mounted"
             for mount, path in self._joined():
                 await self.join(mount, path)
+        if self.unit.serve:
+            if not paths:
+                await self._configure_vfs()
+            for i, sv in enumerate(self.unit.serve):
+                await self.start_serve(i, sv)
         self._set(State.READY)
         self.last_error = None
         log.info("unit %s: ready", n)
         if self._failing:
             self._failing = False
             self.emit(Event("unit.recovered", n, "ready again", "info", resolves=True))
-        if paths and resolved(self.cfg, n)[3]:
+        if (paths or self.unit.serve) and resolved(self.cfg, n)[3]:
             self._warm_task = asyncio.create_task(self._warm(), name=f"warm:{n}")
 
         code = await proc.wait()
@@ -407,17 +426,12 @@ class UnitSupervisor:
                 await self._rc_mount(mount, path)
         except (RcError, OSError) as e:
             self.mount_states[key] = f"failed: {e}"
-            self._mark_lost(key, f"could not mount: {e}")
+            self._mark_lost("mount", key, f"could not mount: {e}")
             log.error("unit %s: could not mount %s: %s", self.name, path, e)
             return False
         self.mount_states[key] = "mounted"
         log.info("unit %s: mounted %s%s", self.name, path, " (read-only bind)" * mount.read_only)
-        if key in self._lost:
-            self._lost.discard(key)
-            self.emit(
-                Event("mount.recovered", f"{self.name}:{key}", "mounted again", "info",
-                      resolves=True)
-            )  # fmt: skip
+        self._mark_back("mount", key, "mounted again")
         return True
 
     async def _rc_mount(self, mount: Mount, path: Path) -> None:
@@ -446,10 +460,16 @@ class UnitSupervisor:
         self._make_mountpoint(path)
         await mountutil.bind_read_only(self.primary_path, path)
 
-    def _mark_lost(self, key: str, why: str) -> None:
+    def _mark_lost(self, family: str, key: str, why: str) -> None:
         if key not in self._lost:
             self._lost.add(key)
-            self.emit(Event("mount.lost", f"{self.name}:{key}", why))
+            self.emit(Event(f"{family}.lost", f"{self.name}:{key}", why))
+
+    def _mark_back(self, family: str, key: str, message: str) -> None:
+        if key in self._lost:
+            self._lost.discard(key)
+            self.emit(Event(f"{family}.recovered", f"{self.name}:{key}", message, "info",
+                            resolves=True))  # fmt: skip
 
     async def heal_mounts(self) -> list[str]:
         """Check the joined mounts of a healthy unit and re-join any that is
@@ -463,9 +483,94 @@ class UnitSupervisor:
                 continue
             why = "not answering" if mounted else "not mounted"
             log.warning("unit %s: mount %s %s: re-mounting", self.name, path, why)
-            self._mark_lost(str(path), why)
+            self._mark_lost("mount", str(path), why)
             ok = await self.join(mount, path)
             notes.append(f"{path} {why}: {'re-mounted' if ok else 'failed'}")
+        return notes
+
+    # ---------------------------------------------------------------- serve
+
+    async def _configure_vfs(self) -> None:
+        """A unit without mounts is an `rclone rcd`, which takes no VFS flags:
+        give its servers the unit's settings by making them the process's
+        defaults before the first server creates the VFS. Mirrors argv()."""
+        uid, gid, cache_max, _ = resolved(self.cfg, self.name)
+        read = {k: v["value"] for k, v in read_settings(self.cfg, self.name).items()}
+        vfs: dict[str, Any] = {
+            "CacheMode": read["vfs_cache_mode"],
+            "ChunkSize": read["vfs_read_chunk_size"],
+            "ReadAhead": read["vfs_read_ahead"],
+            "DirCacheTime": "1000h",
+            "PollInterval": "15s",
+            "Umask": 0o002,
+            "CacheMaxAge": "336h",
+            "CacheMaxSize": cache_max,
+            "CachePollInterval": "5m",
+            "CacheMinFreeSpace": self.cfg.defaults.cache_min_free_space,
+        }
+        if uid is not None:
+            vfs["UID"] = uid
+        if gid is not None:
+            vfs["GID"] = gid
+        await self.rc.call("options/set", vfs=vfs, main={"BufferSize": read["buffer_size"]})
+
+    async def start_serve(self, i: int, sv: Serve) -> bool:
+        """Start a server in the process. No VFS options are passed (Serve
+        refuses them), so it shares the process's VFS."""
+        key = f"{sv.type}@{sv.addr}"
+        try:
+            params = self._serve_params(sv)
+            _port_free(*sv.host_port)
+            r = await self.rc.call("serve/start", **params)
+        except (RcError, OSError) as e:
+            self.serve_states[i] = f"failed: {e}"
+            self._mark_lost("serve", key, f"could not start: {e}")
+            log.error("unit %s: could not start %s server on %s: %s", self.name, sv.type,
+                      sv.addr, e)  # fmt: skip
+            return False
+        self.serve_ids[i] = str(r["id"])
+        self.serve_states[i] = "running"
+        log.info("unit %s: %s server on %s", self.name, sv.type, sv.addr)
+        self._mark_back("serve", key, "running again")
+        return True
+
+    def _serve_params(self, sv: Serve) -> dict[str, Any]:
+        params: dict[str, Any] = {**sv.options, "type": sv.type, "fs": f"{self.name}:",
+                                  "addr": sv.addr}  # fmt: skip
+        if sv.user is not None and sv.pass_file is not None:
+            secret = sv.pass_file.read_text().strip()
+            if sv.type == "s3":
+                params["auth_key"] = [f"{sv.user},{secret}"]
+            else:
+                params["user"], params["pass"] = sv.user, secret
+        elif sv.type == "sftp" and not sv.authenticated:
+            params["no_auth"] = True  # sftp refuses to start without some auth
+        if sv.htpasswd is not None:
+            params["htpasswd"] = str(sv.htpasswd)
+        if sv.cert is not None and sv.key is not None:
+            params["cert"], params["key"] = str(sv.cert), str(sv.key)
+        if sv.passive_port is not None:
+            params["passive_port"] = sv.passive_port
+        return params
+
+    async def heal_serves(self) -> list[str]:
+        """Restart, in place, any configured server rclone no longer runs."""
+        if not self.unit.serve:
+            return []
+        try:
+            running = {str(s["id"]) for s in (await self.rc.call("serve/list")).get("list") or []}
+        except RcError as e:
+            return [f"serve/list failed: {e}"]
+        notes = []
+        for i, sv in enumerate(self.unit.serve):
+            if self.serve_ids.get(i) in running:
+                continue
+            key = f"{sv.type}@{sv.addr}"
+            log.warning("unit %s: %s server on %s not running: restarting it", self.name,
+                        sv.type, sv.addr)  # fmt: skip
+            self._mark_lost("serve", key, "not running")
+            ok = await self.start_serve(i, sv)
+            notes.append(f"{sv.type} on {sv.addr} not running: {'restarted' if ok else 'failed'}")
         return notes
 
     async def _warm(self) -> None:
@@ -549,6 +654,7 @@ class UnitSupervisor:
                 else:
                     await mountutil.detach(path)
         self.mount_states = {}
+        self.serve_ids, self.serve_states = {}, {}
 
 
 def _refresh_errors(output: Any) -> str | None:
@@ -559,3 +665,16 @@ def _refresh_errors(output: Any) -> str | None:
         return None
     bad = [f"{d or '/'}: {r}" for d, r in result.items() if r != "OK"]
     return "; ".join(bad) or None
+
+
+def _port_free(host: str, port: int) -> None:
+    """rclone answers a port already in use with a nil-pointer panic: test
+    the port first so the error says what happened."""
+    host = host.strip("[]")
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError as e:
+            raise OSError(f"{host or '*'}:{port} is not available ({e.strerror})") from None

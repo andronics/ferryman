@@ -358,7 +358,7 @@ class Agent:
             if reason:
                 report[sup.name] = "restarting"
                 continue
-            notes = await sup.heal_mounts()
+            notes = [*await sup.heal_mounts(), *await sup.heal_serves()]
             report[sup.name] = "; ".join(["healthy", *notes])
             await self._unhandled_cap_hit(sup)
         return report
