@@ -531,6 +531,68 @@ def events(ctx: typer.Context, limit: Annotated[int, typer.Option(help="How many
     ctx.obj.show(ctx.obj.request("GET", "/v1/events", params={"limit": limit}), render)
 
 
+@app.command()
+def migrate(
+    hosts: Annotated[
+        list[str], typer.Argument(metavar="HOST=CONFIG...", help="Each host's 0.2 agent config")
+    ],
+    coordinator: Annotated[Path | None, typer.Option(help="The 0.2 coordinator's config")] = None,
+    controller_url: Annotated[
+        str | None, typer.Option(help="The controller's URL, for hosts that had no coordinator")
+    ] = None,
+    out: Annotated[Path, typer.Option(help="Where to write the 0.3 configs")] = Path(
+        "ferryman-0.3"
+    ),
+) -> None:
+    """Turn 0.2 configs into 0.3: the controller's config and each host's
+    agent.yaml (with a token for hosts that had none)."""
+    import yaml
+
+    from .migrate import MigrateError
+    from .migrate import migrate as run_migrate
+
+    def load(path: Path) -> dict[str, Any]:
+        try:
+            data: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+            return data
+        except (OSError, yaml.YAMLError) as e:
+            _die(f"{path}: {e}")
+
+    parsed = {}
+    for arg in hosts:
+        host, sep, path = arg.partition("=")
+        if not sep or not host or not path:
+            _die(f"{arg!r}: give HOST=CONFIG, e.g. pve-01=/etc/ferryman/config.yaml")
+        parsed[host] = load(Path(path))
+    try:
+        r = run_migrate(parsed, load(coordinator) if coordinator else None, controller_url)
+    except MigrateError as e:
+        _die(f"cannot migrate:\n{e}")
+
+    def write(path: Path, text: str, mode: int = 0o644) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+        typer.echo(f"wrote {path}")
+
+    def dump(data: dict[str, Any]) -> str:
+        return str(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+
+    write(out / "controller.yaml", dump(r.controller), 0o640)
+    for host, boot in r.agents.items():
+        write(out / "agents" / f"{host}.yaml", dump(boot))
+    for host, token in r.tokens.items():
+        write(out / "tokens" / host, token + "\n", 0o600)
+    typer.echo("")
+    for host in r.agents:
+        where = f"its new token is in {out / 'tokens' / host}" if host in r.tokens \
+            else "keeps its coordinator token"  # fmt: skip
+        typer.echo(f"{host}: install {out / 'agents' / (host + '.yaml')} as "
+                   f"/etc/ferryman/agent.yaml; {where}")  # fmt: skip
+    for note in r.notes:
+        typer.echo(f"note: {note}")
+
+
 @app.command(hidden=True, context_settings={"ignore_unknown_options": True,
                                             "allow_extra_args": True})  # fmt: skip
 def coordinator() -> None:
