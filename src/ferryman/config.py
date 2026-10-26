@@ -307,6 +307,8 @@ class Serve(_Model):
     htpasswd: Path | None = None  # http, webdav, restic
     cert: Path | None = None  # TLS; ftp is then FTPS with implicit TLS (ftps://)
     key: Path | None = None
+    # sftp's SSH host key (rclone makes and keeps one in its cache dir if unset).
+    host_key: Path | None = None
     passive_port: str | None = None  # ftp: data port range "30000-30099", required
     # nfs and dlna have no auth: beyond loopback only with this set.
     allow_unauthenticated: bool = False
@@ -349,6 +351,8 @@ class Serve(_Model):
             raise ValueError(f"{self.type} serve: cert and key go together")
         if self.cert is not None and self.type not in _TLS_TYPES:
             raise ValueError(f"{self.type} serve: cert/key are for {', '.join(sorted(_TLS_TYPES))}")
+        if self.host_key is not None and self.type != "sftp":
+            raise ValueError(f"{self.type} serve: host_key is for sftp only")
         if self.type in _NO_AUTH_TYPES and (self.user or self.htpasswd):
             raise ValueError(f"{self.type} serve: rclone has no authentication for {self.type}")
         if self.type == "ftp":
@@ -581,6 +585,8 @@ class Config(_Model):
         not an "address in use"), so overlaps are refused here: the same
         port on the same or a wildcard host, or inside an FTP passive range."""
         taken: list[tuple[str, int, int, str]] = []  # host, first, last port, who
+        if (lst := self.api.listen) is not None:
+            taken.append((lst.host, lst.port, lst.port, "api.listen"))
         for name, unit in self.units.items():
             for s in unit.serve:
                 who = f"unit {name}'s {s.type} serve"
@@ -702,13 +708,14 @@ class Layout:
         for unit, u in self.cfg.units.items():
             for sv in u.serve:
                 for label, f in (("pass_file", sv.pass_file), ("htpasswd", sv.htpasswd),
-                                 ("cert", sv.cert), ("key", sv.key)):  # fmt: skip
+                                 ("cert", sv.cert), ("key", sv.key),
+                                 ("host_key", sv.host_key)):  # fmt: skip
                     where = f"unit {unit}: {sv.type} serve on {sv.addr}: {label} {f}"
                     if f is None:
                         continue
                     if not f.is_file():
                         problems.append(f"{where} does not exist")
-                    elif label in ("pass_file", "key") and f.stat().st_mode & 0o004:
+                    elif label in ("pass_file", "key", "host_key") and f.stat().st_mode & 0o004:
                         problems.append(f"{where} is readable by everyone")
         for name in self.cfg.transfers:
             try:

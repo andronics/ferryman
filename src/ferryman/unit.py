@@ -166,8 +166,9 @@ class UnitSupervisor:
         # correct, so --dir-cache-time is long on purpose: expiry would just
         # make directories cold again after a warm-up has loaded them.
         #
-        # --vfs-cache-max-size is per mount, so the caps don't bound total
-        # disk use; --vfs-cache-min-free-space guards the shared cache disk.
+        # --vfs-cache-max-size is per unit (its mounts and servers share one
+        # VFS), so the caps don't bound total disk use;
+        # --vfs-cache-min-free-space guards the shared cache disk.
         primary = self.unit.mounts[self.unit.primary]
         argv = [
             self.cfg.rclone.binary, "mount", f"{n}:", str(self.primary_path),
@@ -551,6 +552,8 @@ class UnitSupervisor:
             params["cert"], params["key"] = str(sv.cert), str(sv.key)
         if sv.passive_port is not None:
             params["passive_port"] = sv.passive_port
+        if sv.host_key is not None:
+            params["key"] = [str(sv.host_key)]
         return params
 
     async def heal_serves(self) -> list[str]:

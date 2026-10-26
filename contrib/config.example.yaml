@@ -55,7 +55,7 @@ notify:
 defaults:
   uid: null                       # --uid/--gid for mounts; owner of created mount dirs
   gid: null
-  cache_max_size: 10G             # per mount (--vfs-cache-max-size): not a total
+  cache_max_size: 10G             # per unit (--vfs-cache-max-size; its mounts share it): not a total
   cache_min_free_space: 100G      # --vfs-cache-min-free-space, guards the shared cache disk
   warm: true                      # walk the dir cache after each start
   dir_mode: 0775                  # mode of a mount dir ferryman creates; its parent must exist (YAML octal)
@@ -154,7 +154,8 @@ units:
       - type: webdav              # dlna ftp http nfs restic s3 sftp webdav
         addr: 127.0.0.1:8081      # required and unique: host:port (":8081" for every address)
         htpasswd: /etc/ferryman/secrets/photos.htpasswd  # http, webdav, restic
-        cert: /etc/ferryman/tls/photos.crt                # TLS: https (ftp: implicit FTPS)
+        cert: /etc/ferryman/tls/photos.crt                # TLS: https (ftp: implicit FTPS); sftp
+                                                          #   takes host_key instead
         key: /etc/ferryman/tls/photos.key
       - type: ftp
         addr: 0.0.0.0:2121        # beyond loopback: authentication required
@@ -163,6 +164,9 @@ units:
         pass_file: /etc/ferryman/secrets/photos-ftp      # read at start; mode 0600
         options:                  # passed to rclone as-is (its flag names, _ for -);
           public_ip: 10.0.100.5   #   VFS settings are refused: they are the unit's
+      - type: sftp
+        addr: 127.0.0.1:2022
+        host_key: /etc/ferryman/secrets/photos-ssh-host-key   # sftp only; mode 0600
       - type: dlna                # no auth exists for dlna/nfs: beyond loopback only with
         addr: :7879
         allow_unauthenticated: true
