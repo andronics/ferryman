@@ -1,8 +1,13 @@
-# ferryman - agent (and optionally the controller) under Docker
+# ferryman - the controller and an agent under Docker
 #
-#   docker compose up -d                          # the agent
-#   docker compose --profile controller up -d     # plus the controller
+#   docker compose up -d                          # the controller and this host's agent
+#   docker compose up -d ferryman                 # an agent alone (on another host)
 #   docker exec ferryman ferryman status          # the CLI, inside the container
+#
+# Every agent takes its config from the controller: on this host it needs
+# only /etc/ferryman/agent.yaml (the controller's URL and a token file) and
+# the controller /etc/ferryman/controller.yaml (units, bindings, keys).
+# See contrib/agent.example.yaml and contrib/controller.example.yaml.
 #
 # The agent needs what it needs under systemd: root, /dev/fuse, and the
 # right to mount. Mounts it makes inside the container reach the host only
@@ -33,11 +38,19 @@ services:
     # Units unmount in parallel; a busy mount is detached lazily.
     stop_grace_period: 90s
 
+    # It starts without the controller too (from the config it last ran,
+    # kept in /var/lib/ferryman), so this is ordering, not a requirement.
+    depends_on:
+      controller:
+        condition: service_started
+        required: false
+
     volumes:
       # agent.yaml, its token, serve secrets (read-only)
       - /etc/ferryman:/etc/ferryman:ro
 
-      # paths.state, paths.cache, paths.logs
+      # paths.state (the controller's last config and key, the event
+      # outbox), paths.cache, paths.logs
       - /var/lib/ferryman:/var/lib/ferryman
       - /var/cache/ferryman:/var/cache/ferryman
       - /var/log/ferryman:/var/log/ferryman
@@ -73,22 +86,24 @@ services:
       retries: 3
       start_period: 30s
 
-  # Optional: the controller. Shares key pools between hosts and serves the
-  # web UI. Runs as PUID:PGID, not root. Its config must listen on 0.0.0.0
-  # (listen: {host: 0.0.0.0, port: 8470}) to be reachable through the port
-  # below; put Traefik in front for TLS.
+  # The controller: every agent's config, the key pools, events and
+  # notifications, the web UI. Runs as PUID:PGID, not root. Its config must
+  # listen on 0.0.0.0 (listen: {host: 0.0.0.0, port: 8470}) to be reachable
+  # through the port below; this host's agent reaches it as
+  # http://127.0.0.1:8470. Put Traefik in front for TLS and other hosts.
+  # It re-reads controller.yaml when it changes: agents pick up the change
+  # without a restart (`docker kill -s HUP ferryman-controller` to force it).
   controller:
     image: ghcr.io/andronics/ferryman:latest
     container_name: ferryman-controller
     restart: unless-stopped
-    profiles: ["controller"]
     command: ["controller"]
 
     ports:
-      - "127.0.0.1:8470:8470"   # controller HTTP (UI, agent API)
+      - "127.0.0.1:8470:8470"   # controller HTTP (UI, agents)
 
     volumes:
-      # controller.yaml and the pool keys (readable by PUID:PGID)
+      # controller.yaml, the pool keys, any SMTP pass_file (readable by PUID:PGID)
       - /etc/ferryman:/etc/ferryman:ro
       # The config's default `state:`; given to PUID:PGID at start
       - ./controller-state:/var/lib/ferryman-controller
