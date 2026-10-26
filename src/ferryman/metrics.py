@@ -65,6 +65,10 @@ METRICS: dict[str, tuple[str, str]] = {
         "gauge",
         "When the first key of an all-exhausted pool frees.",
     ),
+    "ferryman_pool_key_probe_timestamp_seconds": (
+        "gauge",
+        "When an exhausted key was last probed, by result (ok, capped, error).",
+    ),
     "ferryman_coordinator_reachable": ("gauge", "1 if the coordinator answered the last request."),
     "ferryman_coordinator_info": ("gauge", "Coordinator version (always 1)."),
     "ferryman_agent_last_report_timestamp_seconds": ("gauge", "When the agent last reported."),
@@ -108,6 +112,10 @@ def _pool(m: Exposition, info: dict[str, Any]) -> None:
     for k in keys:
         if k["current"]:
             m.add("ferryman_pool_current_key", 1, pool=p, key=k["key"])
+    for k in keys:
+        if pr := k.get("probe"):
+            m.add("ferryman_pool_key_probe_timestamp_seconds", pr["at"], pool=p, key=k["key"],
+                  result=pr["result"])  # fmt: skip
     frees = [k["exhausted_until"] for k in keys if k["exhausted_until"]]
     if frees and len(frees) == len(keys):
         m.add("ferryman_pool_frees_timestamp_seconds", min(frees), pool=p)

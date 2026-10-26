@@ -157,7 +157,9 @@ def test_example_config_is_valid_and_complete() -> None:
         assert set(raw[section]) == names(model), section
     for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
         shown = set().union(*(set(v) for v in raw[key].values()))
-        assert shown == names(model), f"{key}: missing {names(model) - shown}"
+        # A pool's probe is the coordinator's (the agent refuses it).
+        wanted = names(model) - ({"probe"} if key == "pools" else set())
+        assert shown == wanted, f"{key}: missing {wanted - shown}"
     mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
     assert set().union(*(set(m) for m in mounts)) == names(Mount)
     serves = [sv for u in raw["units"].values() for sv in u.get("serve") or []]

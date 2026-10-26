@@ -316,6 +316,15 @@ def pool(ctx: typer.Context) -> None:
                     if k["file_ok"]
                     else "skipped"
                 )
+                pr = k.get("probe")
+                if (
+                    pr
+                    and k["exhausted_until"]
+                    and pr["at"] >= k["exhausted_until"] - p["quota_window"]
+                ):
+                    when = time.strftime("%F %T", time.localtime(pr["at"]))
+                    said = "still capped" if pr["result"] == "capped" else pr["message"]
+                    state += f"; probed {when}: {said}"
                 typer.echo(
                     f"  {'*' if k['current'] else ' '} {k['key']:66} "
                     f"{'ok' if k['file_ok'] else 'BAD':4} {state}"

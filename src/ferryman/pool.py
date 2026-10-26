@@ -222,6 +222,47 @@ class LocalPool:
     async def info(self) -> dict[str, Any]:
         return self.describe()
 
+    # --------------------------------------------------------------- probes
+
+    def probe_due(self) -> list[tuple[str, float]]:
+        """Exhausted keys (with good files) whose cap hit, or last probe, is
+        at least probe.interval old: (key, when it was marked exhausted)."""
+        if self.cfg.probe is None:
+            return []
+        state, now = self._read(), self.clock()
+        probes = state.get("probes", {})
+        due = []
+        for k in self.cfg.keys:
+            marked = state.get("exhausted", {}).get(k)
+            if marked is None or marked + self.cfg.quota_window <= now or not self.file_ok(k):
+                continue
+            last = max(marked, probes.get(k, {}).get("at", 0))
+            if now - last >= self.cfg.probe.interval:
+                due.append((k, marked))
+        return due
+
+    async def record_probe(self, key: str, marked: float, result: str, message: str = "") -> bool:
+        """Store a probe's outcome. On "ok" the key is available again, unless
+        a cap hit marked it afresh while the probe ran. Returns whether the
+        pool moved onto it (it had no available key)."""
+        async with self.lock:
+            stranded = not self.available()
+            state = self._read()
+            state.setdefault("probes", {})[key] = {"at": self.clock(), "result": result,
+                                                   "message": message}  # fmt: skip
+            back = result == "ok" and state.get("exhausted", {}).get(key) == marked
+            if back:
+                del state["exhausted"][key]
+                if stranded:
+                    state["current"] = key
+                    state["rotated_at"] = self.clock()
+                    state["epoch"] = int(state.get("epoch", 0)) + 1
+            self._write(state)
+        if back:
+            log.warning("pool %s: %s can upload again (probe), %s early", self.name, key,
+                        _span(marked + self.cfg.quota_window - self.clock()))  # fmt: skip
+        return back and stranded
+
     def key_file(self, key: str) -> Path:
         """Path of a key, after checking it parses as a service-account key
         for that client_email (an encrypted or wrong file fails here, before
@@ -242,6 +283,7 @@ class LocalPool:
         state = self._read()
         now = self.clock()
         exhausted = state.get("exhausted", {})
+        probes = state.get("probes", {})
         keys = []
         for k in self.cfg.keys:
             file_ok = self.file_ok(k)
@@ -252,11 +294,13 @@ class LocalPool:
                     "current": k == state.get("current"),
                     "file_ok": file_ok,
                     "exhausted_until": frees if frees > now else None,
+                    "probe": probes.get(k),  # the last: {at, result, message}
                 }
             )
         return {
             "pool": self.name,
             "quota_window": self.cfg.quota_window,
+            "probe_interval": self.cfg.probe.interval if self.cfg.probe else None,
             "rotated_at": state.get("rotated_at"),
             "epoch": int(state.get("epoch", 0)),
             "keys": keys,
@@ -273,3 +317,8 @@ class LocalPool:
         if frees:
             return PoolExhausted(self.name, min(frees))
         return PoolError(f"pool {self.name}: no usable key: every key file is bad")
+
+
+def _span(seconds: float) -> str:
+    s = max(int(seconds), 0)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m"
