@@ -20,6 +20,7 @@ from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
 from .rc import RcError
 from .transfer import TransferBusy, TransferRunner
+from .tuning import Tuner
 from .unit import UnitSupervisor
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class Agent:
             if isinstance(pool, CoordinatorPool):
                 pool.emit = self.notifier.emit
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
+        self.tuner = Tuner(self)
         # Transfers on coordinator pools must hold a claim before they run;
         # name -> why a transfer may not run (absent: it may).
         self.claim_blocks: dict[str, str] = {}
@@ -375,6 +377,7 @@ class Agent:
             "hostname": self.layout.hostname,
             "units": [sup.status() for sup in self.units.values()],
             "transfers": [tr.status() for tr in self.transfers.values()],
+            "tuning": self.tuner.status(),
         }
 
     def select_units(self, pattern: str | None) -> list[UnitSupervisor]:
