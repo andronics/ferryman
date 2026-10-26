@@ -1,6 +1,6 @@
 [project]
 name = "ferryman"
-version = "0.1.0"
+version = "0.2.0"
 description = "Google Drive mounts, uploads and service-account key rotation via rclone"
 readme = "README.md"
 requires-python = ">=3.13"

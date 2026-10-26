@@ -1,19 +1,27 @@
 # ferryman
 
-Google Drive for servers: ferryman keeps rclone mounts of your shared drives alive, moves staged files and backups up to them, and rotates a pool of service-account keys when Drive's ~750G/day upload cap hits — switching every running mount to the next key in place, without a remount.
+Google Drive for servers: ferryman keeps rclone mounts of your shared drives alive, serves them over WebDAV, FTP and friends, moves staged files and backups up to them, and rotates a pool of service-account keys when Drive's ~750G/day upload cap hits — switching every running mount to the next key in place, without a remount.
 
 ```yaml
-roots: {local: /pool/local, remote: /pool/remote}
 pools:
   uploads:
     keys_dir: /etc/ferryman/keys
     keys: [sa-01@proj.iam.gserviceaccount.com, sa-02@proj.iam.gserviceaccount.com]
 units:
-  media-tv: {drive_id: 0AMN8oIdNrZNRUk9PVA, mountpoint: media/tv, pool: uploads}
-  backups:  {drive_id: 0ACZjQ8dkr0XEUk9PVA, mountpoint: backups, pool: uploads, mount: false}
+  media-tv:
+    drive_id: 0AMN8oIdNrZNRUk9PVA
+    pool: uploads
+    mounts:                          # one process, one cache, any number of paths
+      - path: /pool/google/media/tv
+      - path: /srv/emby/tv
+        read_only: true              # a kernel read-only bind of the first
+    serve:
+      - {type: webdav, addr: "127.0.0.1:8081"}
+  backups: {drive_id: 0ACZjQ8dkr0XEUk9PVA, pool: uploads}   # no mounts: transfers only
 transfers:
   media-tv:                          # staged files move up every 4 hours
     unit: media-tv
+    source: /pool/staging/tv
     schedule: "0 */4 * * *"
   pve-dump:                          # each node mirrors its dumps, 7 rolling copies
     unit: backups
@@ -33,7 +41,8 @@ rclone does the data path well, but running it as infrastructure leaves a lot to
 
 **Key Features:**
 
-- **Supervised mounts:** one rclone process per drive, restarted with backoff. A health check catches wedged FUSE endpoints, not just dead ones, and detaches them ([docs](https://github.com/andronics/ferryman/wiki/Health-and-Supervision))
+- **Supervised mounts:** one rclone process per drive, restarted with backoff, mounted at any number of absolute paths that share one cache, with per-path `allow_other` and kernel read-only binds. A health check catches wedged FUSE endpoints, not just dead ones, and re-mounts a lost path in place ([docs](https://github.com/andronics/ferryman/wiki/Units))
+- **Serving:** WebDAV, HTTP, FTP(S), SFTP, S3, NFS, DLNA or restic from the drive's own process, sharing its cache and key; with auth required beyond loopback, and no FUSE needed ([docs](https://github.com/andronics/ferryman/wiki/Serving))
 - **Live key rotation:** on `User rate limit exceeded.` the pool advances once and every mount switches key with `backend set`, keeping its caches ([docs](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation))
 - **Move, copy and sync transfers:** these run inside the mount's own process. `sync` has safety rails: an empty source is refused, deletions can be capped, and date-folder mirrors are rejected ([docs](https://github.com/andronics/ferryman/wiki/Transfers))
 - **Placeholders:** `{hostname}`, `{env:NAME}`, `{weekday}` and `{now:%Y/%m}` let one config serve every node ([docs](https://github.com/andronics/ferryman/wiki/Placeholders))
@@ -41,7 +50,7 @@ rclone does the data path well, but running it as infrastructure leaves a lot to
 - **Coordinator:** a shared key pool for several hosts. A cap hit on one moves them all, and backup destinations that would overlap are refused ([docs](https://github.com/andronics/ferryman/wiki/Coordinator))
 - **Observability:** Prometheus metrics, mail and webhook alerts, and a web UI with restart, run and rotate buttons ([metrics](https://github.com/andronics/ferryman/wiki/Metrics), [alerts](https://github.com/andronics/ferryman/wiki/Notifications), [UI](https://github.com/andronics/ferryman/wiki/Web-UI))
 
-**How it works:** `ferryman agent` runs on each host under systemd. It supervises one `rclone mount` (or `rclone rcd`) per unit and drives each over its rc socket. It also schedules transfers as rc jobs, checks health, and serves a control API on a unix socket for the `ferryman` CLI. The optional `ferryman coordinator` sits behind Traefik and leases keys to agents.
+**How it works:** `ferryman agent` runs on each host under systemd. It supervises one `rclone mount` (or `rclone rcd`) per unit and drives each over its rc socket: further mount paths and servers join that process, so they share its connection, cache and key. It also schedules transfers as rc jobs, checks health, and serves a control API on a unix socket for the `ferryman` CLI. The optional `ferryman coordinator` sits behind Traefik and leases keys to agents.
 
 ---
 
@@ -69,14 +78,16 @@ ln -s /opt/ferryman/bin/ferryman /usr/local/bin/ferryman
 Write `/etc/ferryman/config.yaml`: the example above with your drive ids and keys, or start from [`contrib/config.example.yaml`](contrib/config.example.yaml), which lists every setting with its default. Then:
 
 ```bash
-ferryman verify                                    # offline: config, key files, rclone
+ferryman verify                                    # offline: config, paths, key and secret files, rclone
 install -Dm644 contrib/ferryman.service /etc/systemd/system/ferryman.service
 systemctl daemon-reload && systemctl enable --now ferryman
 
-ferryman status                                    # units and transfers
+ferryman status                                    # units, mounts, servers, transfers
 ferryman run media-tv --dry-run                    # what a transfer would do
 ferryman pool                                      # keys: current, exhausted, file health
 ```
+
+**Upgrading from 0.1:** `roots`, a unit's `mountpoint` and `mount: false` are gone. Give each unit `mounts: [{path: /absolute/path}]` (none for a transfer-only unit) and each transfer an absolute `source`; the old keys fail at load with a message saying what replaces them. Then run `ferryman verify`, which also checks the new path rules.
 
 ### Or with Docker
 
@@ -99,7 +110,7 @@ Tags: `latest` and `X.Y.Z`/`X.Y` for releases, `edge` for main.
 Everything beyond getting started lives on the **[wiki](https://github.com/andronics/ferryman/wiki)**:
 
 **Core Concepts**
-[Units](https://github.com/andronics/ferryman/wiki/Units) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Coordinator](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision) · [Upload Tuning](https://github.com/andronics/ferryman/wiki/Upload-Tuning)
+[Units](https://github.com/andronics/ferryman/wiki/Units) · [Serving](https://github.com/andronics/ferryman/wiki/Serving) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Coordinator](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision) · [Upload Tuning](https://github.com/andronics/ferryman/wiki/Upload-Tuning)
 
 **Control & Observability**
 [CLI Reference](https://github.com/andronics/ferryman/wiki/CLI-Reference) · [HTTP API Reference](https://github.com/andronics/ferryman/wiki/HTTP-API-Reference) · [Web UI](https://github.com/andronics/ferryman/wiki/Web-UI) · [Notifications](https://github.com/andronics/ferryman/wiki/Notifications) · [Metrics](https://github.com/andronics/ferryman/wiki/Metrics)
