@@ -128,6 +128,9 @@ units:
         default_permissions: true # the kernel enforces mode bits (default)
       - path: /pool/google/{hostname}/tv   # placeholders: {hostname} {unit} {env:NAME}
         allow_other: false        # this path for root only; same files, same cache
+      - path: /pool/google/ro/tv
+        read_only: true           # a kernel ro bind of the first writable mount (root only);
+                                  #   takes that mount's allow_other/default_permissions
   media-movies:
     drive_id: 0ABBBBBBBBBBBBBBBBB
     pool: uploads

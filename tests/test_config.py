@@ -242,3 +242,59 @@ def test_bare_off_cache_mode_means_off(tmp_path: Path) -> None:
     path.write_text(path.read_text().replace("vfs_cache_mode: off}", "vfs_cache_mode: on}"))
     with pytest.raises(ValidationError, match="vfs_cache_mode"):
         Config.load(path)  # true has no meaning: still an error
+
+
+# ------------------------------------------------------------ read-only mounts
+
+
+def test_the_first_writable_mount_is_the_processs_own(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    from ferryman.unit import UnitSupervisor
+
+    def unit(*mounts: dict) -> UnitSupervisor:  # type: ignore[type-arg]
+        cfg = make_config(units={"tv": {"pool": "main", "mounts": list(mounts)}}, transfers={})
+        return UnitSupervisor("tv", cfg, Layout(cfg), None)
+
+    sup = unit({"path": "/a", "read_only": True}, {"path": "/b"}, {"path": "/c"})
+    assert sup.unit.primary == 1 and sup.primary_path == Path("/b")
+    argv = sup.argv()
+    assert argv[2:4] == ["tv:", "/b"] and "--read-only" not in argv
+    kinds = [(m["path"], m["kind"], m["primary"]) for m in sup.status()["mounts"]]
+    assert kinds == [("/a", "bind", False), ("/b", "rclone", True), ("/c", "rc", False)]
+
+    # All read-only: the first is rclone's own, read-only as a whole; the rest bind it.
+    sup = unit({"path": "/a", "read_only": True}, {"path": "/b", "read_only": True})
+    assert sup.unit.primary == 0 and "--read-only" in sup.argv()
+    assert [m["kind"] for m in sup.status()["mounts"]] == ["rclone", "bind"]
+
+
+def test_a_bind_cannot_differ_from_the_mount_it_binds(make_config: Callable[..., Config]) -> None:
+    units = {"tv": {"pool": "main", "mounts": [
+        {"path": "/a", "allow_other": False},
+        {"path": "/b", "read_only": True},  # allow_other defaults to true: differs
+    ]}}  # fmt: skip
+    with pytest.raises(ValidationError, match="binds /a, so its allow_other is /a's"):
+        make_config(units=units, transfers={})
+    units["tv"]["mounts"][1]["allow_other"] = False  # type: ignore[index]
+    make_config(units=units, transfers={})
+
+
+async def test_read_only_without_root_fails_that_mount_only(
+    make_config: Callable[..., Config], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from ferryman.unit import UnitSupervisor
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    cfg = make_config(units={"tv": {"pool": "main", "mounts": [
+        {"path": str(tmp_path / "a")}, {"path": str(tmp_path / "b"), "read_only": True}]}},
+        transfers={})  # fmt: skip
+    sup = UnitSupervisor("tv", cfg, Layout(cfg), None)
+    events: list[str] = []
+    sup.emit = lambda e: events.append(e.kind)
+    mount, path = sup._joined()[0]
+    assert not await sup.join(mount, path)
+    assert "need root" in sup.mount_states[str(path)]
+    assert events == ["mount.lost"]
