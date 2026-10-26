@@ -193,6 +193,11 @@ def status(ctx: typer.Context) -> None:
             for unit, m in mounts:
                 state = f"{m['state']} ({m.get('kind', '?')}{', ro' if m.get('read_only') else ''})"
                 typer.echo(f"{m['path']:48} {unit:24} {state}")
+        serves = [(u["unit"], sv) for u in d["units"] for sv in u.get("serves") or []]
+        if serves:
+            typer.echo(f"\n{'SERVE':8} {'ADDRESS':39} {'UNIT':24} STATE")
+            for unit, sv in serves:
+                typer.echo(f"{sv['type']:8} {sv['addr']:39} {unit:24} {sv['state']}")
         # Read settings only where they differ from ferryman's built-ins.
         tuned = [(u["unit"], {k: v for k, v in (u.get("read") or {}).items()
                               if v["source"] != "built-in"}) for u in d["units"]]  # fmt: skip

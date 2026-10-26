@@ -217,3 +217,99 @@ async def test_read_only_bind_shares_the_mount_and_survives_a_crash(
     finally:
         await agent.stop()
     assert not mountutil.is_mounted(ro) and not mountutil.is_mounted(rw)
+
+
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+async def test_serve_from_a_mountless_unit(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    """An rcd unit serving over HTTP: auth, the unit's read settings reach the
+    server's VFS, and a server rclone lost comes back without a restart."""
+    import subprocess
+
+    import httpx
+
+    backing = tmp_path / "drive"
+    backing.mkdir()
+    (backing / "a.txt").write_text("a\n")
+    htpasswd = tmp_path / "htpasswd"
+    run = subprocess.run
+    argv = ["openssl", "passwd", "-apr1", "s3cret"]
+    out = await asyncio.to_thread(run, argv, capture_output=True, text=True, check=True)
+    hashed = out.stdout.strip()
+    htpasswd.write_text(f"emby:{hashed}\n")
+    port = free_port()
+    cfg = make_config(
+        units={"docs": {"backend": "alias", "options": {"remote": str(backing)},
+                        "vfs_read_chunk_size": "4M",
+                        "serve": [{"type": "http", "addr": f"127.0.0.1:{port}",
+                                   "htpasswd": str(htpasswd)}]}},
+        transfers={},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    sup = agent.units["docs"]
+    url = f"http://127.0.0.1:{port}/a.txt"
+    try:
+        await agent.start()
+        await wait_for(lambda: sup.ready)
+        assert sup.status()["serves"] == [
+            {"type": "http", "addr": f"127.0.0.1:{port}", "state": "running"}
+        ]
+        async with httpx.AsyncClient() as c:
+            assert (await c.get(url)).status_code == 401
+            r = await c.get(url, auth=("emby", "s3cret"))
+            assert r.status_code == 200 and r.text == "a\n"
+        vfs = await sup.rc.call("vfs/stats", fs="docs:")
+        assert vfs["opt"]["ChunkSize"] == 4 << 20  # the unit's read setting, via options/set
+
+        # rclone lost the server: the health check starts it again, in place.
+        old = sup.serve_ids[0]
+        await sup.rc.call("serve/stop", id=old)
+        health = await agent.check_health()
+        assert health["docs"] == f"healthy; http on 127.0.0.1:{port} not running: restarted"
+        assert sup.serve_ids[0] != old and sup.restarts == 0
+        async with httpx.AsyncClient() as c:
+            assert (await c.get(url, auth=("emby", "s3cret"))).status_code == 200
+    finally:
+        await agent.stop()
+    from ferryman.unit import _port_free
+
+    _port_free("127.0.0.1", port)  # released
+
+
+async def test_serve_shares_the_mounts_cache(
+    make_config: Callable[..., Config], tmp_path: Path
+) -> None:
+    import httpx
+
+    backing = tmp_path / "drive"
+    backing.mkdir()
+    (tmp_path / "remote").mkdir()
+    port = free_port()
+    cfg = make_config(
+        units={"docs": {"backend": "alias", "options": {"remote": str(backing)}, "warm": False,
+                        "mounts": [{"path": str(tmp_path / "remote/docs")}],
+                        "serve": [{"type": "webdav", "addr": f"127.0.0.1:{port}"}]}},
+        transfers={},
+    )  # fmt: skip
+    agent = Agent(cfg)
+    sup = agent.units["docs"]
+    mount = agent.layout.mount_paths("docs")[0]
+    try:
+        await agent.start()
+        await wait_for(lambda: sup.ready)
+        await asyncio.to_thread((mount / "new.txt").write_text, "new\n")
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"http://127.0.0.1:{port}/new.txt")
+        assert r.status_code == 200 and r.text == "new\n"  # written via FUSE, served at once
+        assert (await sup.rc.call("vfs/stats", fs="docs:"))["inUse"] == 2
+    finally:
+        await agent.stop()
+    assert not mountutil.is_mounted(mount)

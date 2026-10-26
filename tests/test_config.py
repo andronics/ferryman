@@ -136,10 +136,11 @@ def test_example_config_is_valid_and_complete() -> None:
     import yaml
     from pydantic import BaseModel
 
-    from ferryman.config import Mount, Pool, Transfer, Unit
+    from ferryman.config import Mount, Pool, Serve, Transfer, Unit
 
     cfg = Config.load(EXAMPLE)
-    assert not Layout(cfg).check_paths()
+    # Its secret files and TLS certs are examples: absent here, and that's all.
+    assert [p for p in Layout(cfg).check_paths() if not p.endswith("does not exist")] == []
     for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
         value = getattr(cfg, section)
         assert value == type(value)(), f"{section} differs from its defaults"
@@ -159,6 +160,8 @@ def test_example_config_is_valid_and_complete() -> None:
         assert shown == names(model), f"{key}: missing {names(model) - shown}"
     mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
     assert set().union(*(set(m) for m in mounts)) == names(Mount)
+    serves = [sv for u in raw["units"].values() for sv in u.get("serve") or []]
+    assert set().union(*(set(sv) for sv in serves)) == names(Serve)
 
 
 # ---------------------------------------------------------- read settings
@@ -298,3 +301,136 @@ async def test_read_only_without_root_fails_that_mount_only(
     assert not await sup.join(mount, path)
     assert "need root" in sup.mount_states[str(path)]
     assert events == ["mount.lost"]
+
+
+# -------------------------------------------------------------------- serve
+
+
+def serving(make_config: Callable[..., Config], *serve: dict, **unit: object) -> Config:  # type: ignore[type-arg]
+    return make_config(units={"tv": {"pool": "main", "serve": list(serve), **unit}},
+                       transfers={})  # fmt: skip
+
+
+def test_serve_shapes(make_config: Callable[..., Config], tmp_path: Path) -> None:
+    cfg = serving(
+        make_config,
+        {"type": "http", "addr": "127.0.0.1:8081"},  # loopback: auth optional
+        {"type": "webdav", "addr": ":8082", "htpasswd": str(tmp_path / "h")},
+        {"type": "ftp", "addr": "0.0.0.0:2121", "passive_port": "30000-30009",
+         "user": "u", "pass_file": str(tmp_path / "p")},
+        {"type": "dlna", "addr": ":7879", "allow_unauthenticated": True},
+        {"type": "sftp", "addr": "[::1]:2022"},
+        vfs_read_chunk_size="4M",  # read settings apply to a serve-only unit
+    )  # fmt: skip
+    serve = cfg.units["tv"].serve
+    assert serve[2].passive_range == (30000, 30009) and serve[2].authenticated
+    assert serve[4].host_port == ("[::1]", 2022)
+
+
+@pytest.mark.parametrize(
+    ("serve", "message"),
+    [
+        ({"type": "http"}, "Field required"),
+        ({"type": "gopher", "addr": ":70"}, "Input should be"),
+        ({"type": "http", "addr": "8081"}, "must be host:port"),
+        ({"type": "http", "addr": "127.0.0.1:70000"}, "must be host:port"),
+        ({"type": "http", "addr": "127.0.0.1:1", "user": "u"}, "user and pass_file go together"),
+        ({"type": "ftp", "addr": "127.0.0.1:1", "passive_port": "3-4", "htpasswd": "/h"},
+         "htpasswd is for"),
+        ({"type": "http", "addr": "127.0.0.1:1", "cert": "/c"}, "cert and key go together"),
+        ({"type": "sftp", "addr": "127.0.0.1:1", "cert": "/c", "key": "/k"}, "cert/key are for"),
+        ({"type": "ftp", "addr": "127.0.0.1:1"}, "passive_port must be a range"),
+        ({"type": "http", "addr": "127.0.0.1:1", "passive_port": "3-4"}, "for ftp only"),
+        ({"type": "nfs", "addr": "127.0.0.1:1", "user": "u", "pass_file": "/p"},
+         "no authentication for nfs"),
+        ({"type": "http", "addr": "127.0.0.1:1", "options": {"vfs_cache_mode": "off"}},
+         "options vfs_cache_mode can't be set here"),
+        ({"type": "http", "addr": "127.0.0.1:1", "options": {"read_only": True}},
+         "options read_only can't be set here"),
+        ({"type": "http", "addr": ":8081"}, "beyond this host without authentication"),
+        ({"type": "nfs", "addr": "10.0.0.5:2049"}, "beyond this host without authentication"),
+    ],
+)  # fmt: skip
+def test_serve_rejects(make_config: Callable[..., Config], serve: dict, message: str) -> None:  # type: ignore[type-arg]
+    with pytest.raises(ValidationError, match=message):
+        serving(make_config, serve)
+
+
+def test_serve_ports_may_not_overlap(make_config: Callable[..., Config]) -> None:
+    def two(a: dict, b: dict) -> Config:  # type: ignore[type-arg]
+        return make_config(units={"a": {"pool": "main", "serve": [a]},
+                                  "b": {"pool": "main", "serve": [b]}}, transfers={})  # fmt: skip
+
+    http = {"type": "http", "addr": "127.0.0.1:8081"}
+    with pytest.raises(ValidationError, match="overlaps unit a's http serve"):
+        two(http, {"type": "webdav", "addr": "127.0.0.1:8081"})
+    with pytest.raises(ValidationError, match="overlaps"):  # a wildcard takes every host
+        two(http, {"type": "webdav", "addr": ":8081", "allow_unauthenticated": True})
+    two(http, {"type": "webdav", "addr": "127.0.0.2:8081"})  # another host: fine
+    ftp = {"type": "ftp", "addr": "127.0.0.1:2121", "passive_port": "30000-30099"}
+    with pytest.raises(ValidationError, match="overlaps"):
+        two(ftp, {**ftp, "addr": "127.0.0.1:2122", "passive_port": "30050-30149"})
+    with pytest.raises(ValidationError, match="overlaps"):
+        two(ftp, {"type": "http", "addr": "127.0.0.1:30001"})
+
+
+def test_nfs_needs_a_writing_cache(make_config: Callable[..., Config]) -> None:
+    nfs = {"type": "nfs", "addr": "127.0.0.1:2049"}
+    with pytest.raises(ValidationError, match="nfs server needs vfs_cache_mode"):
+        serving(make_config, nfs, vfs_cache_mode="off")
+    serving(make_config, nfs)  # full, the built-in
+
+
+def test_serve_secret_files_are_checked(make_config: Callable[..., Config], tmp_path: Path) -> None:
+    secret = tmp_path / "pass"
+    sv = {"type": "webdav", "addr": "127.0.0.1:8081", "user": "u", "pass_file": str(secret)}
+    cfg = serving(make_config, sv)
+    assert Layout(cfg).check_paths() == [
+        f"unit tv: webdav serve on 127.0.0.1:8081: pass_file {secret} does not exist"
+    ]
+    secret.write_text("s3cret\n")
+    secret.chmod(0o644)
+    assert "readable by everyone" in Layout(cfg).check_paths()[0]
+    secret.chmod(0o600)
+    assert Layout(cfg).check_paths() == []
+
+
+def test_serve_params(make_config: Callable[..., Config], tmp_path: Path) -> None:
+    from ferryman.unit import UnitSupervisor
+
+    secret = tmp_path / "pass"
+    secret.write_text("s3cret\n")
+    cfg = serving(
+        make_config,
+        {"type": "s3", "addr": "127.0.0.1:9000", "user": "AKID", "pass_file": str(secret)},
+        {"type": "sftp", "addr": "127.0.0.1:2022"},
+        {"type": "ftp", "addr": "127.0.0.1:2121", "passive_port": "30000-30009",
+         "user": "u", "pass_file": str(secret), "options": {"public_ip": "10.0.0.5"}},
+    )  # fmt: skip
+    sup = UnitSupervisor("tv", cfg, Layout(cfg), None)
+    s3, sftp, ftp = (sup._serve_params(sv) for sv in cfg.units["tv"].serve)
+    assert s3["auth_key"] == ["AKID,s3cret"] and "pass" not in s3
+    assert sftp["no_auth"] is True
+    assert ftp == {
+        "type": "ftp",
+        "fs": "tv:",
+        "addr": "127.0.0.1:2121",
+        "user": "u",
+        "pass": "s3cret",
+        "passive_port": "30000-30009",
+        "public_ip": "10.0.0.5",
+    }
+
+
+def test_port_check_names_the_clash() -> None:
+    import socket
+
+    from ferryman.unit import _port_free
+
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        with pytest.raises(OSError, match=f"127.0.0.1:{port} is not available"):
+            _port_free("127.0.0.1", port)
+    _port_free("127.0.0.1", port)

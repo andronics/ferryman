@@ -213,7 +213,7 @@ function renderAgent(a) {
   const units = st.units.map((u) => {
     const s = speed[u.unit] || {};
     return `<tr>
-      <td class="mono">${esc(u.unit)}${(u.mounts || []).map((m) => `<div class="${m.state === "mounted" ? "muted" : "err"}">${esc(m.path)}${m.read_only ? " (ro)" : ""}${m.state === "mounted" ? "" : ` (${esc(m.state)})`}</div>`).join("")}</td>
+      <td class="mono">${esc(u.unit)}${(u.mounts || []).map((m) => `<div class="${m.state === "mounted" ? "muted" : "err"}">${esc(m.path)}${m.read_only ? " (ro)" : ""}${m.state === "mounted" ? "" : ` (${esc(m.state)})`}</div>`).join("")}${(u.serves || []).map((s) => `<div class="${s.state === "running" ? "muted" : "err"}">${esc(s.type)} ${esc(s.addr)}${s.state === "running" ? "" : ` (${esc(s.state)})`}</div>`).join("")}</td>
       <td>${state(u.state)} <span class="muted">${ago(u.since)}</span></td>
       <td class="num">${s.speed ? iec(s.speed) + "/s" : "–"}</td>
       <td class="num">${u.restarts}</td>
