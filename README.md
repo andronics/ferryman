@@ -87,7 +87,7 @@ ferryman pool                                      # keys: current, exhausted, f
 Everything beyond getting started lives on the **[wiki](https://github.com/andronics/ferryman/wiki)**:
 
 **Core Concepts**
-[Units](https://github.com/andronics/ferryman/wiki/Units) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Coordinator](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision)
+[Units](https://github.com/andronics/ferryman/wiki/Units) · [Transfers](https://github.com/andronics/ferryman/wiki/Transfers) · [Placeholders](https://github.com/andronics/ferryman/wiki/Placeholders) · [Key Pools and Rotation](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation) · [Coordinator](https://github.com/andronics/ferryman/wiki/Coordinator) · [Health and Supervision](https://github.com/andronics/ferryman/wiki/Health-and-Supervision) · [Upload Tuning](https://github.com/andronics/ferryman/wiki/Upload-Tuning)
 
 **Control & Observability**
 [CLI Reference](https://github.com/andronics/ferryman/wiki/CLI-Reference) · [HTTP API Reference](https://github.com/andronics/ferryman/wiki/HTTP-API-Reference) · [Web UI](https://github.com/andronics/ferryman/wiki/Web-UI) · [Notifications](https://github.com/andronics/ferryman/wiki/Notifications) · [Metrics](https://github.com/andronics/ferryman/wiki/Metrics)
