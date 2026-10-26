@@ -99,3 +99,35 @@ def test_transfer_dest_placeholders_and_sync_options(make_config: Callable[..., 
         make_config(transfers={"t": {"unit": "media-tv", "max_delete": 5}})
     with pytest.raises(ValueError, match="sync only"):
         make_config(transfers={"t": {"unit": "media-tv", "mode": "copy", "allow_empty": True}})
+
+
+EXAMPLE = Path(__file__).parent.parent / "contrib/config.example.yaml"
+
+
+def test_example_config_is_valid_and_complete() -> None:
+    """contrib/config.example.yaml loads, shows the global sections at their
+    defaults, and mentions every setting, so it cannot fall behind the code."""
+    import yaml
+    from pydantic import BaseModel
+
+    from ferryman.config import Pool, Transfer, Unit
+
+    cfg = Config.load(EXAMPLE)
+    assert not Layout(cfg).check_placeholders()
+    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
+        value = getattr(cfg, section)
+        assert value == type(value)(), f"{section} differs from its defaults"
+    assert cfg.hostname is None and cfg.coordinator is None
+
+    raw = yaml.safe_load(EXAMPLE.read_text())
+
+    def names(model: type[BaseModel]) -> set[str]:
+        return {f.alias or n for n, f in model.model_fields.items()}
+
+    assert set(raw) == names(Config)
+    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
+        model = type(getattr(cfg, section))
+        assert set(raw[section]) == names(model), section
+    for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
+        shown = set().union(*(set(v) for v in raw[key].values()))
+        assert shown == names(model), f"{key}: missing {names(model) - shown}"
