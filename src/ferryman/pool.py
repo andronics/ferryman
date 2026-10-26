@@ -43,6 +43,10 @@ class PoolError(Exception):
     pass
 
 
+class NoOtherKey(PoolError):
+    """A rotation by hand found no other usable key; the current one stays."""
+
+
 class PoolExhausted(PoolError):
     def __init__(self, pool: str, frees_at: float) -> None:
         self.frees_at = frees_at
@@ -129,32 +133,49 @@ class LocalPool:
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, self.state_file)
 
+    def file_ok(self, key: str) -> bool:
+        try:
+            self.key_file(key)
+            return True
+        except PoolError:
+            return False
+
     def available(self) -> list[str]:
-        """Keys not exhausted within the quota window, in config order."""
+        """Keys not exhausted within the quota window and with a good key file,
+        in config order. Key files are read every time, so a fixed one is
+        back in rotation without a restart."""
         now = self.clock()
         exhausted = self._read().get("exhausted", {})
-        return [k for k in self.cfg.keys if exhausted.get(k, 0) + self.cfg.quota_window <= now]
+        window = self.cfg.quota_window
+        return [k for k in self.cfg.keys if exhausted.get(k, 0) + window <= now and self.file_ok(k)]
 
     def current(self) -> str:
         """The key uploads should use right now. Settles on the first available
-        key when the state is empty or the recorded one has been exhausted."""
+        key when the state is empty or the recorded one has been exhausted or
+        its file has gone bad."""
         state = self._read()
         avail = self.available()
         if not avail:
-            raise self._exhausted(state)
+            raise self._unavailable(state)
         cur = state.get("current")
         if cur in avail:
             return str(cur)
+        if cur and not self.file_ok(cur):
+            log.warning("pool %s: key file for %s is bad; moving to %s", self.name, cur, avail[0])
         state["current"] = avail[0]
         self._write(state)
         return avail[0]
 
     async def advance(self, expected: str | None = None) -> str:
-        """Mark the current key exhausted and move to the next available one.
+        """Move to the next available key.
 
-        With `expected`, this is a no-op (returning the actual current key)
-        when someone already rotated past it, so N transfers that all hit the
-        cap on the same key rotate once, not N times."""
+        With `expected`, this is a cap hit on that key: it is marked exhausted
+        for the quota window, and the call is a no-op (returning the actual
+        current key) when someone already rotated past it, so N transfers that
+        all hit the cap on the same key rotate once, not N times.
+
+        Without, it is a rotation by hand: the current key keeps its quota and
+        stays available, and NoOtherKey is raised if no other key is usable."""
         async with self.lock:
             if not expected and not self._read().get("current"):
                 # Never used yet: rotating by hand means moving past the key
@@ -168,9 +189,9 @@ class LocalPool:
 
             now = self.clock()
             spent = cur or expected
-            if spent:
+            if expected and spent:
                 state.setdefault("exhausted", {})[spent] = now
-            self._write(state)
+                self._write(state)
 
             # Next available key after the current one, wrapping, so the pool
             # is consumed in order rather than always restarting from the top.
@@ -179,7 +200,9 @@ class LocalPool:
             avail = set(self.available())
             nxt = next((k for k in keys[i + 1 :] + keys[: i + 1] if k in avail), None)
             if nxt is None:
-                raise self._exhausted(state)
+                raise self._unavailable(state)
+            if nxt == spent:
+                raise NoOtherKey(f"pool {self.name}: no other usable key; staying on {spent}")
 
             state["current"] = nxt
             state["rotated_at"] = now
@@ -221,11 +244,7 @@ class LocalPool:
         exhausted = state.get("exhausted", {})
         keys = []
         for k in self.cfg.keys:
-            try:
-                self.key_file(k)
-                file_ok = True
-            except PoolError:
-                file_ok = False
+            file_ok = self.file_ok(k)
             frees = exhausted.get(k, 0) + self.cfg.quota_window
             keys.append(
                 {
@@ -243,7 +262,14 @@ class LocalPool:
             "keys": keys,
         }
 
-    def _exhausted(self, state: dict[str, Any]) -> PoolExhausted:
+    def _unavailable(self, state: dict[str, Any]) -> PoolError:
+        """Why no key is available: exhausted keys with good files free in
+        time; if there are none, the pool needs its key files fixed."""
+        now = self.clock()
         ex = state.get("exhausted", {})
-        frees = min(ex.values(), default=self.clock()) + self.cfg.quota_window
-        return PoolExhausted(self.name, frees)
+        window = self.cfg.quota_window
+        frees = [t + window for k, t in ex.items()
+                 if k in self.cfg.keys and t + window > now and self.file_ok(k)]  # fmt: skip
+        if frees:
+            return PoolExhausted(self.name, min(frees))
+        return PoolError(f"pool {self.name}: no usable key: every key file is bad")

@@ -88,11 +88,17 @@ async def test_cap_hits_from_two_agents_rotate_once(transport: httpx.ASGITranspo
 async def test_all_exhausted_is_a_409_with_frees_at(transport: httpx.ASGITransport) -> None:
     a = client(transport, "site-a")
     await a.request("GET", "/v1/pools/main/lease")  # settles on A
-    for _ in range(2):
-        await a.request("POST", "/v1/pools/main/exhausted", json={})
+    for key in (A, B):
+        await a.request("POST", "/v1/pools/main/exhausted", json={"expected": key})
+    # Only C is left: rotating by hand stays on it, a 409 rather than a server error.
+    r = await raw(transport, "POST", "/v1/pools/main/exhausted", "token-a")
+    assert r.status_code == 409 and "no other usable key" in r.json()["error"]
     with pytest.raises(PoolExhausted) as exc:
-        await a.request("POST", "/v1/pools/main/exhausted", json={})
+        await a.request("POST", "/v1/pools/main/exhausted", json={"expected": C})
     assert exc.value.frees_at > 0
+    # Every key exhausted: rotating by hand gets the same answer.
+    r = await raw(transport, "POST", "/v1/pools/main/exhausted", "token-a")
+    assert r.status_code == 409 and "frees_at" in r.json()
 
 
 async def test_watch_wakes_on_rotation_and_times_out(transport: httpx.ASGITransport) -> None:
@@ -345,14 +351,19 @@ async def test_ui_needs_the_auth_proxy_and_the_csrf_header(
     r = await ui(ui_transport, "POST", "/ui/api/pools/main/rotate",
                  headers={"X-authentik-username": "stephen"})  # fmt: skip
     assert r.status_code == 403 and "X-Ferryman-UI" in r.json()["error"]
+    assert page.headers["cache-control"] == "no-cache"
     state = (await ui(ui_transport, "GET", "/ui/api/state")).json()
     assert state["user"] == "stephen"
+    assert len(state["page"]) == 16  # open tabs reload when this changes
     assert [a["agent"] for a in state["agents"]] == ["site-a", "site-b", "nobody"]
 
 
 async def test_ui_rotate_moves_the_pool(ui_transport: httpx.ASGITransport) -> None:
     r = await ui(ui_transport, "POST", "/ui/api/pools/main/rotate")
     assert r.json() == {"pool": "main", "current": B, "epoch": 1}
+    # A keeps its quota: rotating by hand is not a cap hit.
+    state = (await ui(ui_transport, "GET", "/ui/api/state")).json()
+    assert not any(k["exhausted_until"] for k in state["pools"][0]["keys"])
     assert (await ui(ui_transport, "POST", "/ui/api/pools/nope/rotate")).status_code == 404
 
 

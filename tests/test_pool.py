@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ferryman.config import Pool as PoolConfig
-from ferryman.pool import LocalPool, PoolError, PoolExhausted, is_quota_error
+from ferryman.pool import LocalPool, NoOtherKey, PoolError, PoolExhausted, is_quota_error
 from tests.conftest import KEYS, write_keys
 
 A, B, C = KEYS
@@ -39,11 +39,11 @@ def test_current_settles_on_first_key(pool: LocalPool) -> None:
 
 async def test_advance_in_order_and_wraps(pool: LocalPool, clock: Clock) -> None:
     assert pool.current() == A
-    assert await pool.advance() == B
-    assert await pool.advance() == C
+    assert await pool.advance(expected=A) == B
+    assert await pool.advance(expected=B) == C
     # A's window has passed by now, so the pool wraps back to it.
     clock.now += 101
-    assert await pool.advance() == A
+    assert await pool.advance(expected=C) == A
 
 
 async def test_advance_if_current_rotates_once(pool: LocalPool) -> None:
@@ -56,10 +56,10 @@ async def test_advance_if_current_rotates_once(pool: LocalPool) -> None:
 
 async def test_exhausted_then_frees(pool: LocalPool, clock: Clock) -> None:
     pool.current()
-    await pool.advance()
-    await pool.advance()
+    await pool.advance(expected=A)
+    await pool.advance(expected=B)
     with pytest.raises(PoolExhausted) as exc:
-        await pool.advance()
+        await pool.advance(expected=C)
     assert exc.value.frees_at == 1_000_000.0 + 100
     with pytest.raises(PoolExhausted):
         pool.current()
@@ -108,3 +108,66 @@ async def test_rotating_an_unused_pool_moves_past_its_first_key(tmp_path: Path) 
     write_keys(tmp_path, KEYS)
     assert await pool.advance() == KEYS[1]
     assert pool.epoch == 1
+
+
+async def test_rotating_by_hand_keeps_the_quota(pool: LocalPool) -> None:
+    pool.current()
+    assert await pool.advance() == B
+    assert await pool.advance() == C
+    # Nothing was marked exhausted: the pool wraps straight back to A.
+    assert pool.available() == [A, B, C]
+    assert await pool.advance() == A
+    assert pool.epoch == 3
+    assert not any(k["exhausted_until"] for k in pool.describe()["keys"])
+
+
+async def test_rotating_by_hand_with_no_other_key_stays(pool: LocalPool) -> None:
+    pool.current()
+    await pool.advance(expected=A)
+    await pool.advance(expected=B)
+    with pytest.raises(NoOtherKey, match="staying on " + C):
+        await pool.advance()
+    assert pool.current() == C and pool.epoch == 2
+
+
+def _break(pool: LocalPool, key: str) -> None:
+    assert pool.cfg.keys_dir is not None
+    (pool.cfg.keys_dir / f"{key}.json").write_text("not json")
+
+
+async def test_bad_key_files_are_skipped_until_fixed(pool: LocalPool, tmp_path: Path) -> None:
+    pool.current()
+    _break(pool, B)
+    assert pool.available() == [A, C]
+    assert await pool.advance(expected=A) == C
+    d = {k["key"]: k for k in pool.describe()["keys"]}
+    assert not d[B]["file_ok"] and not d[B]["exhausted_until"]
+    # Fixed on disk: back in rotation, no restart needed.
+    write_keys(tmp_path / "keys", [B])
+    assert pool.available() == [B, C]
+    assert await pool.advance() == B
+
+
+async def test_current_moves_off_a_key_whose_file_went_bad(pool: LocalPool) -> None:
+    assert pool.current() == A
+    _break(pool, A)
+    assert pool.current() == B
+
+
+async def test_every_key_file_bad_is_an_error_not_exhaustion(pool: LocalPool) -> None:
+    for k in KEYS:
+        _break(pool, k)
+    with pytest.raises(PoolError, match="every key file is bad") as exc:
+        pool.current()
+    assert not isinstance(exc.value, PoolExhausted)
+
+
+async def test_exhaustion_ignores_keys_with_bad_files(pool: LocalPool, clock: Clock) -> None:
+    pool.current()
+    await pool.advance(expected=A)
+    clock.now += 50
+    _break(pool, C)
+    # B hits the cap; C is bad, A frees 50s from now: that is when the pool frees.
+    with pytest.raises(PoolExhausted) as exc:
+        await pool.advance(expected=B)
+    assert exc.value.frees_at == 1_000_000.0 + 100

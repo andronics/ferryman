@@ -50,7 +50,7 @@ from starlette.routing import Route
 
 from .config import CoordinatorConfig
 from .metrics import CONTENT_TYPE, coordinator_metrics
-from .pool import LocalPool, PoolError, PoolExhausted
+from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
 
 log = logging.getLogger(__name__)
 # Longest an uplink's tune lock lasts if its agent never releases it.
@@ -277,6 +277,8 @@ def build_app(co: Coordinator) -> Starlette:
                 return JSONResponse({"error": f"not found: {e.args[0]}"}, status_code=404)
             except PoolExhausted as e:
                 return JSONResponse({"error": str(e), "frees_at": e.frees_at}, status_code=409)
+            except NoOtherKey as e:
+                return JSONResponse({"error": str(e)}, status_code=409)
             except PoolError as e:
                 log.error("%s", e)
                 return JSONResponse({"error": str(e)}, status_code=500)
@@ -390,18 +392,21 @@ def _ui_routes(co: Coordinator) -> list[Route]:
         return wrapped
 
     page = resources.files("ferryman").joinpath("ui.html").read_text()
+    # Open tabs compare this with the one they loaded and reload when the
+    # coordinator starts serving a different page (an upgrade).
+    page_id = hashlib.sha256(page.encode()).hexdigest()[:16]
 
     async def index(request: Request) -> Response:
         if user_of(request) is None:
             return PlainTextResponse(f"no {header} header: is the UI behind the auth proxy?",
                                      status_code=403)  # fmt: skip
-        return HTMLResponse(page)
+        return HTMLResponse(page, headers={"Cache-Control": "no-cache"})
 
     async def root(_: Request) -> Response:
         return RedirectResponse("/ui/")
 
     async def state(_: Request, user: str) -> Any:
-        return {"user": user, **co.state()}
+        return {"user": user, "page": page_id, **co.state()}
 
     def _agent_has(agent: str, kind: str, name: str) -> None:
         rep = co.reports.get(agent)
