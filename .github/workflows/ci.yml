@@ -86,6 +86,17 @@ jobs:
             echo "✓ $f is valid YAML"
           done
 
+      - name: Validate Kubernetes manifests
+        run: |
+          kubectl kustomize contrib/k8s > /dev/null
+          uv run python -c "
+          from pathlib import Path
+          from ferryman.config import Config, CoordinatorConfig
+          Config.load(Path('contrib/k8s/agent/config.yaml'))
+          CoordinatorConfig.load(Path('contrib/k8s/coordinator/coordinator.yaml'))
+          "
+          echo "✓ contrib/k8s renders and its configs load"
+
   validate-version:
     name: Validate Version Format
     runs-on: ubuntu-latest

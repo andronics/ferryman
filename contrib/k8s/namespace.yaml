@@ -1,0 +1,9 @@
+# The agent needs a privileged pod (FUSE, bind mounts, mount propagation).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferryman
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

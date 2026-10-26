@@ -1,0 +1,29 @@
+# ferryman on Kubernetes (tested on Talos): the agent as a privileged
+# DaemonSet, and the coordinator that leases keys to it, so no key file is
+# stored on a node. See the wiki's Deployment page (Talos / Kubernetes).
+#
+# Before applying:
+#   1. Edit agent/config.yaml and coordinator/coordinator.yaml.
+#   2. Create the two secrets this doesn't generate (or SOPS-encrypt them
+#      for Flux): one coordinator token per node, and the service-account
+#      keys (<client_email>.json each):
+#        mkdir tokens
+#        for n in $(kubectl get nodes -o name | cut -d/ -f2); do
+#          docker run --rm ghcr.io/andronics/ferryman token
+#          # the token goes in tokens/$n, its sha256 under agents.$n in
+#          # coordinator/coordinator.yaml
+#        done
+#        kubectl create namespace ferryman
+#        kubectl -n ferryman create secret generic ferryman-agent-tokens --from-file=tokens/
+#        kubectl -n ferryman create secret generic ferryman-keys --from-file=keys/
+#   3. kubectl apply -k contrib/k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ferryman
+resources:
+  - namespace.yaml
+  - coordinator
+  - agent
+images:
+  - name: ghcr.io/andronics/ferryman
+    newTag: "0.2.0"

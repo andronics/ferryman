@@ -101,6 +101,8 @@ docker compose --profile coordinator up -d         # plus the coordinator, as PU
 
 Tags: `latest` and `X.Y.Z`/`X.Y` for releases, `edge` for main.
 
+On Kubernetes, [`contrib/k8s`](contrib/k8s) has Kustomize manifests (the agent as a privileged DaemonSet, plus the coordinator), tested on Talos: `kubectl apply -k contrib/k8s`. See [Deployment](https://github.com/andronics/ferryman/wiki/Deployment#talos--kubernetes).
+
 **Continue with the [Quick Start guide](https://github.com/andronics/ferryman/wiki/Quick-Start)** for a first run against a local folder, before any Drive key is involved. Or jump to [Examples](https://github.com/andronics/ferryman/wiki/Examples) for complete configs.
 
 ---

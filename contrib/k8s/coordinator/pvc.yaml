@@ -1,0 +1,13 @@
+# Pool rotation state and granted claims. Small; the default StorageClass.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ferryman-coordinator-state
+  labels:
+    app.kubernetes.io/name: ferryman
+    app.kubernetes.io/component: coordinator
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
