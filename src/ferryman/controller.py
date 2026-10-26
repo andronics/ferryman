@@ -335,11 +335,15 @@ class Controller:
         self._silent &= set(self.cfg.agents)
 
     async def watch_loop(self) -> None:
+        compacted = time.time()
         while True:
             await asyncio.sleep(WATCH_TICK)
             try:
                 self.check_agents()
                 self.check_pools()
+                if time.time() - compacted > 86400:
+                    compacted = time.time()
+                    self.events.compact()  # drop what's past events.retention_days
             except Exception:
                 log.exception("watch failed")
 

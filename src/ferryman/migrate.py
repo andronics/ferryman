@@ -99,8 +99,9 @@ def migrate(hosts: dict[str, dict[str, Any]], coordinator: dict[str, Any] | None
     state = co.get("state")
     if state in (None, "/var/lib/ferryman-coordinator"):
         out["state"] = "/var/lib/ferryman-controller"
-        notes.append("controller state: mv /var/lib/ferryman-coordinator "
-                     "/var/lib/ferryman-controller (pool rotation state and probes)")  # fmt: skip
+        if coordinator is not None:
+            notes.append("controller state: mv /var/lib/ferryman-coordinator "
+                         "/var/lib/ferryman-controller (rotation state, probes)")  # fmt: skip
     else:
         out["state"] = state
 

@@ -88,8 +88,9 @@ def duration(v: object) -> float:
 class SmtpChannel(_Model):
     host: str
     port: int = 587
-    starttls: bool = True  # STARTTLS on a plain connection (587)
-    ssl: bool = False  # TLS from the start (465); not with starttls
+    ssl: bool = False  # TLS from the start (465)
+    # STARTTLS on a plain connection (587). Unset: on, unless ssl.
+    starttls: bool | None = None
     user: str | None = None
     pass_file: Path | None = None  # the password, read at each send
     sender: str = Field(alias="from")
@@ -99,6 +100,8 @@ class SmtpChannel(_Model):
     def _tls(self) -> SmtpChannel:
         if self.ssl and self.starttls:
             raise ValueError("smtp: ssl and starttls are alternatives: set one")
+        if self.starttls is None:
+            object.__setattr__(self, "starttls", not self.ssl)
         if (self.user is None) != (self.pass_file is None):
             raise ValueError("smtp: user and pass_file go together")
         return self

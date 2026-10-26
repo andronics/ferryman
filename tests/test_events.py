@@ -4,6 +4,7 @@ the controller's store, and the events the controller raises itself."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import stat
 import time
@@ -19,6 +20,7 @@ from ferryman.config import AgentBootstrap, Notifications
 from ferryman.controller import Controller, build_app
 from ferryman.events import EventStore, Outbox
 from ferryman.notify import Event
+from ferryman.pool import PoolExhausted
 from tests.test_bootstrap import KEYS, Switch, client, controller_config
 
 
@@ -200,3 +202,24 @@ async def test_a_backlog_through_the_api_is_summed_up(tmp_path: Path) -> None:
     assert r == {"acked": 2}
     assert [i["what"] for i in co.alerts.queues["ops"]] == ["summary"]
     assert co.alerts.problems == {}
+
+
+async def test_an_exhausted_controller_pool_is_raised_once_by_the_controller(
+    tmp_path: Path,
+) -> None:
+    co = Controller(controller_config(tmp_path))
+    (tmp_path / "token").write_text("token-a")
+    boot = AgentBootstrap.model_validate({
+        "controller": {"url": "http://co", "token_file": str(tmp_path / "token")},
+        "paths": {k: str(tmp_path / "agent" / k) for k in ("runtime", "cache", "state", "logs")},
+    })  # fmt: skip
+    transport = httpx.ASGITransport(app=build_app(co))
+    start = await start_config(boot, client(transport))
+    agent = Agent(start.cfg, controller_transport=transport, bootstrap=boot, start=start)
+    await agent.pools["main"].lease()
+    for key in KEYS:
+        with contextlib.suppress(PoolExhausted):
+            await agent.rotate("main", expected=key)
+    assert agent.outbox is not None
+    assert "pool.exhausted" not in [e["kind"] for e in agent.outbox.entries]
+    assert kinds(co) == ["pool.exhausted"]
