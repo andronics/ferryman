@@ -74,6 +74,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest only from the explicit rule below (tag pushes): the
+          # default latest=auto also gave it to dispatched tag builds
+          flavor: |
+            latest=false
           # The sha tag is push-only: on PRs ref_type is still "branch" but
           # {{branch}} is empty, which made an invalid ":-<sha>" tag.
           # A dispatched tag build gets that tag's semver tags only, never
