@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write  # Required for Docker image publishing
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # Validate PEP 440 compatible version format
+          # Supports: v1.2.3, v1.2.3a1, v1.2.3b2, v1.2.3rc1, v1.2.3.post1, v1.2.3.dev0
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(a[0-9]+|b[0-9]+|rc[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$'; then
+            echo "Error: Tag must follow PEP 440 versioning (v1.2.3, v1.2.3rc1, v1.2.3a1, etc.)"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $TAG ($VERSION)"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+
+      - name: Verify version matches tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          TOML_VERSION=$(grep -oP '^version = "\K[^"]+' pyproject.toml)
+          LOCK_VERSION=$(awk '/^name = "ferryman"$/ { getline; print }' uv.lock | grep -oP 'version = "\K[^"]+')
+
+          if [ "$TOML_VERSION" != "$VERSION" ] || [ "$LOCK_VERSION" != "$VERSION" ]; then
+            echo "::error::Version mismatch for tag v$VERSION:"
+            echo "::error::  pyproject.toml has $TOML_VERSION"
+            echo "::error::  uv.lock has $LOCK_VERSION"
+            echo ""
+            echo "The tagged commit must already contain the bumped version files."
+            echo "Never tag manually — use ./scripts/bump-version.sh <major|minor|patch>,"
+            echo "which bumps both files and commits BEFORE creating the tag, then"
+            echo "'git push && git push --tags' to trigger this release."
+            exit 1
+          fi
+
+          echo "✓ Version files match tag v$VERSION"
+
+      - name: Install package
+        run: |
+          uv sync --frozen --no-dev
+          echo "✓ Package installed successfully"
+
+      - name: Test imports
+        run: |
+          uv run --no-sync python -c "from ferryman.config import Config; print('✓ ferryman.config imports successfully')"
+          uv run --no-sync python -c "from ferryman.agent import Agent; print('✓ ferryman.agent imports successfully')"
+          uv run --no-sync python -c "from ferryman.coordinator import Coordinator; print('✓ ferryman.coordinator imports successfully')"
+          uv run --no-sync python -c "from ferryman.cli import main; print('✓ ferryman.cli imports successfully')"
+          echo "✓ All critical imports successful"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | sed -n '2p')
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "First release - no previous tag found"
+            CHANGELOG="## First Release
+
+            This is the initial release of ferryman."
+          else
+            echo "Generating changelog from $PREV_TAG to ${{ steps.version.outputs.tag }}"
+
+            # Generate changelog from commits
+            CHANGELOG="## Changes since $PREV_TAG"$'\n\n'
+
+            # Group commits by type
+            FEATURES=$(git log $PREV_TAG..${{ steps.version.outputs.tag }} --pretty=format:"- %s" --grep="^feat" | head -20)
+            FIXES=$(git log $PREV_TAG..${{ steps.version.outputs.tag }} --pretty=format:"- %s" --grep="^fix" | head -20)
+            REFACTORS=$(git log $PREV_TAG..${{ steps.version.outputs.tag }} --pretty=format:"- %s" --grep="^refactor" | head -20)
+            CHORES=$(git log $PREV_TAG..${{ steps.version.outputs.tag }} --pretty=format:"- %s" --grep="^chore" | head -20)
+
+            if [ -n "$FEATURES" ]; then
+              CHANGELOG="${CHANGELOG}### ✨ New Features"$'\n'"$FEATURES"$'\n\n'
+            fi
+
+            if [ -n "$FIXES" ]; then
+              CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes"$'\n'"$FIXES"$'\n\n'
+            fi
+
+            if [ -n "$REFACTORS" ]; then
+              CHANGELOG="${CHANGELOG}### ♻️ Refactoring"$'\n'"$REFACTORS"$'\n\n'
+            fi
+
+            if [ -n "$CHORES" ]; then
+              CHANGELOG="${CHANGELOG}### 🔧 Maintenance"$'\n'"$CHORES"$'\n\n'
+            fi
+          fi
+
+          # Save to file
+          echo "$CHANGELOG" > release-notes.md
+          cat release-notes.md
+
+      - name: Update CHANGELOG.md
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TODAY=$(date -u +%Y-%m-%d)
+
+          # Re-header the generated notes as a Keep-a-Changelog version entry
+          # instead of "## Changes since $PREV_TAG" (line 2 of release-notes.md
+          # is already the blank separator line, so don't add a second one)
+          {
+            echo "## [$VERSION] - $TODAY"
+            tail -n +2 release-notes.md
+          } > /tmp/new-changelog-entry.md
+
+          # The checkout above is a detached HEAD at the tag -- the changelog
+          # content only depends on git log (already computed), so it's safe
+          # to switch to main now and apply/commit the file update there.
+          git fetch origin main:main
+          git checkout main
+
+          # Splice the new entry in just above the first existing "## [" heading
+          awk -v newfile="/tmp/new-changelog-entry.md" '
+            !inserted && /^## \[/ {
+              while ((getline line < newfile) > 0) print line
+              inserted = 1
+            }
+            { print }
+          ' CHANGELOG.md > /tmp/CHANGELOG.md.new
+          mv /tmp/CHANGELOG.md.new CHANGELOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "CHANGELOG.md already up to date for v$VERSION, skipping commit"
+          else
+            git commit -m "docs: update CHANGELOG.md for v$VERSION [skip ci]"
+            git push origin main
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, 'a') || contains(steps.version.outputs.tag, 'b') || contains(steps.version.outputs.tag, 'rc') }}
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        run: |
+          echo "✅ Release ${{ steps.version.outputs.tag }} created successfully"
+          echo ""
+          echo "🐳 Docker images will be built and published automatically by docker-build.yml workflow"
+          echo "   Image: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}"
+          echo "   Image: ghcr.io/${{ github.repository }}:latest"
+          echo ""
+          echo "📦 Distribution: Docker image, or a venv under systemd (see the wiki's Deployment page)"
