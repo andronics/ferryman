@@ -297,7 +297,7 @@ def test_controller_example_is_valid_and_complete() -> None:
     """contrib/controller.example.yaml loads and mentions every setting of
     the controller's own models, so it cannot fall behind the code."""
     cfg = ControllerConfig.load(EXAMPLE)
-    for section in ("listen", "ui", "rclone", "health", "tuning", "defaults"):
+    for section in ("listen", "ui", "rclone", "events", "health", "tuning", "defaults"):
         value = getattr(cfg, section)
         assert value == type(value)(), f"{section} differs from its defaults"
     raw = yaml.safe_load(EXAMPLE.read_text())

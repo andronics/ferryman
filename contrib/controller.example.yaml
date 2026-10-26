@@ -26,6 +26,11 @@ rclone:                           # runs key probes; needed only with `probe:`
   binary: rclone
   log_level: INFO
 
+# Events from every agent and the controller itself.
+events:
+  retention_days: 30              # how long the controller keeps them
+  silent_after: 120               # seconds without a report before agent.silent
+
 # Every agent's health check.
 health:
   interval: 120                   # seconds between health checks

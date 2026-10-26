@@ -69,6 +69,8 @@ class Notifier:
         # (family, subject) -> when that open problem was last sent
         self._open: dict[tuple[str, str], float] = {}
         self.transport: httpx.AsyncBaseTransport | None = None  # tests
+        # Where every event also goes: an agent's outbox, for the controller.
+        self.sink: Callable[[Event], None] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -77,6 +79,8 @@ class Notifier:
     def emit(self, event: Event) -> None:
         self.history.append(event)
         log.debug("event %s", event.line())
+        if self.sink is not None:
+            self.sink(event)
         if not self.enabled or not self._wanted(event):
             return
         self._queue.append(event)
