@@ -188,6 +188,10 @@ class RuleLimit(_Model):
 Action = Literal["restart", "retry", "run", "tune", "rotate"]
 
 
+# Event families whose subject is a unit: what `restart` restarts by default.
+UNIT_FAMILIES = frozenset({"unit", "warm", "mount", "serve"})
+
+
 class RuleDo(_Model):
     """What a rule does when it fires (phase 2): restart a unit, retry a
     failed transfer, run a transfer, re-tune a host, rotate a pool. Targets
@@ -1238,8 +1242,9 @@ class ControllerConfig(_Model):
             return v if v is not None and "{" not in v else None
 
         err = f"rule {rule.name}: {do.action}"
-        if do.action == "restart" and do.unit is None and family != "unit":
-            raise ValueError(f"{err} needs a unit: match unit.* events or give unit")
+        if do.action == "restart" and do.unit is None and family not in UNIT_FAMILIES:
+            raise ValueError(f"{err} needs a unit: match unit.*, warm.*, mount.* or "
+                             "serve.* events, or give unit")  # fmt: skip
         if do.action == "retry" and family != "transfer":
             raise ValueError(f"{err} retries the failed transfer: match transfer.* events")
         if do.action == "run" and do.transfer is None:

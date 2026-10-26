@@ -353,6 +353,7 @@ def with_rules(*rules: dict[str, Any]) -> dict[str, Any]:
     ("do", "match", "message"),
     [
         ({"action": "restart"}, {"kind": "transfer.failed"}, "restart needs a unit"),
+        ({"action": "restart"}, {"kind": "pool.exhausted"}, "restart needs a unit"),
         ({"action": "retry"}, {"kind": "unit.failed"}, "match transfer"),
         ({"action": "run"}, {}, "run needs a transfer"),
         ({"action": "rotate"}, {"kind": "unit.failed"}, "rotate needs a pool"),
@@ -376,6 +377,7 @@ def test_actions_that_load() -> None:
         {"name": "heal", "match": {"kind": "unit.failed"}, "when": {"count": 3, "within": "15m"},
          "send": ["ops"], "do": {"action": "restart", "delay": "1m"}},
         {"name": "retry", "match": {"kind": "transfer.failed"}, "do": {"action": "retry"}},
+        {"name": "warm", "match": {"kind": "warm.failed"}, "do": {"action": "restart"}},
         {"name": "catch-up", "match": {"kind": "unit.recovered"},
          "do": {"action": "run", "transfer": "tv-up", "agent": "{agent}"}},
         {"name": "quota", "match": {"kind": "transfer.failed"}, "do": {"action": "rotate"}},
