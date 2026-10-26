@@ -37,6 +37,7 @@ rclone does the data path well, but running it as infrastructure leaves a lot to
 - **Live key rotation:** on `User rate limit exceeded.` the pool advances once and every mount switches key with `backend set`, keeping its caches ([docs](https://github.com/andronics/ferryman/wiki/Key-Pools-and-Rotation))
 - **Move, copy and sync transfers:** these run inside the mount's own process. `sync` has safety rails: an empty source is refused, deletions can be capped, and date-folder mirrors are rejected ([docs](https://github.com/andronics/ferryman/wiki/Transfers))
 - **Placeholders:** `{hostname}`, `{env:NAME}`, `{weekday}` and `{now:%Y/%m}` let one config serve every node ([docs](https://github.com/andronics/ferryman/wiki/Placeholders))
+- **Upload tuning:** `ferryman tune` measures what the host's path to Drive sustains and picks the chunk size and parallel transfers from it, applied live; drift alerts and scheduled re-tunes keep it current ([docs](https://github.com/andronics/ferryman/wiki/Upload-Tuning))
 - **Coordinator:** a shared key pool for several hosts. A cap hit on one moves them all, and backup destinations that would overlap are refused ([docs](https://github.com/andronics/ferryman/wiki/Coordinator))
 - **Observability:** Prometheus metrics, mail and webhook alerts, and a web UI with restart, run and rotate buttons ([metrics](https://github.com/andronics/ferryman/wiki/Metrics), [alerts](https://github.com/andronics/ferryman/wiki/Notifications), [UI](https://github.com/andronics/ferryman/wiki/Web-UI))
 
