@@ -11,6 +11,7 @@ from . import __version__
 from .coordinator_pool import CoordinatorPool
 from .pool import LocalPool
 from .rc import RcError
+from .tuning import BACKEND
 from .unit import State
 
 if TYPE_CHECKING:
@@ -33,6 +34,13 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_rclone_transferring": ("gauge", "Files in flight in the process."),
     "ferryman_rclone_bytes": ("gauge", "Bytes moved by the process since start or stats reset."),
     "ferryman_rclone_errors": ("gauge", "Errors in the process since start or stats reset."),
+    "ferryman_tune_running": ("gauge", "1 while a tune runs."),
+    "ferryman_tune_rate_bytes": ("gauge", "Rate the profile's setting reached, bytes/s."),
+    "ferryman_tune_chunk_size_bytes": ("gauge", "The profile's upload chunk size."),
+    "ferryman_tune_transfers": ("gauge", "The profile's transfer count."),
+    "ferryman_tune_noisy": ("gauge", "1 if the profile's repeated probes disagreed."),
+    "ferryman_tune_limit": ("gauge", "What limited the profile's rate (1 for it)."),
+    "ferryman_tune_timestamp_seconds": ("gauge", "When the profile was measured."),
     "ferryman_transfer_running": ("gauge", "1 while the transfer runs."),
     "ferryman_transfer_blocked": ("gauge", "1 if the coordinator refused the transfer's claim."),
     "ferryman_transfer_last_success": ("gauge", "1 if the transfer's last run succeeded."),
@@ -147,6 +155,20 @@ async def agent_metrics(agent: Agent) -> str:
             m.add("ferryman_transfer_runs_total", n, transfer=name, result=result)
         m.add("ferryman_transfer_bytes_total", tr.bytes_total, transfer=name)
         m.add("ferryman_transfer_files_total", tr.files_total, transfer=name)
+
+    tuner = agent.tuner
+    m.add("ferryman_tune_running", int(tuner.running), backend=BACKEND)
+    # profile=latest: the last tune; profile=active: the one in effect.
+    for which, p in (("latest", tuner.profile), ("active", tuner.active)):
+        if p is None:
+            continue
+        labels = {"backend": p.backend, "profile": which}
+        m.add("ferryman_tune_rate_bytes", p.rate, **labels)
+        m.add("ferryman_tune_chunk_size_bytes", p.chunk_size, **labels)
+        m.add("ferryman_tune_transfers", p.transfers, **labels)
+        m.add("ferryman_tune_noisy", int(p.noisy), **labels)
+        m.add("ferryman_tune_limit", 1, limit=p.limit, **labels)
+        m.add("ferryman_tune_timestamp_seconds", p.at, **labels)
 
     for name, pool in agent.pools.items():
         if isinstance(pool, LocalPool):

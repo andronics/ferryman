@@ -6,15 +6,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from ferryman import tuning
 from ferryman.agent import Agent
-from ferryman.config import Tuning, parse_size
+from ferryman.config import Config, Tuning, parse_size
+from ferryman.metrics import agent_metrics
 from ferryman.rc import RcClient
 from ferryman.tuning import Outcome, Probe, Profile, TuneBusy, TuneError, classify, search
+from ferryman.unit import State
 from tests.conftest import FakeRclone
 
 M = 1 << 20
@@ -272,3 +275,117 @@ async def test_failed_run_is_reported(agent: Agent, monkeypatch: pytest.MonkeyPa
     assert not r["ok"] and "exited" in r["error"]
     assert agent.tuner.profile is None
     assert agent.notifier.recent(5)[-1]["kind"] == "tune.failed"
+
+
+# --------------------------------------------------------- phase 2: apply
+
+
+def tune_to(agent: Agent, monkeypatch: pytest.MonkeyPatch, **kw: object) -> None:
+    async def fake_tune(sup: object) -> Profile:
+        return make_profile(chunk_size=16 * M, transfers=6, **kw)
+
+    monkeypatch.setattr(agent.tuner, "_tune", fake_tune)
+
+
+async def test_defaults_until_a_profile_is_applied(
+    agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sup = agent.units["media-tv"]
+    assert "chunk_size = 128M\n" in sup.render_conf()
+    tune_to(agent, monkeypatch)
+    r = await agent.tuner.run()  # tuning.apply defaults to suggest
+    assert r["applied"] == [] and agent.tuner.active is None
+    assert agent.tuner.transfer_settings("media-tv") == {
+        "transfers": 8, "checkers": 8, "source": "default"}  # fmt: skip
+    assert "chunk_size = 128M\n" in sup.render_conf()
+
+
+async def test_apply_switches_units_live_and_transfers_next_run(
+    agent: Agent, fake_rclone: FakeRclone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tune_to(agent, monkeypatch)
+    r = await agent.tuner.run(apply=True)
+    assert r["applied"] == [{"unit": "media-tv", "chunk_size": 16 * M, "live": True,
+                             "was": None}]  # fmt: skip
+    set_call = next(p for e, p in fake_rclone.calls if e == "backend/command")
+    # `set` takes plain bytes; the conf needs the B (a bare number is KiB).
+    assert set_call == {"command": "set", "fs": "media-tv:", "opt": {"chunk_size": str(16 * M)}}
+    conf = agent.layout.rclone_conf("media-tv").read_text()
+    assert f"chunk_size = {16 * M}B\n" in conf
+    assert agent.layout.tune_active("drive").exists()
+    assert agent.tuner.unit_settings("media-tv") == {"chunk_size": 16 * M, "source": "profile"}
+
+    await agent.transfers["media-tv"].run()
+    job = next(p for e, p in fake_rclone.calls if e == "sync/move")
+    assert (job["_config"]["Transfers"], job["_config"]["Checkers"]) == (6, 6)
+
+
+async def test_auto_applies_unless_noisy(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent.cfg = agent.cfg.model_copy(update={"tuning": Tuning(apply="auto")})
+    tune_to(agent, monkeypatch, noisy=True)
+    assert (await agent.tuner.run())["applied"] == []
+    tune_to(agent, monkeypatch)
+    assert len((await agent.tuner.run())["applied"]) == 1
+
+
+async def test_a_suggested_tune_leaves_the_active_profile_in_effect(
+    agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tune_to(agent, monkeypatch)
+    await agent.tuner.run(apply=True)
+
+    async def later(sup: object) -> Profile:
+        return make_profile(at=2.0, chunk_size=64 * M, transfers=12)
+
+    monkeypatch.setattr(agent.tuner, "_tune", later)
+    await agent.tuner.run(apply=False)
+    assert agent.tuner.profile is not None and agent.tuner.profile.transfers == 12
+    assert agent.tuner.transfer_settings("media-tv")["transfers"] == 6
+    assert agent.units["media-tv"].tuned_chunk == 16 * M
+    await agent.tuner.apply()
+    assert agent.tuner.transfer_settings("media-tv")["transfers"] == 12
+    assert agent.units["media-tv"].tuned_chunk == 64 * M
+
+
+async def test_own_settings_win_over_the_profile(
+    make_config: Callable[..., Config], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = Agent(make_config(
+        units={"media-tv": {"mountpoint": "media/tv", "pool": "main", "drive_id": "0A",
+                            "options": {"chunk_size": "256M"}}},
+        transfers={"media-tv": {"unit": "media-tv", "transfers": 3}},
+    ))  # fmt: skip
+    tune_to(agent, monkeypatch)
+    agent.units["media-tv"].state = State.READY
+    agent.units["media-tv"].key_path = Path("/k.json")
+    r = await agent.tuner.run(apply=True)
+    assert r["applied"] == []  # nothing tunable: the unit has its own chunk_size
+    assert agent.tuner.unit_settings("media-tv") == {"chunk_size": "256M", "source": "config"}
+    assert agent.tuner.transfer_settings("media-tv") == {
+        "transfers": 3, "checkers": 6, "source": "config"}  # fmt: skip
+    assert "chunk_size = 256M\n" in agent.units["media-tv"].render_conf()
+
+
+async def test_active_profile_survives_a_restart(
+    agent: Agent, make_config: Callable[..., Config], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tune_to(agent, monkeypatch)
+    await agent.tuner.run(apply=True)
+    again = Agent(agent.cfg)
+    assert again.units["media-tv"].tuned_chunk == 16 * M
+    assert again.tuner.transfer_settings("media-tv")["source"] == "profile"
+
+
+async def test_apply_without_a_profile_is_refused(agent: Agent) -> None:
+    with pytest.raises(TuneError, match="no tuning profile"):
+        await agent.tuner.apply()
+
+
+async def test_tune_metrics(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> None:
+    tune_to(agent, monkeypatch)
+    await agent.tuner.run(apply=True)
+    text = await agent_metrics(agent)
+    assert 'ferryman_tune_chunk_size_bytes{backend="drive",profile="active"} 16777216.0' in text
+    assert 'ferryman_tune_transfers{backend="drive",profile="latest"} 6.0' in text
+    assert 'ferryman_tune_limit{limit="path",backend="drive",profile="active"} 1.0' in text
+    assert 'ferryman_tune_running{backend="drive"} 0.0' in text

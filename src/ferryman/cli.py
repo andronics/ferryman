@@ -351,18 +351,45 @@ def _profile(p: dict[str, Any]) -> None:
                f"{iec(p['bytes_used'])} uploaded")  # fmt: skip
 
 
+def _applied(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        typer.echo("applied: transfers use the profile from their next run (no drive units "
+                   "without their own chunk_size)")  # fmt: skip
+    for r in rows:
+        how = (
+            f"live (was {r['was']})"
+            if r["live"]
+            else f"not live: {r['error']}; restarting"
+            if "error" in r
+            else "from its next start"
+        )
+        typer.echo(f"applied {iec(r['chunk_size'])} chunks to {r['unit']}: {how}")  # fmt: skip
+
+
 @app.command()
 def tune(
     ctx: typer.Context,
     unit: Annotated[str | None, typer.Option(help="Drive unit whose drive and key to use")] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show the probe plan only")] = False,
-    show: Annotated[bool, typer.Option("--show", help="Show the stored profile")] = False,
+    show: Annotated[bool, typer.Option("--show", help="Show the profiles and settings")] = False,
+    apply: Annotated[
+        bool | None,
+        typer.Option("--apply/--suggest", help="Put the result in effect (default: tuning.apply)"),
+    ] = None,
+    use_latest: Annotated[
+        bool, typer.Option("--use-latest", help="Apply the latest profile without probing")
+    ] = False,
     wait: Annotated[bool, typer.Option(help="Wait for the result")] = True,
 ) -> None:
     """Measure Drive upload throughput and pick the chunk size and transfers.
 
     Probes upload random data (counted against the key's daily cap) into a
-    scratch folder on the unit's drive, which is trashed afterwards."""
+    scratch folder on the unit's drive, which is trashed afterwards. Units'
+    and transfers' own chunk_size / transfers settings always win."""
+    if use_latest:
+        r = ctx.obj.request("POST", "/v1/tune/apply")
+        ctx.obj.show(r, lambda d: _applied(d["applied"]))
+        return
     if show:
         st = ctx.obj.request("GET", "/v1/tune")
 
@@ -375,10 +402,26 @@ def tune(
                 _profile(s["profile"])
             elif not s["running"]:
                 typer.echo("no tuning profile yet (run `ferryman tune`)")
+            active, latest = s["active"], s["profile"]
+            if latest and active and active["at"] == latest["at"]:
+                typer.echo("in effect: this profile")
+            elif active:
+                when = time.strftime("%F %T", time.localtime(active["at"]))
+                was = f"{iec(active['chunk_size'])} chunks x {active['transfers']}"
+                typer.echo(f"in effect: the profile from {when} ({was}); `--use-latest` to switch")
+            elif latest:
+                typer.echo("in effect: built-in defaults; `--use-latest` to apply this profile")
+            typer.echo("\nUNIT                     CHUNK     FROM")
+            for name, u in s["units"].items():
+                size = u["chunk_size"] if isinstance(u["chunk_size"], str) else iec(u["chunk_size"])
+                typer.echo(f"{name:24} {size:>6}     {u['source']}")
+            typer.echo("\nTRANSFER                 XFERS  CHECKERS  FROM")
+            for name, t in s["transfers"].items():
+                typer.echo(f"{name:24} {t['transfers']:>5}  {t['checkers']:>8}  {t['source']}")
 
         ctx.obj.show(st, render_status)
         return
-    body = {"unit": unit, "dry_run": dry_run, "wait": wait}
+    body = {"unit": unit, "dry_run": dry_run, "wait": wait, "apply": apply}
     if not dry_run and wait and not ctx.obj.as_json:
         typer.echo("tuning; this takes a few minutes (`ferryman tune --show` for progress)",
                    err=True)  # fmt: skip
@@ -398,6 +441,11 @@ def tune(
             typer.echo("tune started")
         elif r["ok"]:
             _profile(r["profile"])
+            if r["applied"]:
+                typer.echo("")
+                _applied(r["applied"])
+            else:
+                typer.echo("\nnot applied (suggest mode); `ferryman tune --use-latest` applies it")
         else:
             _die(f"tune failed: {r['error']}")
 

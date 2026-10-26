@@ -125,6 +125,9 @@ class Tuning(_Model):
     chunk_sizes: list[str] = Field(default_factory=lambda: ["8M", "16M", "32M", "64M", "128M",
                                                             "256M"])  # fmt: skip
     transfers: list[int] = Field(default_factory=lambda: [1, 2, 4, 8, 12, 16])
+    # suggest: record the profile only. auto: apply it unless it is noisy.
+    # (`ferryman tune --apply` applies one either way.)
+    apply: Literal["suggest", "auto"] = "suggest"
 
     @field_validator("budget", "probe_bytes", "max_memory")
     @classmethod
@@ -221,8 +224,9 @@ class Transfer(_Model):
     # per-run time ones ({now:FORMAT}, {date}, {weekday}).
     dest: str = ""
     schedule: str | None = None  # cron expression; None = run on demand only
-    transfers: int = 8
-    checkers: int = 8
+    # Unset: the applied tuning profile's transfer count, else 8.
+    transfers: int | None = Field(default=None, ge=1)
+    checkers: int | None = Field(default=None, ge=1)
     # rclone filter patterns of source files to leave alone (e.g. "*.tmp").
     exclude: list[str] = Field(default_factory=list)
     # Skip files modified more recently than this ("15m", "2h"): ones still
@@ -369,7 +373,12 @@ class Layout:
         return self.cfg.paths.logs / "tune.log"
 
     def tune_profile(self, backend: str) -> Path:
+        # The latest tune's result.
         return self.cfg.paths.state / "tuning" / f"{backend}.json"
+
+    def tune_active(self, backend: str) -> Path:
+        # The profile in effect: written only when one is applied.
+        return self.cfg.paths.state / "tuning" / f"{backend}.active.json"
 
     def pool_state(self, pool: str) -> Path:
         return self.cfg.paths.state / "pools" / f"{pool}.json"

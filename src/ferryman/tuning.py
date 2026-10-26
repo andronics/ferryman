@@ -50,6 +50,11 @@ SOURCE_BYTES = 1 << 30
 READY_TIMEOUT = 30.0
 STOP_TIMEOUT = 30.0
 PURGE_TIMEOUT = 120.0
+# Without a profile (or with one not applied). Eight transfers: at Drive's
+# per-request latency one stream idled about half the time on the 13 Oct
+# workstation; eight filled its uplink.
+DEFAULT_TRANSFERS = 8
+DEFAULT_CHUNK = "128M"
 # A probe process past 2 x max_memory plus this aborts the tune: chunk
 # buffers are the only thing that should grow with the settings.
 RSS_SLACK = 512 << 20
@@ -287,10 +292,16 @@ class Tuner:
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
         self.lock = asyncio.Lock()
+        # The latest tune, and the profile in effect (an earlier one, when
+        # the latest was only suggested).
         self.profile = Profile.load(agent.layout.tune_profile(BACKEND))
+        self.active = Profile.load(agent.layout.tune_active(BACKEND))
         self.last: dict[str, Any] | None = None
         self.progress: str | None = None
         self.sample_interval = 1.0
+        if self.active:
+            for sup in self._tunable():
+                sup.tuned_chunk = self.active.chunk_size
 
     @property
     def cfg(self) -> Tuning:
@@ -305,8 +316,72 @@ class Tuner:
             "running": self.running,
             "progress": self.progress,
             "profile": asdict(self.profile) if self.profile else None,
+            "active": asdict(self.active) if self.active else None,
             "last": self.last,
+            "units": {s.name: self.unit_settings(s.name) for s in self.agent.units.values()
+                      if s.unit.backend == BACKEND},
+            "transfers": {n: self.transfer_settings(n) for n in self.agent.transfers},
+        }  # fmt: skip
+
+    # ------------------------------------------------------------- settings
+
+    def _tunable(self) -> list[UnitSupervisor]:
+        """Drive units without a chunk_size of their own."""
+        return [s for s in self.agent.units.values()
+                if s.unit.backend == BACKEND and "chunk_size" not in s.unit.options]  # fmt: skip
+
+    def unit_settings(self, unit: str) -> dict[str, Any]:
+        """The unit's upload chunk size and where it comes from."""
+        u = self.agent.cfg.units[unit]
+        if "chunk_size" in u.options:
+            return {"chunk_size": u.options["chunk_size"], "source": "config"}
+        if (p := self.active) and u.backend == BACKEND:
+            return {"chunk_size": p.chunk_size, "source": "profile"}
+        return {"chunk_size": parse_size(DEFAULT_CHUNK), "source": "default"}
+
+    def transfer_settings(self, name: str) -> dict[str, Any]:
+        """Transfers and checkers for a transfer's jobs: its own config, else
+        an applied profile's transfer count (for drive units), else 8."""
+        t = self.agent.cfg.transfers[name]
+        p = self.active if self.agent.cfg.units[t.unit].backend == BACKEND else None
+        fallback, source = (p.transfers, "profile") if p else (DEFAULT_TRANSFERS, "default")
+        return {
+            "transfers": t.transfers or fallback,
+            "checkers": t.checkers or fallback,
+            "source": "config" if t.transfers else source,
         }
+
+    async def apply(self) -> list[dict[str, Any]]:
+        """Put the latest profile into effect: transfers take its count from
+        their next run; drive units without their own chunk_size switch now,
+        in place via `backend set` (as rotation does), and keep it across
+        restarts through their rendered conf."""
+        p = self.profile
+        if p is None:
+            raise TuneError("no tuning profile to apply (run `ferryman tune`)")
+        p.save(self.agent.layout.tune_active(BACKEND))
+        self.active = p
+        out: list[dict[str, Any]] = []
+        for sup in self._tunable():
+            sup.tuned_chunk = p.chunk_size
+            if not sup.ready:
+                out.append({"unit": sup.name, "chunk_size": p.chunk_size, "live": False})
+                continue
+            try:
+                # `set` takes plain bytes: "16M" fails to parse.
+                r = await sup.rc.call("backend/command", command="set", fs=f"{sup.name}:",
+                                      opt={"chunk_size": str(p.chunk_size)})  # fmt: skip
+                sup.write_conf()
+                was = (r.get("result") or {}).get("chunk_size", {}).get("previous")
+                out.append({"unit": sup.name, "chunk_size": p.chunk_size, "live": True,
+                            "was": was})  # fmt: skip
+            except RcError as e:
+                log.error("unit %s: could not set chunk size live (%s); restarting", sup.name, e)
+                self.agent.restart(sup)
+                out.append({"unit": sup.name, "chunk_size": p.chunk_size, "live": False,
+                            "error": str(e)})  # fmt: skip
+        log.info("tune: applied %s", describe(p))
+        return out
 
     def plan(self) -> dict[str, Any]:
         """The probe grid and the most a tune could upload."""
@@ -354,7 +429,11 @@ class Tuner:
             raise TuneBusy(f"{why}; a tune now would share the link with it")
         return sup
 
-    async def run(self, unit: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self, unit: str | None = None, dry_run: bool = False, apply: bool | None = None
+    ) -> dict[str, Any]:
+        """Tune, store the profile and, if `apply` (default: tuning.apply is
+        auto and the tune was not noisy), put it into effect."""
         sup = self.check(unit)
         plan = {"unit": sup.name, "key": sup.key, **self.plan()}
         if dry_run:
@@ -383,7 +462,12 @@ class Tuner:
             summary = describe(profile)
             log.info("tune: %s", summary)
             emit(Event("tune.done", BACKEND, summary, "info", resolves=True))
-            return {"ok": True, "profile": asdict(profile)}
+        if apply is None:
+            apply = self.cfg.apply == "auto" and not profile.noisy
+            if self.cfg.apply == "auto" and profile.noisy:
+                log.warning("tune: not applying a noisy profile; re-run, or apply by hand")
+        applied = await self.apply() if apply else []
+        return {"ok": True, "profile": asdict(profile), "applied": applied}
 
     # ------------------------------------------------------------ internals
 
