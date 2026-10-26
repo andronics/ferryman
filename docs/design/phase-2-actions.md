@@ -1,6 +1,6 @@
 # Phase 2: rules that act
 
-Status: proposal. It builds on phase 1 (docs/design/0.3-controller.md), whose rules can only notify.
+Status: implemented on `next` (PRs #24–#28) with the defaults below: 3 actions per hour per target, once per problem, no actions for late events, failover deferred. Tested on the Talos cluster: a unit failing on purpose was restarted twice, then limited. It builds on phase 1 (docs/design/0.3-controller.md), whose rules could only notify.
 
 ## Why
 
@@ -59,7 +59,7 @@ notify:
 
 | `action` | Does | Target | Carried out by |
 |---|---|---|---|
-| `restart` | Restart a unit | The event's unit on the event's agent, or `unit:` / `agent:` | The agent (`restart` command) |
+| `restart` | Restart a unit | The event's unit (`unit.*`, `warm.*`, `mount.*`, `serve.*` events) on the event's agent, or `unit:` / `agent:` | The agent (`restart` command) |
 | `retry` | Run a failed transfer again | The event's transfer on the event's agent | The agent (`run` command) |
 | `run` | Run a named transfer | `transfer:`, on the event's agent or `agent:` | The agent (`run` command) |
 | `tune` | Re-tune a host's uploads | The event's agent, or `agent:` | The agent (`tune` command) |
@@ -81,7 +81,7 @@ A top-level `actions: {enabled: true}` turns every rule's `do` off at once. The 
 
 ### Checked at load
 
-- The target can be worked out. `restart` needs a unit: from a `unit.*` match, or `unit:` given. `retry` needs a `transfer.*` match. `rotate` needs `pool:`, or a match on `pool.*` or `transfer.*` events (the transfer's unit's pool).
+- The target can be worked out. `restart` needs a unit: from a `unit.*`, `warm.*`, `mount.*` or `serve.*` match, or `unit:` given. `retry` needs a `transfer.*` match. `rotate` needs `pool:`, or a match on `pool.*` or `transfer.*` events (the transfer's unit's pool).
 - A named `agent:`, `unit:`, `transfer:` or `pool:` exists, and the transfer or unit is bound on that agent.
 - `delay`, `limit.within` and `every` are durations.
 
