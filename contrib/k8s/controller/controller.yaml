@@ -18,7 +18,9 @@ ui:
   enabled: false
   user_header: X-authentik-username
 
-# Keys come from the ferryman-keys Secret, one <client_email>.json each.
+# Keys come from the ferryman-keys Secret: sa-01.json for
+# sa-01@my-project.iam.gserviceaccount.com (a Secret can't name a file
+# with an @; <client_email>.json works anywhere else).
 pools:
   uploads:
     keys_dir: /etc/ferryman-keys

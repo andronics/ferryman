@@ -266,9 +266,15 @@ class LocalPool:
     def key_file(self, key: str) -> Path:
         """Path of a key, after checking it parses as a service-account key
         for that client_email (an encrypted or wrong file fails here, before
-        rclone ever sees it)."""
+        rclone ever sees it). The file is <key>.json, or <local part>.json
+        (sa-01.json for sa-01@...): a Kubernetes Secret's file names can't
+        hold an @."""
         assert self.cfg.keys_dir is not None  # a local pool always has one
         path = self.cfg.keys_dir / f"{key}.json"
+        if not path.exists() and "@" in key:
+            short = self.cfg.keys_dir / f"{key.split('@', 1)[0]}.json"
+            if short.exists():
+                path = short
         try:
             data = json.loads(path.read_text())
         except FileNotFoundError:
