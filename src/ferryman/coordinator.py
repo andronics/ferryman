@@ -31,7 +31,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from importlib import resources
 from pathlib import PurePosixPath
 from typing import Any
@@ -48,13 +48,16 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from .config import CoordinatorConfig
+from .config import CoordinatorConfig, parse_size
 from .metrics import CONTENT_TYPE, coordinator_metrics
 from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
+from .probe import probe
 
 log = logging.getLogger(__name__)
 # Longest an uplink's tune lock lasts if its agent never releases it.
 TUNE_LOCK_MAX = 7200.0
+# How often the probe loop looks for exhausted keys due a probe.
+PROBE_TICK = 60.0
 
 
 def token_hash(token: str) -> str:
@@ -159,6 +162,37 @@ class Coordinator:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(cond.wait_for(lambda: pool.epoch != epoch), timeout)
         return self.lease(pool)
+
+    # --------------------------------------------------------------- probes
+
+    async def probe_loop(self) -> None:
+        """Probe each pool's exhausted keys as they fall due, one at a time."""
+        if not any(p.cfg.probe for p in self.pools.values()):
+            return
+        while True:
+            for pool in self.pools.values():
+                for key, marked in pool.probe_due():
+                    try:
+                        await self.probe_key(pool, key, marked)
+                    except Exception:
+                        log.exception("pool %s: probing %s failed", pool.name, key)
+            await asyncio.sleep(PROBE_TICK)
+
+    async def probe_key(self, pool: LocalPool, key: str, marked: float) -> str:
+        cfg = pool.cfg.probe
+        assert cfg is not None
+        r = await probe(self.cfg.rclone.binary, pool.key_file(key), cfg.drive_id,
+                        parse_size(cfg.size), self.cfg.state / "probe",
+                        key.split("@", 1)[0])  # fmt: skip
+        if r.result == "error":
+            log.warning("pool %s: probe of %s inconclusive: %s", pool.name, key, r.message)
+        else:
+            log.info("pool %s: probe of %s: %s", pool.name, key, r.result)
+        if await pool.record_probe(key, marked, r.result, r.message):
+            # The pool had no key and now has one: wake the agents' watches.
+            async with self._changed[pool.name]:
+                self._changed[pool.name].notify_all()
+        return r.result
 
     # ------------------------------------------------------ reports, commands
 
@@ -338,7 +372,18 @@ def build_app(co: Coordinator) -> Starlette:
     async def metrics(_: Request) -> Response:
         return PlainTextResponse(coordinator_metrics(co), media_type=CONTENT_TYPE)
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncIterator[None]:
+        task = asyncio.create_task(co.probe_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     return Starlette(
+        lifespan=lifespan,
         routes=[
             Route("/healthz", healthz),
             Route("/metrics", metrics),
@@ -355,7 +400,7 @@ def build_app(co: Coordinator) -> Starlette:
             Route("/v1/claims", authed(get_claims)),
             Route("/v1/claims", authed(put_claims), methods=["PUT"]),
             *(_ui_routes(co) if co.cfg.ui.enabled else []),
-        ]
+        ],
     )
 
 

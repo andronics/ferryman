@@ -256,19 +256,36 @@ function renderAgent(a) {
   </div>`;
 }
 
+function probeNote(p, k) {
+  const pr = k.probe;
+  if (k.exhausted_until) {
+    if (!p.probe_interval) return "";
+    // A probe from before this cap hit says nothing about it.
+    const marked = k.exhausted_until - p.quota_window;
+    const seen = pr && pr.at >= marked ? pr : null;
+    const next = `next probe ${ago(Math.max(marked, seen ? seen.at : 0) + p.probe_interval)}`;
+    if (!seen) return `<div class="muted">${next}</div>`;
+    const what = seen.result === "capped" ? "still capped" : `inconclusive: ${seen.message}`;
+    return `<div class="${seen.result === "capped" ? "muted" : "err"}">probed ${ago(seen.at)}: ${esc(what)} · ${next}</div>`;
+  }
+  if (pr && pr.result === "ok" && now() - pr.at < p.quota_window) {
+    return `<div class="muted">back early: probe ${ago(pr.at)}</div>`;
+  }
+  return "";
+}
 function renderPool(p, owner) {
   const keys = p.keys.map((k) => `<tr>
       <td>${k.current ? "●" : ""}</td>
       <td class="mono">${esc(k.key)}</td>
       <td>${k.file_ok ? "" : `<span class="err">bad key file</span>`}</td>
-      <td>${k.exhausted_until ? state("failed", `exhausted, frees ${ago(k.exhausted_until)}`) : k.file_ok ? state("ok", "available") : state("failed", "skipped")}</td>
+      <td>${k.exhausted_until ? state("failed", `exhausted, frees ${ago(k.exhausted_until)}`) : k.file_ok ? state("ok", "available") : state("failed", "skipped")}${probeNote(p, k)}</td>
     </tr>`).join("");
   const rotate = owner ? "" : `<button data-act="rotate" data-name="${esc(p.pool)}">Rotate</button>`;
   return `<div class="panel">
     <div class="agent"><div class="head">
       <span class="name mono">${esc(p.pool)}</span>
       <span class="muted">${owner ? `local to ${esc(owner)}` : "shared"} · epoch ${esc(p.epoch)} ·
-        rotated ${ago(p.rotated_at)} · window ${span(p.quota_window)}</span>
+        rotated ${ago(p.rotated_at)} · window ${span(p.quota_window)}${p.probe_interval ? ` · probes every ${span(p.probe_interval)}` : ""}</span>
       <span style="margin-left:auto">${rotate}</span>
     </div></div>
     <div class="scroll"><table>${keys}</table></div>

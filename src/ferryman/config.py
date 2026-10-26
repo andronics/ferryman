@@ -208,6 +208,24 @@ class Tuning(_Model):
         return v
 
 
+class Probe(_Model):
+    """Coordinator pools: test each exhausted key every `interval` with a
+    small upload, and return it to the pool as soon as one succeeds, rather
+    than waiting out the whole quota_window (the cap is reported to roll, so
+    a key can upload again well before then). The quota_window still frees
+    a key whose probes never succeed."""
+
+    drive_id: str  # a shared drive every key in the pool can write to
+    interval: float = Field(default=3600.0, ge=300)
+    size: str = "1K"  # each probe's upload; counts against the key's cap
+
+    @field_validator("size")
+    @classmethod
+    def _size(cls, v: str) -> str:
+        parse_size(v)
+        return v
+
+
 class Pool(_Model):
     # A local pool names its keys by client_email; each is <keys_dir>/<key>.json.
     # A coordinator pool (`coordinator: true`) has neither: the coordinator
@@ -216,6 +234,7 @@ class Pool(_Model):
     keys_dir: Path | None = None
     keys: list[str] = Field(default_factory=list)
     quota_window: int = 86400
+    probe: Probe | None = None  # the coordinator's pools only
 
     @model_validator(mode="after")
     def _shape(self) -> Pool:
@@ -553,6 +572,10 @@ class Config(_Model):
             for name in names:
                 if not _NAME.match(name):
                     raise ValueError(f"invalid {kind} name: {name!r}")
+        for name, pool in self.pools.items():
+            if pool.probe is not None:
+                raise ValueError(f"pool {name}: probe is a coordinator setting (its pools "
+                                 "probe their exhausted keys)")  # fmt: skip
         if self.coordinator is None:
             for name, pool in self.pools.items():
                 if pool.coordinator:
@@ -806,6 +829,7 @@ class Ui(_Model):
 class CoordinatorConfig(_Model):
     listen: Listen = Listen()
     ui: Ui = Ui()
+    rclone: Rclone = Rclone()  # runs key probes (pools with `probe:`)
     state: Path = Path("/var/lib/ferryman-coordinator")
     watch_timeout: float = 30.0
     pools: dict[str, Pool] = Field(default_factory=dict)

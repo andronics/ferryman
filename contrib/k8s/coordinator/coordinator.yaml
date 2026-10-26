@@ -25,6 +25,13 @@ pools:
     keys:
       - sa-01@my-project.iam.gserviceaccount.com
       - sa-02@my-project.iam.gserviceaccount.com
+    # Test each exhausted key hourly with a small upload into this shared
+    # drive, and return it to the pool as soon as one lands, rather than
+    # after the whole quota_window (the cap is reported to roll).
+    # probe:
+    #   drive_id: 0AAAAAAAAAAAAAAAAAA
+    #   interval: 3600
+    #   size: 1K
 
 # One entry per node: the agent on each node uses the token stored under
 # its node's name in the ferryman-agent-tokens Secret. `ferryman token`
