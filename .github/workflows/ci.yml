@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test Python Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          enable-cache: true
+
+      - name: Install package with dependencies
+        run: |
+          uv sync --frozen
+          echo "✓ Package and dependencies installed"
+
+      - name: Validate Python syntax
+        run: |
+          uv run python -m py_compile src/ferryman/*.py
+          echo "✓ All Python files have valid syntax"
+
+      - name: Test module imports
+        run: |
+          for m in src/ferryman/*.py; do
+            mod="ferryman.$(basename "$m" .py)"
+            [ "$mod" = "ferryman.__init__" ] && mod=ferryman
+            uv run python -c "import $mod; print('✓ $mod')"
+          done
+          echo "✓ All modules import successfully"
+
+      # Integration tests skip themselves here: no rclone or FUSE
+      - name: Run tests
+        run: |
+          uv run pytest tests/ -v
+          echo "✓ All tests passed"
+
+      - name: Lint with ruff
+        run: |
+          uv run ruff check src/ tests/
+
+      - name: Check code formatting
+        run: |
+          uv run ruff format --check src/ tests/
+
+      - name: Type check with mypy
+        run: |
+          uv run mypy --strict
+
+      - name: Verify version
+        run: |
+          uv run python -c "from ferryman import __version__; print(f'Version: {__version__}')"
+          echo "✓ Version is readable"
+
+      - name: Check for common issues
+        run: |
+          # Check for print statements (should use logger or typer.echo)
+          if grep -r "print(" src/ --include="*.py" | grep -v "# print OK" | grep -v "__pycache__"; then
+            echo "Warning: Found print() statements. Consider using logger instead."
+          fi
+
+          # Check for hardcoded credentials
+          if grep -rE "(password|token|secret|key)\s*=\s*['\"][^'\"]{8,}" src/ --include="*.py"; then
+            echo "Warning: Potential hardcoded credentials found!"
+            exit 1
+          fi
+
+          echo "✓ No common issues found"
+
+      - name: Validate configuration examples
+        run: |
+          for f in contrib/*.yaml; do
+            [ -e "$f" ] || continue
+            uv run python -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$f"
+            echo "✓ $f is valid YAML"
+          done
+
+  validate-version:
+    name: Validate Version Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check version format
+        run: |
+          VERSION=$(grep -oP '^version = "\K[^"]+' pyproject.toml)
+          echo "Current version: $VERSION"
+
+          # Validate PEP 440 format (the release workflow's tag format)
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(a[0-9]+|b[0-9]+|rc[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$'; then
+            echo "Error: Version must follow PEP 440 (1.2.3, 1.2.3rc1, 1.2.3a1, ...)"
+            exit 1
+          fi
+
+          # uv.lock records the project's version too
+          LOCK_VERSION=$(awk '/^name = "ferryman"$/ { getline; print }' uv.lock | grep -oP 'version = "\K[^"]+')
+          if [ "$LOCK_VERSION" != "$VERSION" ]; then
+            echo "Error: uv.lock has $LOCK_VERSION, pyproject.toml $VERSION (run uv lock)"
+            exit 1
+          fi
+
+          echo "✓ Version format is valid"

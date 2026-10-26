@@ -1,0 +1,109 @@
+# ferryman - agent (and optionally the coordinator) under Docker
+#
+#   docker compose up -d                          # the agent
+#   docker compose --profile coordinator up -d    # plus the coordinator
+#   docker exec ferryman ferryman status          # the CLI, inside the container
+#
+# The agent needs what it needs under systemd: root, /dev/fuse, and the
+# right to mount. Mounts it makes inside the container reach the host only
+# through a shared (rshared) bind of their parent directory, so give each
+# mount path's parent below, at the same path inside as outside: the
+# config's paths are then valid on both sides.
+
+services:
+  ferryman:
+    image: ghcr.io/andronics/ferryman:latest
+    container_name: ferryman
+    restart: unless-stopped
+    command: ["agent"]
+
+    # FUSE mounts and the kernel bind mounts behind read-only mounts. At its
+    # narrowest this is `cap_add: [SYS_ADMIN]`, `devices: [/dev/fuse]` and
+    # `security_opt: [apparmor:unconfined]`, which covers FUSE; read-only
+    # binds may need privileged on hosts with a strict seccomp/AppArmor policy.
+    privileged: true
+
+    # Servers (WebDAV, FTP passive ranges, ...) and api.listen bind on the
+    # host directly; an FTP server's whole passive_port range must be reachable.
+    network_mode: host
+
+    # Reap rclone's helpers (fusermount3, mount) as PID 1 would.
+    init: true
+
+    # Units unmount in parallel; a busy mount is detached lazily.
+    stop_grace_period: 90s
+
+    volumes:
+      # config.yaml, keys, secrets (read-only)
+      - /etc/ferryman:/etc/ferryman:ro
+
+      # paths.state, paths.cache, paths.logs
+      - /var/lib/ferryman:/var/lib/ferryman
+      - /var/cache/ferryman:/var/cache/ferryman
+      - /var/log/ferryman:/var/log/ferryman
+
+      # Mount paths' parent: rshared, so the FUSE mounts show on the host
+      # (the host side must be a shared mount: it is under systemd).
+      - type: bind
+        source: /pool/google
+        target: /pool/google
+        bind:
+          propagation: rshared
+
+      # Transfer sources (staging dirs, backups), at the same paths.
+      # - /pool/ceph/staging:/pool/ceph/staging
+      # - /var/lib/vz/dump:/var/lib/vz/dump:ro
+
+    # paths.runtime: sockets, rendered rclone.conf, leased keys. Memory only.
+    tmpfs:
+      - /run/ferryman:mode=0700
+
+    environment:
+      # What {hostname} expands to: the host, not the container's id
+      FERRYMAN_HOSTNAME: "pve-01"   # Change this!
+
+      # Cron schedules and time placeholders use local time
+      TZ: "Europe/London"
+
+    # Health check: the agent answers on its API socket
+    healthcheck:
+      test: ["CMD", "ferryman", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Optional: the coordinator. Shares key pools between hosts and serves the
+  # web UI. Runs as PUID:PGID, not root. Its config must listen on 0.0.0.0
+  # (listen: {host: 0.0.0.0, port: 8470}) to be reachable through the port
+  # below; put Traefik in front for TLS.
+  coordinator:
+    image: ghcr.io/andronics/ferryman:latest
+    container_name: ferryman-coordinator
+    restart: unless-stopped
+    profiles: ["coordinator"]
+    command: ["coordinator"]
+
+    ports:
+      - "127.0.0.1:8470:8470"   # coordinator HTTP (UI, agent API)
+
+    volumes:
+      # coordinator.yaml and the pool keys (readable by PUID:PGID)
+      - /etc/ferryman:/etc/ferryman:ro
+      # The config's default `state:`; given to PUID:PGID at start
+      - ./coordinator-state:/var/lib/ferryman-coordinator
+
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "Europe/London"
+      # If coordinator.yaml sets another `state:`, name it here too so its
+      # ownership is fixed at start:
+      # FERRYMAN_COORDINATOR_STATE: /var/lib/ferryman-coordinator
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8470/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

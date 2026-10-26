@@ -1,0 +1,106 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - 'dev/**'
+      - 'feat/**'
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Build an image for an existing release tag (e.g. v0.1.0), using this
+          branch's Dockerfile. Empty: build the selected branch as usual.
+        required: false
+        type: string
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # A tag cut before the image existed (v0.1.0) has no Dockerfile: take
+      # the Docker files from the commit this workflow runs from
+      - name: Overlay Docker files from ${{ github.ref_name }}
+        if: inputs.tag != ''
+        run: |
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- Dockerfile .dockerignore docker/
+          echo "✓ Building ${{ inputs.tag }} with the Docker files of $GITHUB_SHA"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # The sha tag is push-only: on PRs ref_type is still "branch" but
+          # {{branch}} is empty, which made an invalid ":-<sha>" tag.
+          # A dispatched tag build gets that tag's semver tags only, never
+          # latest/edge: an older release mustn't take them over.
+          tags: |
+            type=ref,event=branch,enable=${{ inputs.tag == '' }}
+            type=ref,event=pr
+            type=semver,pattern={{version}},enable=${{ inputs.tag == '' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ inputs.tag == '' }}
+            type=semver,pattern={{major}},enable=${{ inputs.tag == '' }}
+            type=semver,pattern={{version}},value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=sha,prefix={{branch}}-,enable=${{ github.ref_type == 'branch' && github.event_name != 'pull_request' && inputs.tag == '' }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=edge,enable=${{ github.ref_name == 'main' && inputs.tag == '' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: echo ${{ steps.build.outputs.digest }}
