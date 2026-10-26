@@ -340,6 +340,7 @@ def test_serve_shapes(make_config: Callable[..., Config], tmp_path: Path) -> Non
         ({"type": "http", "addr": "127.0.0.1:1", "cert": "/c"}, "cert and key go together"),
         ({"type": "sftp", "addr": "127.0.0.1:1", "cert": "/c", "key": "/k"}, "cert/key are for"),
         ({"type": "ftp", "addr": "127.0.0.1:1"}, "passive_port must be a range"),
+        ({"type": "http", "addr": "127.0.0.1:1", "host_key": "/k"}, "host_key is for sftp only"),
         ({"type": "http", "addr": "127.0.0.1:1", "passive_port": "3-4"}, "for ftp only"),
         ({"type": "nfs", "addr": "127.0.0.1:1", "user": "u", "pass_file": "/p"},
          "no authentication for nfs"),
@@ -372,6 +373,9 @@ def test_serve_ports_may_not_overlap(make_config: Callable[..., Config]) -> None
         two(ftp, {**ftp, "addr": "127.0.0.1:2122", "passive_port": "30050-30149"})
     with pytest.raises(ValidationError, match="overlaps"):
         two(ftp, {"type": "http", "addr": "127.0.0.1:30001"})
+    with pytest.raises(ValidationError, match=r"overlaps api\.listen"):
+        make_config(api={"listen": {"port": 8081}}, units={"a": {"pool": "main", "serve": [http]}},
+                    transfers={})  # fmt: skip
 
 
 def test_nfs_needs_a_writing_cache(make_config: Callable[..., Config]) -> None:
@@ -403,14 +407,14 @@ def test_serve_params(make_config: Callable[..., Config], tmp_path: Path) -> Non
     cfg = serving(
         make_config,
         {"type": "s3", "addr": "127.0.0.1:9000", "user": "AKID", "pass_file": str(secret)},
-        {"type": "sftp", "addr": "127.0.0.1:2022"},
+        {"type": "sftp", "addr": "127.0.0.1:2022", "host_key": "/etc/ssh/k"},
         {"type": "ftp", "addr": "127.0.0.1:2121", "passive_port": "30000-30009",
          "user": "u", "pass_file": str(secret), "options": {"public_ip": "10.0.0.5"}},
     )  # fmt: skip
     sup = UnitSupervisor("tv", cfg, Layout(cfg), None)
     s3, sftp, ftp = (sup._serve_params(sv) for sv in cfg.units["tv"].serve)
     assert s3["auth_key"] == ["AKID,s3cret"] and "pass" not in s3
-    assert sftp["no_auth"] is True
+    assert sftp["no_auth"] is True and sftp["key"] == ["/etc/ssh/k"]
     assert ftp == {
         "type": "ftp",
         "fs": "tv:",
