@@ -109,7 +109,7 @@ defaults:
 
 pools:
   uploads:
-    keys_dir: /etc/ferryman/keys  # one <client_email>.json per key
+    keys_dir: /etc/ferryman/keys  # one <client_email>.json (or <local part>.json) per key
     keys:
       - sa-01@my-project.iam.gserviceaccount.com
       - sa-02@my-project.iam.gserviceaccount.com
