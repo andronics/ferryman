@@ -257,3 +257,16 @@ def test_render_one_and_many() -> None:
     title, body = render(many)
     assert title == "[ferryman] 1 problem(s), 1 recovered"
     assert body.count("\n") == 2 and time.strftime("%F", time.localtime(NOW)) in body
+
+
+def test_smtp_on_465_needs_only_ssl() -> None:
+    ch = Notifications.model_validate({"channels": {"m": {"smtp": {
+        "host": "smtp.x", "port": 465, "ssl": True, "from": "f@x", "to": ["t@x"]}}}})  # fmt: skip
+    smtp = ch.channels["m"].smtp
+    assert smtp is not None and smtp.ssl and smtp.starttls is False
+    plain = Notifications.model_validate({"channels": {"m": {"smtp": {
+        "host": "smtp.x", "from": "f@x", "to": ["t@x"]}}}})  # fmt: skip
+    assert plain.channels["m"].smtp is not None and plain.channels["m"].smtp.starttls is True
+    with pytest.raises(ValidationError, match="alternatives"):
+        both = {"host": "x", "ssl": True, "starttls": True, "from": "f@x", "to": ["t@x"]}
+        Notifications.model_validate({"channels": {"m": {"smtp": both}}})

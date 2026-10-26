@@ -196,7 +196,10 @@ class Agent:
         try:
             lease = await pool.exhausted(expected)
         except PoolExhausted as e:
-            self.notifier.emit(Event("pool.exhausted", pool_name, str(e), "error"))
+            # A controller pool's exhaustion (and its recovery) is the
+            # controller's to raise, once for every agent.
+            if not isinstance(pool, ControllerPool):
+                self.notifier.emit(Event("pool.exhausted", pool_name, str(e), "error"))
             raise
         if lease.epoch != before:
             why = f"cap hit on {expected}" if expected else "rotated by hand"
@@ -417,11 +420,19 @@ class Agent:
 
     async def _report_loop(self) -> None:
         assert self.controller is not None and self.cfg.controller is not None
+        failing = False
         while True:
             try:
                 await self.controller.request("PUT", "/v2/report", json=await self.report())
+                if failing:
+                    failing = False
+                    log.info("controller: reporting again")
             except PoolError as e:
-                log.debug("report: %s", e)  # the watch already complains loudly
+                # Once per outage: a host with no pools has no watch to
+                # complain, and a refused token must not go unnoticed.
+                if not failing:
+                    failing = True
+                    log.warning("controller: can't report (%s); events wait in the outbox", e)
             await asyncio.sleep(self.cfg.controller.report_interval)
 
     async def _command_loop(self) -> None:

@@ -44,7 +44,7 @@ notify:
   #     smtp:                     # the controller usually runs without sendmail
   #       host: smtp.example.org
   #       port: 587
-  #       starttls: true          # or ssl: true (465)
+  #       starttls: true          # the default on 587; for 465 set ssl: true instead
   #       user: ferryman
   #       pass_file: /etc/ferryman/smtp.pass
   #       from: ferryman@example.org

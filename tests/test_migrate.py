@@ -72,6 +72,7 @@ def test_the_02_example_runs_as_it_did() -> None:
         token.encode()).hexdigest()  # fmt: skip
     assert r.agents["pve-01"]["controller"]["url"] == "https://ferryman.example.org"
     assert any("copy its key files" in n for n in r.notes)
+    assert not any("ferryman-coordinator" in n for n in r.notes)  # there was none
 
 
 def test_one_unit_on_two_hosts_is_one_unit_and_two_bindings() -> None:
