@@ -187,6 +187,15 @@ def status(ctx: typer.Context) -> None:
                 f"{u['unit']:24} {u['state']:9} {_ago(u['since']):>12} {u['restarts']:>8}  "
                 f"{_warm(u.get('warm')):28}  {(u['last_error'] or '')[:60]}"
             )
+        # Read settings only where they differ from ferryman's built-ins.
+        tuned = [(u["unit"], {k: v for k, v in (u.get("read") or {}).items()
+                              if v["source"] != "built-in"}) for u in d["units"]]  # fmt: skip
+        if any(r for _, r in tuned):
+            typer.echo(f"\n{'UNIT':24} READ SETTINGS (not built-in)")
+            for name, r in tuned:
+                if r:
+                    typer.echo(f"{name:24} " + ", ".join(
+                        f"{k}={v['value']} ({v['source']})" for k, v in r.items()))  # fmt: skip
         if d["transfers"]:
             typer.echo(f"\n{'TRANSFER':24} {'MODE':5} {'STATE':8} {'NEXT':>12}  LAST RUN")
             for t in d["transfers"]:

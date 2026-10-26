@@ -131,3 +131,67 @@ def test_example_config_is_valid_and_complete() -> None:
     for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
         shown = set().union(*(set(v) for v in raw[key].values()))
         assert shown == names(model), f"{key}: missing {names(model) - shown}"
+
+
+# ---------------------------------------------------------- read settings
+
+
+def test_read_settings_built_in_defaults_and_unit(make_config: Callable[..., Config]) -> None:
+    from ferryman.config import read_settings
+
+    cfg = make_config(
+        defaults={"buffer_size": "8M", "vfs_cache_mode": "full"},  # full restates the built-in
+        units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+                            "buffer_size": "0", "vfs_read_chunk_size": "4M"}},
+    )  # fmt: skip
+    assert read_settings(cfg, "media-tv") == {
+        "buffer_size": {"value": "0", "source": "unit"},
+        "vfs_cache_mode": {"value": "full", "source": "built-in"},
+        "vfs_read_chunk_size": {"value": "4M", "source": "unit"},
+        "vfs_read_ahead": {"value": "0", "source": "built-in"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"defaults": {"buffer_size": "16777216"}}, "needs a unit suffix"),
+        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_read_chunk_size": "4096"}}},
+         "needs a unit suffix"),
+        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "most"}}},
+         "vfs_cache_mode"),
+        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "writes",
+                          "vfs_read_ahead": "64M"}}}, "only applies with vfs_cache_mode: full"),
+        ({"defaults": {"vfs_read_ahead": "64M"},
+          "units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "minimal"}}},
+         "only applies with vfs_cache_mode: full"),
+        ({"units": {"m": {"mountpoint": "m", "pool": "main", "mount": False,
+                          "buffer_size": "0"}}}, "only apply to mounts"),
+    ],
+)  # fmt: skip
+def test_read_settings_are_validated(
+    make_config: Callable[..., Config], override: dict[str, object], error: str
+) -> None:
+    with pytest.raises(ValidationError, match=error):
+        make_config(**override)
+
+
+def test_mount_argv_carries_read_settings(make_config: Callable[..., Config]) -> None:
+    from ferryman.unit import UnitSupervisor
+
+    cfg = make_config(
+        units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+                            "buffer_size": "0", "vfs_read_chunk_size": "4M",
+                            "mount_args": ["--buffer-size=1M"]}},
+    )  # fmt: skip
+    argv = UnitSupervisor("media-tv", cfg, Layout(cfg), None).argv()
+
+    def flag(name: str) -> str:
+        return argv[argv.index(name) + 1]
+
+    assert flag("--buffer-size") == "0"
+    assert flag("--vfs-cache-mode") == "full"
+    assert flag("--vfs-read-chunk-size") == "4M"
+    assert flag("--vfs-read-ahead") == "0"
+    # mount_args still come last, so they still win.
+    assert argv[-1] == "--buffer-size=1M"

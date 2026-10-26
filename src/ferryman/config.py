@@ -85,15 +85,45 @@ class Health(_Model):
     stat_timeout: float = 10.0
 
 
+# rclone reads a bare number as KiB ("8388608" is 8G), so read sizes need a
+# suffix; only 0 is unambiguous without one.
+_RCLONE_SIZE = re.compile(r"^(0|\d+(\.\d+)?[KMGTP]i?B?)$", re.IGNORECASE)
+CacheMode = Literal["off", "minimal", "writes", "full"]
+# Mount read settings, in defaults and per unit; see read_settings().
+READ_SETTINGS = ("buffer_size", "vfs_cache_mode", "vfs_read_chunk_size", "vfs_read_ahead")
+
+
+def _rclone_size(v: str | None) -> str | None:
+    if v is not None and not _RCLONE_SIZE.match(v):
+        raise ValueError(f"size {v!r} needs a unit suffix (16M, 1G); a bare number is KiB "
+                         "to rclone")  # fmt: skip
+    return v
+
+
 class UnitDefaults(_Model):
     uid: int | None = None
     gid: int | None = None
     cache_max_size: str = "10G"
     cache_min_free_space: str = "100G"
     warm: bool = True
+    # How a mount reads. Small on purpose: library scanners open every file
+    # just to probe its header, and each open fetches the read-ahead window
+    # into the VFS cache; at 256M buffer + 256M read-ahead that churned ~600G
+    # through a 64G cache in under three days. A unit of many small random
+    # reads may want less still (buffer_size: 0, a smaller chunk).
+    buffer_size: str = "16M"  # in-memory read-ahead per open file
+    vfs_cache_mode: CacheMode = "full"
+    vfs_read_chunk_size: str = "128M"  # size of each ranged read from the remote
+    vfs_read_ahead: str = "0"  # extra on-disk read-ahead; full cache mode only
     # Mode for directories ferryman creates under roots.remote (mountpoints
     # and their missing parents), owned by the unit's uid/gid.
     dir_mode: int = 0o775
+
+    @field_validator("buffer_size", "vfs_read_chunk_size", "vfs_read_ahead")
+    @classmethod
+    def _sizes(cls, v: str) -> str:
+        _rclone_size(v)
+        return v
 
 
 _SIZE = re.compile(r"^(\d+)([KMGT]?)$")
@@ -211,7 +241,20 @@ class Unit(_Model):
     gid: int | None = None
     cache_max_size: str | None = None
     warm: bool | None = None
+    # Read settings for this mount; unset takes `defaults`.
+    buffer_size: str | None = None
+    vfs_cache_mode: CacheMode | None = None
+    vfs_read_chunk_size: str | None = None
+    vfs_read_ahead: str | None = None
+    # Appended last, so a flag here overrides one ferryman sets (rclone takes
+    # the last value of a repeated flag). Prefer the settings above: they are
+    # validated and show in status.
     mount_args: list[str] = Field(default_factory=list)
+
+    @field_validator("buffer_size", "vfs_read_chunk_size", "vfs_read_ahead")
+    @classmethod
+    def _sizes(cls, v: str | None) -> str | None:
+        return _rclone_size(v)
 
     @field_validator("mountpoint")
     @classmethod
@@ -329,6 +372,15 @@ class Config(_Model):
                         f"{unit.mountpoint!r}"
                     )
                 seen[unit.mountpoint] = name
+        for name, unit in self.units.items():
+            set_here = [k for k in READ_SETTINGS if getattr(unit, k) is not None]
+            if not unit.mount and set_here:
+                raise ValueError(f"unit {name}: {', '.join(set_here)} only apply to mounts")
+            r = read_settings(self, name)
+            if unit.mount and r["vfs_read_ahead"]["value"] != "0" and \
+                    r["vfs_cache_mode"]["value"] != "full":  # fmt: skip
+                raise ValueError(f"unit {name}: vfs_read_ahead only applies with "
+                                 "vfs_cache_mode: full")  # fmt: skip
         for name, t in self.transfers.items():
             if t.unit not in self.units:
                 raise ValueError(f"transfer {name}: unknown unit {t.unit!r}")
@@ -436,6 +488,22 @@ class Layout:
     @property
     def claims_file(self) -> Path:
         return self.cfg.paths.state / "claims.json"
+
+
+def read_settings(cfg: Config, unit: str) -> dict[str, dict[str, str]]:
+    """Each mount read setting's value and where it comes from: the unit,
+    the config's `defaults`, or ferryman's built-in default."""
+    u, d = cfg.units[unit], cfg.defaults
+    out = {}
+    for k in READ_SETTINGS:
+        if (v := getattr(u, k)) is not None:
+            out[k] = {"value": v, "source": "unit"}
+        else:
+            # A defaults entry that restates the built-in value changes nothing.
+            built_in = type(d).model_fields[k].default
+            src = "defaults" if getattr(d, k) != built_in else "built-in"
+            out[k] = {"value": getattr(d, k), "source": src}
+    return out
 
 
 def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]:

@@ -65,6 +65,13 @@ defaults:
   cache_min_free_space: 100G      # --vfs-cache-min-free-space, guards the shared cache disk
   warm: true                      # walk the dir cache after each start
   dir_mode: 0775                  # mode of mount dirs ferryman creates (YAML octal)
+  # How mounts read (sizes need a suffix: a bare number is KiB to rclone).
+  # Small on purpose: scanners open every file to probe it, and each open
+  # pulls the read-ahead window into the cache.
+  buffer_size: 16M                # in-memory read-ahead per open file
+  vfs_cache_mode: full            # off | minimal | writes | full
+  vfs_read_chunk_size: 128M       # size of each ranged read from Drive
+  vfs_read_ahead: "0"             # extra on-disk read-ahead (full mode only)
 
 # Upload tuning: `ferryman tune` measures this host's path to Drive and picks
 # the chunk size and transfer count. Probe bytes count against the daily cap.
@@ -125,6 +132,14 @@ units:
     pool: uploads
     warm: false                   # skip the dir-cache walk after start
     mount_args: [--read-only]     # extra flags, appended to `rclone mount`
+  media-music:                    # many small random reads: fetch less per open
+    drive_id: 0ADDDDDDDDDDDDDDDDD
+    mountpoint: media/music
+    pool: uploads
+    buffer_size: "0"              # no in-memory read-ahead
+    vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
+    vfs_cache_mode: full          # keep cached re-reads (writes would stop caching reads)
+    vfs_read_ahead: "0"           # status shows each value's source: unit, defaults or built-in
   backups:                        # transfer-only: no FUSE mount, just `rclone rcd`
     drive_id: 0ACCCCCCCCCCCCCCCCC
     mountpoint: backups           # still required: names the default transfer source
