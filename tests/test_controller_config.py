@@ -18,7 +18,11 @@ from ferryman.config import (
     ControllerConfig,
     ControllerRef,
     HostDefaults,
+    Layout,
+    Mount,
     Probe,
+    Serve,
+    Transfer,
     UnitSpec,
     effective_config,
     read_settings,
@@ -312,4 +316,15 @@ def test_controller_example_is_valid_and_complete() -> None:
     )
     assert shown(b for a in raw["agents"].values() for b in a["units"].values()) == names(Binding)
     assert shown(p["probe"] for p in raw["pools"].values() if "probe" in p) == names(Probe)
+    bindings = [b for a in raw["agents"].values() for b in a["units"].values()]
+    assert shown(m for b in bindings for m in b.get("mounts") or []) == names(Mount)
+    assert shown(sv for b in bindings for sv in b.get("serve") or []) == names(Serve)
+    transfers = [t for a in raw["agents"].values() for t in (a.get("transfers") or {}).values()]
+    assert shown(transfers) == names(Transfer)
+    # As each agent would build and check it, short of files on this machine
+    # (the example's secrets and certs).
+    for agent in cfg.agents:
+        flat = effective_config(BOOT, cfg.slice(agent))
+        problems = Layout(flat).check_paths()
+        assert [p for p in problems if not p.endswith("does not exist")] == [], agent
     assert cfg.agent_pools("emby-01") == ["uploads"]

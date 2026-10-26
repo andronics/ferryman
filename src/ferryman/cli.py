@@ -1,5 +1,6 @@
 """`ferryman agent` runs the daemon; every other command talks to it over its
-unix socket (except `verify`, which checks the config offline)."""
+unix socket (except `verify`, which checks this host's config and the
+controller's slice for it)."""
 
 from __future__ import annotations
 
@@ -17,13 +18,12 @@ from typing import Annotated, Any, NoReturn
 import httpx
 import typer
 
-from .config import Config, Layout
-from .pool import LocalPool, PoolError
+from .config import AgentBootstrap, Config, Layout
 from .transfer import describe, iec
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 
-DEFAULT_CONFIG = Path(os.environ.get("FERRYMAN_CONFIG", "/etc/ferryman/config.yaml"))
+DEFAULT_CONFIG = Path(os.environ.get("FERRYMAN_CONFIG", "/etc/ferryman/agent.yaml"))
 DEFAULT_CONTROLLER_CONFIG = Path(
     os.environ.get("FERRYMAN_CONTROLLER_CONFIG", "/etc/ferryman/controller.yaml")
 )
@@ -33,9 +33,9 @@ class _Ctx:
     def __init__(self, config: Path, socket: Path | None, as_json: bool) -> None:
         self.config_path, self._socket, self.as_json = config, socket, as_json
 
-    def config(self) -> Config:
+    def bootstrap(self) -> AgentBootstrap:
         try:
-            return Config.load(self.config_path)
+            return AgentBootstrap.load(self.config_path)
         except FileNotFoundError:
             _die(f"config not found: {self.config_path}")
         except ValueError as e:
@@ -47,7 +47,8 @@ class _Ctx:
             return self._socket
         if env := os.environ.get("FERRYMAN_SOCKET"):
             return Path(env)
-        return Layout(self.config()).api_socket
+        b = self.bootstrap()
+        return Layout(Config(paths=b.paths, api=b.api)).api_socket
 
     def request(self, method: str, path: str, **kw: Any) -> Any:
         transport = httpx.HTTPTransport(uds=str(self.socket))
@@ -109,12 +110,12 @@ def agent(
     ctx: typer.Context,
     log_level: Annotated[str, typer.Option(help="Python log level")] = "INFO",
 ) -> None:
-    """Run the daemon."""
+    """Run the daemon: its config comes from the controller."""
     from .agent import Agent
+    from .bootstrap import Rejected, start_config
+    from .controller_pool import ControllerClient
 
-    cfg = ctx.obj.config()
-    if problems := Layout(cfg).check_paths():
-        _die("\n".join(problems))
+    b = ctx.obj.bootstrap()
     logging.basicConfig(
         level=log_level.upper(),
         stream=sys.stderr,
@@ -127,50 +128,69 @@ def agent(
     # agent's own at DEBUG.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    asyncio.run(Agent(cfg).run())
+
+    async def main() -> None:
+        client = ControllerClient.from_token_file(b.controller.url, b.controller.token_file)
+        try:
+            start = await start_config(b, client)
+        finally:
+            await client.aclose()
+        await Agent(start.cfg, bootstrap=b, start=start).run()
+
+    try:
+        asyncio.run(main())
+    except Rejected as e:
+        _die(f"the controller's config for this host can't run here, and there is no "
+             f"previous one to fall back on:\n{e}")  # fmt: skip
 
 
 @app.command()
 def verify(ctx: typer.Context) -> None:
-    """Check the config, every pool's key files and the rclone binary (offline)."""
-    cfg = ctx.obj.config()
-    layout, failed = Layout(cfg), 0
-    rclone = shutil.which(cfg.rclone.binary)
+    """Check this host's config, the rclone binary, the controller, and the
+    controller's config for this host (as the agent would check it)."""
+    from .bootstrap import Rejected, build, fetch, load_cached, slice_file
+    from .controller_pool import ControllerClient, ControllerError
+
+    b, failed = ctx.obj.bootstrap(), 0
+    rclone = shutil.which(b.rclone.binary)
     if rclone:
         out = subprocess.run([rclone, "version"], capture_output=True, text=True, check=False)
         typer.echo(f"[PASS] rclone: {out.stdout.splitlines()[0] if out.stdout else rclone}")
     else:
-        typer.echo(f"[FAIL] rclone: {cfg.rclone.binary} not found")
+        typer.echo(f"[FAIL] rclone: {b.rclone.binary} not found")
         failed += 1
-    if cfg.controller:
-        tf = cfg.controller.token_file
-        ok = os.access(tf, os.R_OK) and bool(tf.read_text().strip())
-        typer.echo(f"[{'PASS' if ok else 'FAIL'}] controller {cfg.controller.url}: token {tf}")
-        failed += not ok
-    for name, p in cfg.pools.items():
-        if p.controller:
-            typer.echo(f"[PASS] pool {name}: served by the controller")
-            continue
-        pool = LocalPool(name, p, layout.pool_state(name))
-        errors = []
-        for key in p.keys:
-            try:
-                pool.key_file(key)
-            except PoolError as e:
-                errors.append(str(e))
-        typer.echo(f"[{'FAIL' if errors else 'PASS'}] pool {name}: {len(p.keys)} key(s)")
-        for err in errors:
-            typer.echo(f"  - {err}")
-        failed += bool(errors)
-    if (mail := cfg.notify.mail) is not None:
-        ok = shutil.which(mail.sendmail) is not None
-        typer.echo(f"[{'PASS' if ok else 'FAIL'}] notify: mail to {', '.join(mail.to)} "
-                   f"via {mail.sendmail}")  # fmt: skip
-        failed += not ok
-    for problem in layout.check_paths():
-        typer.echo(f"[FAIL] {problem}")
-        failed += 1
-    typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s)")
+    tf = b.controller.token_file
+    if not (os.access(tf, os.R_OK) and tf.read_text().strip()):
+        typer.echo(f"[FAIL] token {tf}: missing or empty")
+        raise typer.Exit(1)
+    typer.echo(f"[PASS] token {tf}")
+
+    async def get() -> dict[str, Any]:
+        client = ControllerClient.from_token_file(b.controller.url, tf)
+        try:
+            return await fetch(client)
+        finally:
+            await client.aclose()
+
+    try:
+        slc = asyncio.run(get())
+        typer.echo(f"[PASS] controller {b.controller.url}: config version {slc['version']}")
+    except ControllerError as e:
+        cached = load_cached(b)
+        if cached is None:
+            typer.echo(f"[FAIL] controller {b.controller.url}: {e}; no cached config")
+            raise typer.Exit(1) from None
+        slc = cached
+        typer.echo(f"[WARN] controller {b.controller.url}: {e}; checking the config cached "
+                   f"at {slice_file(b)} (version {slc.get('version')})")  # fmt: skip
+    try:
+        cfg = build(b, slc)
+    except Rejected as e:
+        for problem in str(e).split("; "):
+            typer.echo(f"[FAIL] {problem}")
+        raise typer.Exit(1) from None
+    typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s), "
+               f"pools: {', '.join(cfg.pools) or 'none'}")  # fmt: skip
     raise typer.Exit(1 if failed else 0)
 
 

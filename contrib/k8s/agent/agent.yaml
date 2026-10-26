@@ -1,0 +1,18 @@
+# ferryman agent config for the DaemonSet: one file for every node, and
+# only what the node itself needs. Units, transfers and settings come from
+# the controller (contrib/k8s/controller/controller.yaml). Every setting and
+# its default: contrib/agent.example.yaml.
+#
+# {hostname} is the node's name (FERRYMAN_HOSTNAME, from the downward API).
+
+# Each pod's token is its node's, copied in by the init container. The
+# controller hands the agent its config and leases it keys.
+controller:
+  url: http://ferryman-controller:8470
+  token_file: /run/secrets/ferryman/token
+
+# Probes and metrics on the pod's network: /readyz is the readiness probe.
+api:
+  listen:
+    host: 0.0.0.0
+    port: 8470

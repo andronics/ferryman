@@ -82,8 +82,26 @@ class ControllerPool:
         self._lease: Lease | None = None
         self._size = 0
         self.emit: Emit = discard
-        # Leases are served from the cache while the controller is away.
+        # Leases are served from the cache while the controller is away,
+        # including the one kept on disk from before a restart.
         self.reachable = True
+        self._load()
+
+    @property
+    def _meta(self) -> Path:
+        # Which key the file beside it is, and its epoch (not *.json: those
+        # are keys, and superseded ones are deleted).
+        return self.keys_dir / "lease"
+
+    def _load(self) -> None:
+        try:
+            meta = json.loads(self._meta.read_text())
+            path = self.keys_dir / f"{meta['key']}.json"
+            if path.is_file():
+                self._lease = Lease(str(meta["key"]), path, int(meta["epoch"]))
+                self._size = int(meta["size"])
+        except (FileNotFoundError, ValueError, KeyError, TypeError):
+            pass
 
     @property
     def size(self) -> int:
@@ -129,6 +147,11 @@ class ControllerPool:
                 old.unlink(missing_ok=True)
         self._size = int(body["size"])
         lease = Lease(key, path, int(body["epoch"]))
+        meta = self._meta.with_suffix(".tmp")
+        fd = os.open(meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"key": key, "epoch": lease.epoch, "size": self._size}, f)
+        os.replace(meta, self._meta)
         if self._lease is None or lease.epoch != self._lease.epoch:
             log.info("pool %s: leased %s (epoch %d)", self.name, key, lease.epoch)
         self._lease = lease
@@ -154,12 +177,6 @@ class ControllerPool:
             "POST", f"/v2/pools/{self.name}/exhausted", json={"expected": expected}
         )
         return self._store(body)
-
-    def forget(self) -> None:
-        """Remove leased credentials from disk (on agent shutdown)."""
-        for path in self.keys_dir.glob("*.json"):
-            path.unlink(missing_ok=True)
-        self._lease = None
 
     async def info(self) -> dict[str, Any]:
         info: dict[str, Any] = await self.client.request("GET", f"/v2/pools/{self.name}")

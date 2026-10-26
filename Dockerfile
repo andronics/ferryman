@@ -87,7 +87,7 @@ RUN chmod 0755 /opt/ferryman/bin/ferryman
 ENV PATH="/opt/ferryman/bin:$PATH"
 
 # Default config locations
-ENV FERRYMAN_CONFIG=/etc/ferryman/config.yaml \
+ENV FERRYMAN_CONFIG=/etc/ferryman/agent.yaml \
     FERRYMAN_CONTROLLER_CONFIG=/etc/ferryman/controller.yaml
 
 # Health check: the agent answers on its API socket (the controller

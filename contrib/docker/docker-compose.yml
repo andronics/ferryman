@@ -34,7 +34,7 @@ services:
     stop_grace_period: 90s
 
     volumes:
-      # config.yaml, keys, secrets (read-only)
+      # agent.yaml, its token, serve secrets (read-only)
       - /etc/ferryman:/etc/ferryman:ro
 
       # paths.state, paths.cache, paths.logs
@@ -54,7 +54,7 @@ services:
       # - /pool/ceph/staging:/pool/ceph/staging
       # - /var/lib/vz/dump:/var/lib/vz/dump:ro
 
-    # paths.runtime: sockets, rendered rclone.conf, leased keys. Memory only.
+    # paths.runtime: sockets, rendered rclone.conf. Memory only.
     tmpfs:
       - /run/ferryman:mode=0700
 
