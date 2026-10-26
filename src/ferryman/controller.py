@@ -1,22 +1,22 @@
-"""The controller: owns the service-account keys and every pool's rotation
-state, and leases the current key to agents.
+"""The controller: holds the config every agent runs, owns the
+service-account keys and every pool's rotation state, and leases the
+current key to agents.
+
+Each agent fetches its slice of the config (its bound units, its transfers,
+its settings) with a long poll on /v2/config, and is woken when the slice
+changes: the controller re-reads its file on SIGHUP and whenever the file
+changes. A config that fails to load leaves the previous one in force.
 
 It speaks plain HTTP on a TCP port and expects to sit behind Traefik, which
 terminates TLS. Authentication is its own regardless: each agent sends a
-bearer token whose sha256 is in the config, and may only touch the pools
-listed for it.
+bearer token whose sha256 is in the config, and may only lease the pools of
+the units bound to it.
 
 Agents report their status to it every few seconds and collect commands
 (restart a unit, run a transfer) from it with long polls, which is what its
 web UI at /ui/ shows and drives. The UI has no login of its own: Traefik puts
 it behind forward-auth (authentik), and the controller trusts the user
 header that sets.
-
-It also arbitrates transfer claims. Two agents *moving* (or copying) into the
-same place on a drive is harmless - each only adds its own files - but a
-`sync` mirrors its source and deletes whatever else is there, so a sync
-whose destination overlaps another agent's transfer would delete that
-agent's uploads. Those claims are refused.
 """
 
 from __future__ import annotations
@@ -30,12 +30,16 @@ import itertools
 import json
 import logging
 import os
+import signal
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from importlib import resources
+from pathlib import Path
 from typing import Any
 
 import uvicorn
+import yaml
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import (
@@ -47,7 +51,7 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from .config import ControllerConfig, overlaps, parse_size
+from .config import ControllerConfig, parse_size
 from .metrics import CONTENT_TYPE, controller_metrics
 from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
 from .probe import probe
@@ -57,6 +61,9 @@ log = logging.getLogger(__name__)
 TUNE_LOCK_MAX = 7200.0
 # How often the probe loop looks for exhausted keys due a probe.
 PROBE_TICK = 60.0
+# How often the config file is checked for changes (a Kubernetes Secret
+# update replaces it in place; SIGHUP reloads at once).
+CONFIG_TICK = 10.0
 
 
 def token_hash(token: str) -> str:
@@ -68,14 +75,19 @@ class Forbidden(Exception):
 
 
 class Controller:
-    def __init__(self, cfg: ControllerConfig) -> None:
+    def __init__(self, cfg: ControllerConfig, path: Path | None = None) -> None:
         self.cfg = cfg
-        self.pools = {
-            name: LocalPool(name, p, cfg.state / "pools" / f"{name}.json")
-            for name, p in cfg.pools.items()
-        }
-        self._changed = {name: asyncio.Condition() for name in cfg.pools}
-        self.claims_file = cfg.state / "claims.json"
+        # The file cfg came from, re-read on change; None: never reloaded.
+        self.path = path
+        self._file_id = _file_id(path)
+        # Why the file's current contents aren't in force, if they aren't.
+        self.config_error: str | None = None
+        self._config_changed = asyncio.Condition()
+        self.pools: dict[str, LocalPool] = {}
+        self._changed: dict[str, asyncio.Condition] = {}
+        self._commands_changed: dict[str, asyncio.Condition] = {}
+        self._slices: dict[str, dict[str, Any]] = {}
+        self._apply(cfg)
         # agent -> {"at": when, "report": what it last said}; in memory only,
         # agents re-report within seconds of a controller restart.
         self.reports: dict[str, dict[str, Any]] = {}
@@ -83,13 +95,79 @@ class Controller:
         # next long poll.
         self.commands: collections.deque[dict[str, Any]] = collections.deque(maxlen=100)
         self._command_ids = itertools.count(1)
-        self._commands_changed = {name: asyncio.Condition() for name in cfg.agents}
         # uplink -> {"agent", "until"}: agents behind one uplink tune one at a
         # time. In memory: a controller restart frees them, which costs at
         # most one overlapping tune.
         self.tune_locks: dict[str, dict[str, Any]] = {}
         # pool -> the index of the drive its last probe used (drive: rotate).
         self._probe_turn: dict[str, int] = {}
+
+    # ---------------------------------------------------------------- config
+
+    def _apply(self, cfg: ControllerConfig) -> None:
+        """Put cfg in force. Pool state lives in files, so pools rebuilt from
+        a new config carry on where they were."""
+        self.cfg = cfg
+        self.pools = {name: LocalPool(name, p, cfg.state / "pools" / f"{name}.json")
+                      for name, p in cfg.pools.items()}  # fmt: skip
+        for name in cfg.pools:
+            self._changed.setdefault(name, asyncio.Condition())
+        for name in cfg.agents:
+            self._commands_changed.setdefault(name, asyncio.Condition())
+        self._slices = {name: cfg.slice(name) for name in cfg.agents}
+
+    async def reload(self, cfg: ControllerConfig) -> list[str]:
+        """Put a new config in force and wake every agent whose slice changed.
+        Returns those agents."""
+        before = {a: s["version"] for a, s in self._slices.items()}
+        self._apply(cfg)
+        self.config_error = None
+        changed = [a for a, s in self._slices.items() if before.get(a) != s["version"]]
+        async with self._config_changed:
+            self._config_changed.notify_all()
+        for name in cfg.pools:  # a pool's keys may have changed
+            async with self._changed[name]:
+                self._changed[name].notify_all()
+        log.info("config reloaded: %d agent(s), %d changed", len(cfg.agents), len(changed))
+        return changed
+
+    async def check_config(self, force: bool = False) -> None:
+        """Reload if the file changed (or `force`). A file that fails to load
+        leaves the previous config in force, with the error kept."""
+        if self.path is None:
+            return
+        file_id = _file_id(self.path)
+        if not force and file_id == self._file_id:
+            return
+        self._file_id = file_id
+        try:
+            cfg = ControllerConfig.load(self.path)
+        except (OSError, yaml.YAMLError, ValidationError, ValueError) as e:
+            self.config_error = f"{self.path}: {e}"
+            log.error("config not reloaded, the previous one stays in force: %s", e)
+            return
+        await self.reload(cfg)
+
+    async def config_loop(self) -> None:
+        while True:
+            await asyncio.sleep(CONFIG_TICK)
+            try:
+                await self.check_config()
+            except Exception:
+                log.exception("config check failed")
+
+    async def slice_for(self, agent: str, version: str | None, timeout: float) -> dict[str, Any]:
+        """The agent's slice: at once when its version isn't `version`, else
+        when it changes or after `timeout` (then just {"version": version})."""
+        async with self._config_changed:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._config_changed.wait_for(
+                    lambda: agent not in self._slices
+                    or self._slices[agent]["version"] != version), timeout)  # fmt: skip
+        if agent not in self._slices:
+            raise KeyError(agent)  # removed from the config while it waited
+        slc = self._slices[agent]
+        return slc if slc["version"] != version else {"version": version}
 
     # ------------------------------------------------------------ tune locks
 
@@ -252,52 +330,10 @@ class Controller:
                 for name in self.cfg.agents
             ],
             "pools": [p.describe() for p in self.pools.values()],
-            "claims": self._read_claims(),
+            "config_error": self.config_error,
             "commands": list(self.commands)[::-1],
             "tune_locks": {u: h for u, h in self.tune_locks.items() if h["until"] > time.time()},
         }
-
-    # --------------------------------------------------------------- claims
-
-    def _read_claims(self) -> dict[str, list[dict[str, str]]]:
-        try:
-            data: dict[str, list[dict[str, str]]] = json.loads(self.claims_file.read_text())
-            return data
-        except FileNotFoundError:
-            return {}
-
-    def claim(self, agent: str, wanted: list[dict[str, str]]) -> dict[str, Any]:
-        """Replace an agent's claims with `wanted`, minus any that conflict with
-        another agent's. Returns the conflicts."""
-        claims = self._read_claims()
-        accepted, conflicts = [], []
-        for c in wanted:
-            clash = next(
-                (
-                    (owner, o)
-                    for owner, theirs in claims.items()
-                    if owner != agent
-                    for o in theirs
-                    if o["target"] == c["target"]
-                    and overlaps(o["dest"], c["dest"])
-                    and "sync" in (o["mode"], c["mode"])
-                ),
-                None,
-            )
-            if clash:
-                owner, o = clash
-                conflicts.append({"transfer": c["transfer"], "owner": owner,
-                                  "owner_transfer": o["transfer"]})  # fmt: skip
-                log.warning("agent %s: transfer %s refused, overlaps %s's %s",
-                            agent, c["transfer"], owner, o["transfer"])  # fmt: skip
-            else:
-                accepted.append({k: c[k] for k in ("transfer", "target", "dest", "mode")})
-        claims[agent] = accepted
-        self.claims_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.claims_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(claims, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, self.claims_file)
-        return {"accepted": [c["transfer"] for c in accepted], "conflicts": conflicts}
 
 
 # -------------------------------------------------------------------- HTTP
@@ -349,15 +385,13 @@ def build_app(co: Controller) -> Starlette:
         epoch = int(request.query_params.get("epoch", "-1"))
         return await co.watch(p, epoch, co.cfg.watch_timeout)
 
-    async def put_claims(request: Request, agent: str) -> Any:
-        wanted = await request.json()
-        for c in wanted:
-            if not all(isinstance(c.get(k), str) for k in ("transfer", "target", "dest", "mode")):
-                raise KeyError("claim fields transfer/target/dest/mode")
-        return co.claim(agent, wanted)
+    async def get_config(request: Request, agent: str) -> Any:
+        return await co.slice_for(agent, request.query_params.get("version"),
+                                  co.cfg.watch_timeout)  # fmt: skip
 
-    async def get_claims(_: Request, agent: str) -> Any:
-        return co._read_claims()
+    async def gone(_: Request) -> JSONResponse:
+        return JSONResponse({"error": "this controller speaks /v2 (ferryman 0.3): upgrade "
+                             "the agent"}, status_code=410)  # fmt: skip
 
     async def put_report(request: Request, agent: str) -> Any:
         co.report(agent, await request.json())
@@ -382,31 +416,41 @@ def build_app(co: Controller) -> Starlette:
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
-        task = asyncio.create_task(co.probe_loop())
+        tasks = [asyncio.create_task(co.probe_loop()), asyncio.create_task(co.config_loop())]
+        loop = asyncio.get_running_loop()
+
+        def hup() -> None:
+            tasks.append(asyncio.create_task(co.check_config(force=True)))
+
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(signal.SIGHUP, hup)
         try:
             yield
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(signal.SIGHUP)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     return Starlette(
         lifespan=lifespan,
         routes=[
             Route("/healthz", healthz),
             Route("/metrics", metrics),
-            Route("/v1/report", authed(put_report), methods=["PUT"]),
-            Route("/v1/tune-lock/{uplink}", authed(tune_lock), methods=["POST"]),
-            Route("/v1/tune-lock/{uplink}", authed(tune_unlock), methods=["DELETE"]),
-            Route("/v1/commands", authed(get_commands)),
-            Route("/v1/commands/{id:int}", authed(post_command), methods=["POST"]),
-            Route("/v1/pools", authed(pools)),
-            Route("/v1/pools/{pool}", authed(pool)),
-            Route("/v1/pools/{pool}/lease", authed(lease)),
-            Route("/v1/pools/{pool}/exhausted", authed(exhausted), methods=["POST"]),
-            Route("/v1/pools/{pool}/watch", authed(watch)),
-            Route("/v1/claims", authed(get_claims)),
-            Route("/v1/claims", authed(put_claims), methods=["PUT"]),
+            Route("/v2/config", authed(get_config)),
+            Route("/v2/report", authed(put_report), methods=["PUT"]),
+            Route("/v2/tune-lock/{uplink}", authed(tune_lock), methods=["POST"]),
+            Route("/v2/tune-lock/{uplink}", authed(tune_unlock), methods=["DELETE"]),
+            Route("/v2/commands", authed(get_commands)),
+            Route("/v2/commands/{id:int}", authed(post_command), methods=["POST"]),
+            Route("/v2/pools", authed(pools)),
+            Route("/v2/pools/{pool}", authed(pool)),
+            Route("/v2/pools/{pool}/lease", authed(lease)),
+            Route("/v2/pools/{pool}/exhausted", authed(exhausted), methods=["POST"]),
+            Route("/v2/pools/{pool}/watch", authed(watch)),
+            # 0.2 agents: a clear answer instead of a 404.
+            Route("/v1/{rest:path}", gone, methods=["GET", "POST", "PUT", "DELETE"]),
             *(_ui_routes(co) if co.cfg.ui.enabled else []),
         ],
     )
@@ -506,8 +550,20 @@ def _ui_routes(co: Controller) -> list[Route]:
     ]
 
 
-def run(cfg: ControllerConfig) -> None:
-    co = Controller(cfg)
+def _file_id(path: Path | None) -> tuple[int, int, int] | None:
+    """What changes when a file is rewritten or replaced (a Secret's
+    atomic symlink swap gives a new inode)."""
+    if path is None:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def run(cfg: ControllerConfig, path: Path | None = None) -> None:
+    co = Controller(cfg, path)
     for name, p in co.pools.items():
         for key in p.cfg.keys:
             try:

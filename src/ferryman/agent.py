@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
-import os
 import signal
 from typing import Any
 
@@ -61,10 +59,6 @@ class Agent:
                 pool.emit = self.notifier.emit
         self.transfers = {name: TransferRunner(name, self) for name in cfg.transfers}
         self.tuner = Tuner(self)
-        # Transfers on controller pools must hold a claim before they run;
-        # name -> why a transfer may not run (absent: it may).
-        self.claim_blocks: dict[str, str] = {}
-        self._load_claims()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._stopping = asyncio.Event()
 
@@ -92,8 +86,6 @@ class Agent:
         for pool in self.pools.values():
             if isinstance(pool, ControllerPool):
                 self.spawn(pool.watch(self.apply), f"watch:{pool.name}")
-        if self._claims():
-            self.spawn(self._claims_loop(), "claims")
         if self.cfg.controller:
             self.spawn(self._report_loop(), "report")
             if self.cfg.controller.commands:
@@ -181,60 +173,6 @@ class Agent:
                 )
                 self.restart(sup)
 
-    # ----------------------------------------------------------------- claims
-
-    def _claims(self) -> list[dict[str, str]]:
-        """Claims for every transfer whose unit's pool is on the controller.
-        A drive is identified by its id (or, without one, its pool)."""
-        out = []
-        for name, t in self.cfg.transfers.items():
-            u = self.cfg.units[t.unit]
-            if u.pool and isinstance(self.pools.get(u.pool), ControllerPool):
-                target = u.drive_id or f"pool:{u.pool}"
-                dest = self.layout.claim_dest(name)
-                out.append({"transfer": name, "target": target, "dest": dest, "mode": t.mode})
-        return out
-
-    def _load_claims(self) -> None:
-        """Until the controller answers, a transfer may run only if it was
-        granted before (persisted), unchanged. A controller outage then
-        stops nothing that was already running fine."""
-        try:
-            granted = json.loads(self.layout.claims_file.read_text())
-        except (FileNotFoundError, ValueError):
-            granted = []
-        for c in self._claims():
-            if c not in granted:
-                self.claim_blocks[c["transfer"]] = "awaiting a claim from the controller"
-
-    async def _claims_loop(self) -> None:
-        assert self.controller is not None
-        wanted = self._claims()
-        while True:
-            try:
-                r = await self.controller.request("PUT", "/v1/claims", json=wanted)
-            except PoolError as e:
-                log.warning("claims: %s; retrying in 30s", e)
-                await asyncio.sleep(30)
-                continue
-            accepted = set(r["accepted"])
-            self.claim_blocks = {
-                c["transfer"]: f"destination overlaps {c['owner']}'s transfer "
-                f"{c['owner_transfer']} on the same drive"
-                for c in r["conflicts"]
-            }
-            for name, why in self.claim_blocks.items():
-                log.error("transfer %s will not run: %s", name, why)
-                self.notifier.emit(Event("transfer.blocked", name, why, "error"))
-            granted = [c for c in wanted if c["transfer"] in accepted]
-            path = self.layout.claims_file
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(granted, indent=2) + "\n")
-            os.replace(tmp, path)
-            # Re-assert now and then: the controller may have lost its state.
-            await asyncio.sleep(600)
-
     # ------------------------------------------------- controller UI support
 
     async def report(self) -> dict[str, Any]:
@@ -252,7 +190,7 @@ class Agent:
         assert self.controller is not None and self.cfg.controller is not None
         while True:
             try:
-                await self.controller.request("PUT", "/v1/report", json=await self.report())
+                await self.controller.request("PUT", "/v2/report", json=await self.report())
             except PoolError as e:
                 log.debug("report: %s", e)  # the watch already complains loudly
             await asyncio.sleep(self.cfg.controller.report_interval)
@@ -264,7 +202,7 @@ class Agent:
         while True:
             try:
                 cmds = await self.controller.request(
-                    "GET", "/v1/commands", timeout=self.controller.timeout + 60
+                    "GET", "/v2/commands", timeout=self.controller.timeout + 60
                 )
                 retry = 5.0
             except PoolError as e:
@@ -304,7 +242,7 @@ class Agent:
             result = {"ok": False, "error": str(e)}
         if self.controller is not None:
             try:
-                await self.controller.request("POST", f"/v1/commands/{cmd['id']}", json=result)
+                await self.controller.request("POST", f"/v2/commands/{cmd['id']}", json=result)
             except PoolError as e:
                 log.warning("command %s: could not report its result: %s", cmd["id"], e)
         return result

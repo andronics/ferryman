@@ -572,7 +572,7 @@ class Tuner:
     @property
     def _uplink_path(self) -> str | None:
         if self.cfg.uplink and self.agent.controller is not None:
-            return f"/v1/tune-lock/{self.cfg.uplink}"
+            return f"/v2/tune-lock/{self.cfg.uplink}"
         return None
 
     async def _lock_uplink(self, seconds: float) -> None:

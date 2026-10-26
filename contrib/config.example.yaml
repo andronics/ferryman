@@ -15,7 +15,7 @@ hostname: null
 paths:
   runtime: /run/ferryman          # sockets, rendered rclone.conf, leased keys (use tmpfs)
   cache: /var/cache/ferryman      # VFS cache, one dir per unit; tuning's probe data
-  state: /var/lib/ferryman        # pool state, granted claims, tuning profiles
+  state: /var/lib/ferryman        # pool state, tuning profiles
   logs: /var/log/ferryman         # one rclone log per unit, plus tune.log
 
 api:

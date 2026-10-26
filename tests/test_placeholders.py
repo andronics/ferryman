@@ -79,7 +79,6 @@ def test_config_rules(make_config: Callable[..., Config], tmp_path: Path) -> Non
     layout = Layout(cfg)
     assert layout.transfer_source("dump") == Path("/srv/pve-01/dump")
     assert layout.transfer_dest("dump", SUNDAY) == "d/sun"
-    assert layout.claim_dest("dump") == "d"
     assert Layout(transfer(source="/srv/{unit}")).transfer_source("dump") == Path("/srv/media-tv")
     with pytest.raises(ValueError, match="absolute"):
         transfer(source="{unit}")  # relative once expanded: no roots to resolve it against
