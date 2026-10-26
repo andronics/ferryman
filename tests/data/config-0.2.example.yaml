@@ -1,0 +1,209 @@
+# ferryman agent config: every setting, with its default.
+#
+# Copy to /etc/ferryman/config.yaml, keep what you change, then check it
+# offline with `ferryman verify`. Loaded once at startup (changes need a
+# restart); unknown keys are errors, so a typo fails loudly.
+#
+# Sections below `defaults` show their defaults exactly: deleting one changes
+# nothing. pools/units/transfers are worked examples to adapt. Full reference:
+# https://github.com/andronics/ferryman/wiki/In-Depth-Configuration
+
+# What {hostname} expands to. null: $FERRYMAN_HOSTNAME, else the system's
+# name (in a pod, set the env from the node name).
+hostname: null
+
+paths:
+  runtime: /run/ferryman          # sockets, rendered rclone.conf, leased keys (use tmpfs)
+  cache: /var/cache/ferryman      # VFS cache, one dir per unit; tuning's probe data
+  state: /var/lib/ferryman        # pool state, granted claims, tuning profiles
+  logs: /var/log/ferryman         # one rclone log per unit, plus tune.log
+
+api:
+  socket: null                    # null: <paths.runtime>/api.sock (the CLI talks to it)
+  socket_mode: 0660               # YAML octal
+  # TCP listener for /healthz, /readyz and /metrics only (no control), for
+  # Prometheus and Kubernetes probes. Off unless set:
+  listen: null
+  # listen:
+  #   host: 127.0.0.1
+  #   port: 8470
+  #   forwarded_allow_ips: 127.0.0.1    # the proxy, if one is in front
+
+rclone:
+  binary: rclone                  # >= 1.75; distribution packages are often older
+  log_level: INFO                 # rclone's --log-level
+
+health:
+  interval: 120                   # seconds between health checks
+  stat_timeout: 10                # seconds a stat of a mount path may take before it counts as wedged
+
+notify:
+  level: warning                  # info | warning | error: the least severe event sent
+  batch: 60                       # collect events this many seconds, send one message
+  repeat: 21600                   # re-send a problem still open after this many seconds
+  mail: null
+  # mail:
+  #   to: [ops@example.org]
+  #   from: ferryman@pve-01.example.org   # null: ferryman@<hostname>
+  #   sendmail: /usr/sbin/sendmail
+  webhook: null
+  # webhook:
+  #   url: https://hooks.example.org/ferryman   # gets a JSON POST {host, title, text, events}
+  #   headers: {Authorization: "Bearer ..."}
+
+# Applied to every unit unless the unit says otherwise.
+defaults:
+  uid: null                       # --uid/--gid for mounts; owner of created mount dirs
+  gid: null
+  cache_max_size: 10G             # per unit (--vfs-cache-max-size; its mounts share it): not a total
+  cache_min_free_space: 100G      # --vfs-cache-min-free-space, guards the shared cache disk
+  warm: true                      # walk the dir cache after each start
+  dir_mode: 0775                  # mode of a mount dir ferryman creates; its parent must exist (YAML octal)
+  # How mounts read (sizes need a suffix: a bare number is KiB to rclone).
+  # Small on purpose: scanners open every file to probe it, and each open
+  # pulls the read-ahead window into the cache.
+  buffer_size: 16M                # in-memory read-ahead per open file
+  vfs_cache_mode: full            # off | minimal | writes | full
+  vfs_read_chunk_size: 128M       # size of each ranged read from Drive
+  vfs_read_ahead: "0"             # extra on-disk read-ahead (full mode only)
+
+# Upload tuning: `ferryman tune` measures this host's path to Drive and picks
+# the chunk size and transfer count. Probe bytes count against the daily cap.
+# https://github.com/andronics/ferryman/wiki/Upload-Tuning
+tuning:
+  budget: 32G                     # most a whole tune may upload
+  probe_bytes: 2G                 # most one probe run may upload
+  max_memory: 2G                  # transfers x chunk size never exceeds this
+  warmup: 3                       # seconds discarded at each probe's start
+  window: 15                      # seconds measured after that
+  repeats: 2                      # runs per setting; the best counts
+  chunk_sizes: [8M, 16M, 32M, 64M, 128M, 256M]
+  transfers: [1, 2, 4, 8, 12, 16] # ascending, starting at 1
+  apply: suggest                  # suggest: record only; auto: apply non-noisy results, re-tune on drift
+  schedule: null                  # cron for re-tunes, e.g. "0 4 * * 0"
+  uplink: null                    # hosts sharing an uplink take turns (needs the coordinator)
+  drift: 0.6                      # drift_runs large transfer runs in a row below this
+  drift_runs: 3                   #   fraction of the profile's rate raise tune.drift
+
+# A coordinator shares key pools between hosts and serves the web UI. Off
+# unless set; with it, pools may say `coordinator: true`.
+coordinator: null
+# coordinator:
+#   url: https://ferryman.example.org
+#   token_file: /etc/ferryman/token     # from `ferryman token`
+#   agent: pve-01                       # informational; the token identifies the agent
+#   report_interval: 15                 # seconds between status reports
+#   commands: true                      # take restart/run/tune commands from the web UI
+
+# ------------------------------------------------------------------ examples
+
+# Service-account keys, rotated when Drive's ~750G/day upload cap hits.
+# A local pool names each key by client_email: <keys_dir>/<key>.json.
+pools:
+  uploads:
+    coordinator: false            # true: the coordinator owns the keys (then no keys/keys_dir)
+    keys_dir: /etc/ferryman/keys
+    keys:
+      - sa-01@my-project.iam.gserviceaccount.com
+      - sa-02@my-project.iam.gserviceaccount.com
+      - sa-03@my-project.iam.gserviceaccount.com
+    quota_window: 86400           # seconds an exhausted key sits out
+  # A pool the coordinator owns (no keys here; needs `coordinator:` above):
+  # shared: {coordinator: true}
+
+# One rclone process per unit. Names: letters, digits, _ . - (not leading).
+# Mount paths are absolute; ferryman creates the last directory only, so the
+# parent must exist. Never a system directory, inside another mount, or
+# overlapping a transfer's source (checked by `ferryman verify` and at start).
+units:
+  media-tv:                       # a shared drive, mounted for a media server
+    drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive's id (from its URL)
+    pool: uploads                 # required for drive units
+    uid: 1000                     # unit-level: every mount of the unit shares one cache,
+    gid: 1000                     #   so uid/gid and the read settings apply to all of them
+    cache_max_size: 150G          # a library worth caching
+    mounts:                       # the first runs the process; the rest join it
+      - path: /pool/google/media/tv
+        allow_other: true         # other users (the media server) may use it (default)
+        default_permissions: true # the kernel enforces mode bits (default)
+      - path: /pool/google/{hostname}/tv   # placeholders: {hostname} {unit} {env:NAME}
+        allow_other: false        # this path for root only; same files, same cache
+      - path: /pool/google/ro/tv
+        read_only: true           # a kernel ro bind of the first writable mount (root only);
+                                  #   takes that mount's allow_other/default_permissions
+  media-movies:
+    drive_id: 0ABBBBBBBBBBBBBBBBB
+    pool: uploads
+    warm: false                   # skip the dir-cache walk after start
+    mount_args: [--read-only]     # extra flags, appended to `rclone mount`
+    mounts:
+      - path: /pool/google/media/movies
+  media-music:                    # many small random reads: fetch less per open
+    drive_id: 0ADDDDDDDDDDDDDDDDD
+    pool: uploads
+    mounts:
+      - path: /pool/google/media/music
+    buffer_size: "0"              # no in-memory read-ahead
+    vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
+    vfs_cache_mode: full          # keep cached re-reads (writes would stop caching reads)
+    vfs_read_ahead: "0"           # status shows each value's source: unit, defaults or built-in
+  media-photos:                   # no mounts, served instead: Drive over WebDAV/FTP, no FUSE
+    drive_id: 0AEEEEEEEEEEEEEEEEE
+    pool: uploads
+    serve:                        # servers inside the unit's process: same cache and key
+      - type: webdav              # dlna ftp http nfs restic s3 sftp webdav
+        addr: 127.0.0.1:8081      # required and unique: host:port (":8081" for every address)
+        htpasswd: /etc/ferryman/secrets/photos.htpasswd  # http, webdav, restic
+        cert: /etc/ferryman/tls/photos.crt                # TLS: https (ftp: implicit FTPS); sftp
+                                                          #   takes host_key instead
+        key: /etc/ferryman/tls/photos.key
+      - type: ftp
+        addr: 0.0.0.0:2121        # beyond loopback: authentication required
+        passive_port: 30000-30099 # ftp only, required; ranges may not overlap
+        user: photos              # with pass_file (s3: access key id + secret key)
+        pass_file: /etc/ferryman/secrets/photos-ftp      # read at start; mode 0600
+        options:                  # passed to rclone as-is (its flag names, _ for -);
+          public_ip: 10.0.100.5   #   VFS settings are refused: they are the unit's
+      - type: sftp
+        addr: 127.0.0.1:2022
+        host_key: /etc/ferryman/secrets/photos-ssh-host-key   # sftp only; mode 0600
+      - type: dlna                # no auth exists for dlna/nfs: beyond loopback only with
+        addr: :7879
+        allow_unauthenticated: true
+  backups:                        # no mounts: no FUSE, just `rclone rcd` for transfers
+    drive_id: 0ACCCCCCCCCCCCCCCCC
+    pool: uploads
+  scratch:                        # any rclone backend; options go into its conf verbatim
+    backend: alias
+    mounts:
+      - path: /pool/google/scratch
+    options:
+      remote: /srv/scratch
+    # A drive unit's options can override what ferryman renders, e.g.
+    # chunk_size: 64M (always with a suffix: a bare number is KiB to rclone).
+
+# Move, copy or sync jobs, run inside their unit's process.
+transfers:
+  media-tv:                       # staging: whatever lands in the source goes up
+    unit: media-tv
+    source: /pool/ceph/staging/tv # required: absolute, placeholders allowed; not in or above a mount
+    mode: move                    # files are deleted locally once uploaded
+    schedule: "0 */4 * * *"       # cron, host's timezone; omit to run on demand only
+    min_age: 5m                   # skip files still being written
+    exclude: ["*.part", "*.tmp"]  # rclone filter patterns to leave alone
+  pve-dump:                       # a backup: a mirror per weekday, 7 rolling copies
+    unit: backups
+    mode: sync                    # deletes at the destination what the source lacks
+    source: /var/lib/vz/dump
+    dest: proxmox/{hostname}/{weekday}
+    schedule: "30 3 * * *"
+    max_delete: 50                # abort the job after this many deletions
+    allow_empty: false            # refuse a sync from an empty source (the default)
+  configs:                        # dated archives: copy, never sync, into a dated folder
+    unit: backups
+    mode: copy
+    source: /etc
+    dest: configs/{hostname}/{now:%Y/%m}
+    schedule: "0 2 1 * *"
+    transfers: 2                  # pin these instead of the tuning profile (else 8)
+    checkers: 4
