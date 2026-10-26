@@ -15,6 +15,7 @@ from . import __version__, mountutil, patterns, sdnotify
 from .bootstrap import Rejected, Start, build, fetch, save_cached
 from .config import AgentBootstrap, Config, Layout, unit_spec
 from .controller_pool import ControllerClient, ControllerPool
+from .events import Outbox
 from .notify import Event, Notifier
 from .pool import Lease, LocalPool, Pool, PoolError, PoolExhausted, is_quota_error
 from .rc import RcError
@@ -52,6 +53,12 @@ class Agent:
             self.config_state["state"] = "rejected"
         self.layout = Layout(cfg)
         self.notifier = Notifier(cfg.notify, self.layout.hostname)
+        # Agents notify no one: with a controller, every event goes into the
+        # outbox, delivered to the controller in order, outages included.
+        self.outbox: Outbox | None = None
+        if cfg.controller:
+            self.outbox = Outbox(self.layout.outbox)
+            self.notifier.sink = self.outbox.append
         self.job_poll_interval = 5.0
         self.controller = (
             ControllerClient.from_token_file(
@@ -137,8 +144,8 @@ class Agent:
             self._tune_schedule = self.spawn(self.tuner.schedule(), "tune-schedule")
             self._tune_schedule_for = self.cfg.tuning.schedule
         self.spawn(self._health_loop(), "health")
-        if self.notifier.enabled:
-            self.spawn(self.notifier.run(), "notify")
+        if self.outbox is not None:
+            self.spawn(self._events_loop(), "events")
         if (interval := sdnotify.watchdog_interval()) is not None:
             self.spawn(self._watchdog(interval), "watchdog")
 
@@ -225,9 +232,34 @@ class Agent:
             "status": self.status(),
             "stats": await self.stats(),
             "pools": local,
-            "events": self.notifier.recent(20),
             "config": self.config_state,
+            "outbox": len(self.outbox.entries) if self.outbox else 0,
         }
+
+    async def _events_loop(self) -> None:
+        """Deliver the outbox to the controller, oldest first; what isn't
+        acknowledged is sent again (the controller ignores repeats)."""
+        assert self.controller is not None and self.outbox is not None
+        outbox = self.outbox
+        outbox.wake = asyncio.Event()
+        retry = 5.0
+        while True:
+            outbox.wake.clear()
+            batch = outbox.pending()
+            if not batch:
+                await outbox.wake.wait()
+                continue
+            try:
+                r = await self.controller.request(
+                    "POST", "/v2/events", json={"outbox": outbox.id, "events": batch}
+                )
+                outbox.ack(int(r["acked"]))
+                retry = 5.0
+            except PoolError as e:
+                log.debug("events: %s; %d waiting, retrying in %.0fs", e, len(outbox.entries),
+                          retry)  # fmt: skip
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, 60.0)
 
     async def _config_loop(self) -> None:
         """Follow the controller's slice for this agent with long polls."""

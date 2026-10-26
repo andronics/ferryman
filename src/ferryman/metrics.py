@@ -68,6 +68,10 @@ METRICS: dict[str, tuple[str, str]] = {
         "gauge",
         "When an exhausted key was last probed, by result (ok, capped, error).",
     ),
+    "ferryman_events_undelivered": (
+        "gauge",
+        "Events in the outbox, not yet acknowledged by the controller.",
+    ),
     "ferryman_controller_reachable": ("gauge", "1 if the controller answered the last request."),
     "ferryman_controller_info": ("gauge", "Controller version (always 1)."),
     "ferryman_agent_last_report_timestamp_seconds": ("gauge", "When the agent last reported."),
@@ -194,6 +198,8 @@ async def agent_metrics(agent: Agent) -> str:
             if pool.current:
                 m.add("ferryman_pool_current_key", 1, pool=name, key=pool.current)
             m.add("ferryman_controller_reachable", int(pool.reachable), pool=name)
+    if agent.outbox is not None:
+        m.add("ferryman_events_undelivered", len(agent.outbox.entries))
     return m.render()
 
 

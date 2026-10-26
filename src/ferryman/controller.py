@@ -52,6 +52,7 @@ from starlette.responses import (
 from starlette.routing import Route
 
 from .config import ControllerConfig, parse_size
+from .events import EventStore
 from .metrics import CONTENT_TYPE, controller_metrics
 from .pool import LocalPool, NoOtherKey, PoolError, PoolExhausted
 from .probe import probe
@@ -64,6 +65,8 @@ PROBE_TICK = 60.0
 # How often the config file is checked for changes (a Kubernetes Secret
 # update replaces it in place; SIGHUP reloads at once).
 CONFIG_TICK = 10.0
+# How often agents' silence and pools' exhaustion are looked at.
+WATCH_TICK = 30.0
 
 
 def token_hash(token: str) -> str:
@@ -88,6 +91,12 @@ class Controller:
         self._commands_changed: dict[str, asyncio.Condition] = {}
         self._slices: dict[str, dict[str, Any]] = {}
         self._apply(cfg)
+        self.events = EventStore(cfg.state, cfg.events.retention_days * 86400.0)
+        self.started = time.time()
+        # Problems the controller has raised and not yet seen end.
+        self._silent: set[str] = set()
+        self._exhausted: set[str] = set()
+        self._rejected: dict[str, Any] = {}
         # agent -> {"at": when, "report": what it last said}; in memory only,
         # agents re-report within seconds of a controller restart.
         self.reports: dict[str, dict[str, Any]] = {}
@@ -145,8 +154,14 @@ class Controller:
         except (OSError, yaml.YAMLError, ValidationError, ValueError) as e:
             self.config_error = f"{self.path}: {e}"
             log.error("config not reloaded, the previous one stays in force: %s", e)
+            why = f"not reloaded, the previous config stays in force: {e}"
+            self.events.emit("config.invalid", str(self.path), why, "error")
             return
+        was_invalid = self.config_error is not None
         await self.reload(cfg)
+        if was_invalid:
+            self.events.emit("config.reloaded", str(self.path), "valid again and in force",
+                             "info", resolves=True)  # fmt: skip
 
     async def config_loop(self) -> None:
         while True:
@@ -219,6 +234,11 @@ class Controller:
         before = pool.epoch
         try:
             await pool.advance(expected)
+        except PoolExhausted as e:
+            if pool.name not in self._exhausted:
+                self._exhausted.add(pool.name)
+                self.events.emit("pool.exhausted", pool.name, str(e), "error")
+            raise
         finally:
             # Even an all-exhausted pool changed state (the key got marked).
             async with self._changed[pool.name]:
@@ -274,12 +294,65 @@ class Controller:
             # The pool had no key and now has one: wake the agents' watches.
             async with self._changed[pool.name]:
                 self._changed[pool.name].notify_all()
+        if r.result == "ok" and key in pool.available():
+            self.events.emit("probe.recovered", pool.name, f"{key} can upload again", "info")
+            self.check_pools()
         return r.result
+
+    # ---------------------------------------------------- the controller's own
+
+    def check_pools(self) -> None:
+        """An exhausted pool that has a key again (its window ended, or a
+        probe found one) has recovered."""
+        for name in list(self._exhausted):
+            pool = self.pools.get(name)
+            if pool is None or pool.available():
+                self._exhausted.discard(name)
+                self.events.emit("pool.recovered", name, "a key can upload again", "info",
+                                 resolves=True)  # fmt: skip
+
+    def check_agents(self) -> None:
+        """agent.silent for an agent that hasn't reported for silent_after
+        (since the controller started, for one never heard from)."""
+        now, after = time.time(), self.cfg.events.silent_after
+        for name in self.cfg.agents:
+            rep = self.reports.get(name)
+            last = rep["at"] if rep else self.started
+            if now - last > after and name not in self._silent:
+                self._silent.add(name)
+                seen = f"last report {time.strftime('%F %T', time.localtime(last))}" if rep \
+                    else "no report since the controller started"  # fmt: skip
+                self.events.emit("agent.silent", name, f"quiet for {now - last:.0f}s ({seen})")
+        self._silent &= set(self.cfg.agents)
+
+    async def watch_loop(self) -> None:
+        while True:
+            await asyncio.sleep(WATCH_TICK)
+            try:
+                self.check_agents()
+                self.check_pools()
+            except Exception:
+                log.exception("watch failed")
 
     # ------------------------------------------------------ reports, commands
 
     def report(self, agent: str, body: dict[str, Any]) -> None:
         self.reports[agent] = {"at": time.time(), "report": body}
+        if agent in self._silent:
+            self._silent.discard(agent)
+            self.events.emit("agent.recovered", agent, "reporting again", "info", resolves=True)
+        cfg = body.get("config") or {}
+        if cfg.get("state") == "rejected":
+            seen = (cfg.get("offered"), cfg.get("error"))
+            if self._rejected.get(agent) != seen:
+                self._rejected[agent] = seen
+                self.events.emit("agent.config_rejected", agent,
+                                 f"version {cfg.get('offered')} refused, {cfg.get('version')} "
+                                 f"stays in force: {cfg.get('error')}", "error")  # fmt: skip
+        elif agent in self._rejected and cfg.get("state") in ("applied", "pending"):
+            del self._rejected[agent]
+            now_in = f"version {cfg.get('version')} in force"
+            self.events.emit("agent.config_applied", agent, now_in, "info", resolves=True)
 
     async def queue(self, agent: str, action: str, target: str, by: str,
                     **args: Any) -> dict[str, Any]:  # fmt: skip
@@ -331,6 +404,7 @@ class Controller:
             ],
             "pools": [p.describe() for p in self.pools.values()],
             "config_error": self.config_error,
+            "events": self.events.latest(200),
             "commands": list(self.commands)[::-1],
             "tune_locks": {u: h for u, h in self.tune_locks.items() if h["until"] > time.time()},
         }
@@ -393,6 +467,10 @@ def build_app(co: Controller) -> Starlette:
         return JSONResponse({"error": "this controller speaks /v2 (ferryman 0.3): upgrade "
                              "the agent"}, status_code=410)  # fmt: skip
 
+    async def post_events(request: Request, agent: str) -> Any:
+        body = await request.json()
+        return {"acked": co.events.ingest(agent, str(body["outbox"]), body["events"])}
+
     async def put_report(request: Request, agent: str) -> Any:
         co.report(agent, await request.json())
         return {"ok": True}
@@ -416,7 +494,11 @@ def build_app(co: Controller) -> Starlette:
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
-        tasks = [asyncio.create_task(co.probe_loop()), asyncio.create_task(co.config_loop())]
+        tasks = [
+            asyncio.create_task(co.probe_loop()),
+            asyncio.create_task(co.config_loop()),
+            asyncio.create_task(co.watch_loop()),
+        ]
         loop = asyncio.get_running_loop()
 
         def hup() -> None:
@@ -440,6 +522,7 @@ def build_app(co: Controller) -> Starlette:
             Route("/metrics", metrics),
             Route("/v2/config", authed(get_config)),
             Route("/v2/report", authed(put_report), methods=["PUT"]),
+            Route("/v2/events", authed(post_events), methods=["POST"]),
             Route("/v2/tune-lock/{uplink}", authed(tune_lock), methods=["POST"]),
             Route("/v2/tune-lock/{uplink}", authed(tune_unlock), methods=["DELETE"]),
             Route("/v2/commands", authed(get_commands)),

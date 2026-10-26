@@ -310,9 +310,8 @@ function render(d) {
   document.getElementById("pools").innerHTML =
     pools.join("") || `<div class="panel empty">no pools</div>`;
 
-  const events = d.agents.flatMap((a) =>
-    ((a.report && a.report.events) || []).map((e) => ({...e, agent: a.agent})));
-  events.sort((x, y) => y.at - x.at);
+  // Every agent's events and the controller's own, newest first.
+  const events = (d.events || []).map((e) => ({...e, agent: e.agent || "controller"}));
   document.getElementById("events").innerHTML = events.length ? `<table>
     <tr><th>When</th><th>Agent</th><th>Event</th><th>Subject</th><th>Message</th></tr>
     ${events.slice(0, 40).map((e) => `<tr>

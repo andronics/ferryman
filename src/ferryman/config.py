@@ -789,6 +789,11 @@ class Layout:
                 return f"overlaps ferryman's own {own}"
         return None
 
+    @property
+    def outbox(self) -> Path:
+        # Events not yet delivered to the controller.
+        return self.cfg.paths.state / "controller" / "outbox.jsonl"
+
     def leased_keys(self, pool: str) -> Path:
         # The key leased from the controller, kept (root-only) in the state
         # dir so a restart during a controller outage can still mount.
@@ -986,12 +991,19 @@ class Ui(_Model):
     user_header: str | None = "X-authentik-username"
 
 
+class Events(_Model):
+    retention_days: int = Field(default=30, ge=1)  # how long the controller keeps events
+    # An agent that hasn't reported for this long raises agent.silent.
+    silent_after: float = Field(default=120.0, ge=30)
+
+
 class ControllerConfig(_Model):
     listen: Listen = Listen()
     ui: Ui = Ui()
     rclone: Rclone = Rclone()  # runs key probes (pools with `probe:`)
     state: Path = Path("/var/lib/ferryman-controller")
     watch_timeout: float = 30.0
+    events: Events = Events()
     health: Health = Health()
     tuning: Tuning = Tuning()
     defaults: UnitDefaults = UnitDefaults()
