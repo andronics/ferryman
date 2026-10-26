@@ -1,11 +1,11 @@
-"""Agent side of the coordinator: pools whose keys and rotation state live on
-the coordinator, shared by every agent that leases from them.
+"""Agent side of the controller: pools whose keys and rotation state live on
+the controller, shared by every agent that leases from them.
 
 A lease carries the key's credentials. They are written to a 0600 file in the
 runtime dir (tmpfs) because rclone's drive `backend set` takes a key *file*;
-nothing else on the agent ever holds them. If the coordinator goes away the
+nothing else on the agent ever holds them. If the controller goes away the
 agent keeps using its last lease and only loses rotation; it retries and
-complains in the log until the coordinator answers again.
+complains in the log until the controller answers again.
 """
 
 from __future__ import annotations
@@ -29,11 +29,11 @@ WATCH_RETRY_MIN = 5.0
 WATCH_RETRY_MAX = 60.0
 
 
-class CoordinatorError(PoolError):
+class ControllerError(PoolError):
     pass
 
 
-class CoordinatorClient:
+class ControllerClient:
     def __init__(
         self,
         url: str,
@@ -52,14 +52,14 @@ class CoordinatorClient:
     @classmethod
     def from_token_file(
         cls, url: str, token_file: Path, transport: httpx.AsyncBaseTransport | None = None
-    ) -> CoordinatorClient:
+    ) -> ControllerClient:
         return cls(url, token_file.read_text().strip(), transport=transport)
 
     async def request(self, method: str, path: str, timeout: float | None = None, **kw: Any) -> Any:
         try:
             r = await self._client.request(method, path, timeout=timeout or self.timeout, **kw)
         except httpx.HTTPError as e:
-            raise CoordinatorError(f"coordinator unreachable: {e or type(e).__name__}") from e
+            raise ControllerError(f"controller unreachable: {e or type(e).__name__}") from e
         try:
             body = r.json()
         except ValueError:
@@ -67,22 +67,22 @@ class CoordinatorClient:
         if r.status_code == 409 and "frees_at" in body:
             raise PoolExhausted(path.split("/")[3], float(body["frees_at"]))
         if r.status_code != 200:
-            raise CoordinatorError(f"coordinator: {body.get('error', f'HTTP {r.status_code}')}")
+            raise ControllerError(f"controller: {body.get('error', f'HTTP {r.status_code}')}")
         return body
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
 
-class CoordinatorPool:
-    def __init__(self, name: str, client: CoordinatorClient, keys_dir: Path) -> None:
+class ControllerPool:
+    def __init__(self, name: str, client: ControllerClient, keys_dir: Path) -> None:
         self.name = name
         self.client = client
         self.keys_dir = keys_dir
         self._lease: Lease | None = None
         self._size = 0
         self.emit: Emit = discard
-        # Leases are served from the cache while the coordinator is away.
+        # Leases are served from the cache while the controller is away.
         self.reachable = True
 
     @property
@@ -104,18 +104,18 @@ class CoordinatorPool:
     def _up(self) -> None:
         if not self.reachable:
             self.reachable = True
-            self.emit(Event("coordinator.recovered", self.name, "reachable again", "info",
+            self.emit(Event("controller.recovered", self.name, "reachable again", "info",
                             resolves=True))  # fmt: skip
 
     def _down(self, e: Exception) -> None:
         self.reachable = False
-        self.emit(Event("coordinator.unreachable", self.name, str(e)))
+        self.emit(Event("controller.unreachable", self.name, str(e)))
 
     def _store(self, body: dict[str, Any]) -> Lease:
         key = str(body["key"])
         creds = body["credentials"]
         if creds.get("type") != "service_account" or creds.get("client_email") != key:
-            raise CoordinatorError(f"pool {self.name}: coordinator sent a bad key for {key}")
+            raise ControllerError(f"pool {self.name}: controller sent a bad key for {key}")
         self.keys_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self.keys_dir / f"{key}.json"
         tmp = path.with_suffix(".tmp")
@@ -142,7 +142,7 @@ class CoordinatorPool:
         except PoolExhausted:
             self._up()
             raise
-        except CoordinatorError as e:
+        except ControllerError as e:
             self._down(e)
             if self._lease is None:
                 raise
@@ -165,7 +165,7 @@ class CoordinatorPool:
         info: dict[str, Any] = await self.client.request("GET", f"/v1/pools/{self.name}")
         return info
 
-    async def watch(self, on_change: Callable[[CoordinatorPool, Lease], Awaitable[None]]) -> None:
+    async def watch(self, on_change: Callable[[ControllerPool, Lease], Awaitable[None]]) -> None:
         """Follow the pool's epoch with long polls, calling `on_change` with
         each new lease: how a rotation triggered by another agent reaches
         this one's running units."""

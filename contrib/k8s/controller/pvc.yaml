@@ -2,10 +2,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: ferryman-coordinator-state
+  name: ferryman-controller-state
   labels:
     app.kubernetes.io/name: ferryman
-    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/component: controller
 spec:
   accessModes: [ReadWriteOnce]
   resources:

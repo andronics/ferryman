@@ -1,5 +1,5 @@
 """Prometheus metrics, rendered in the text exposition format at scrape time
-from the agent's (or coordinator's) live state. No client library: every
+from the agent's (or controller's) live state. No client library: every
 value already lives somewhere, so a scrape just reads it."""
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
-from .coordinator_pool import CoordinatorPool
+from .controller_pool import ControllerPool
 from .pool import LocalPool
 from .rc import RcError
 from .tuning import BACKEND
@@ -16,7 +16,7 @@ from .unit import State
 
 if TYPE_CHECKING:
     from .agent import Agent
-    from .coordinator import Coordinator
+    from .controller import Controller
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 RC_TIMEOUT = 5.0
@@ -44,7 +44,7 @@ METRICS: dict[str, tuple[str, str]] = {
     "ferryman_tune_limit": ("gauge", "What limited the profile's rate (1 for it)."),
     "ferryman_tune_timestamp_seconds": ("gauge", "When the profile was measured."),
     "ferryman_transfer_running": ("gauge", "1 while the transfer runs."),
-    "ferryman_transfer_blocked": ("gauge", "1 if the coordinator refused the transfer's claim."),
+    "ferryman_transfer_blocked": ("gauge", "1 if the controller refused the transfer's claim."),
     "ferryman_transfer_last_success": ("gauge", "1 if the transfer's last run succeeded."),
     "ferryman_transfer_last_run_timestamp_seconds": ("gauge", "When the last run finished."),
     "ferryman_transfer_last_success_timestamp_seconds": (
@@ -69,8 +69,8 @@ METRICS: dict[str, tuple[str, str]] = {
         "gauge",
         "When an exhausted key was last probed, by result (ok, capped, error).",
     ),
-    "ferryman_coordinator_reachable": ("gauge", "1 if the coordinator answered the last request."),
-    "ferryman_coordinator_info": ("gauge", "Coordinator version (always 1)."),
+    "ferryman_controller_reachable": ("gauge", "1 if the controller answered the last request."),
+    "ferryman_controller_info": ("gauge", "Controller version (always 1)."),
     "ferryman_agent_last_report_timestamp_seconds": ("gauge", "When the agent last reported."),
     "ferryman_agent_units": ("gauge", "Units the agent runs."),
     "ferryman_agent_units_ready": ("gauge", "Of the agent's units, those ready."),
@@ -190,19 +190,19 @@ async def agent_metrics(agent: Agent) -> str:
     for name, pool in agent.pools.items():
         if isinstance(pool, LocalPool):
             _pool(m, pool.describe())
-        elif isinstance(pool, CoordinatorPool):
+        elif isinstance(pool, ControllerPool):
             # Only what the agent knows locally: a scrape never waits on the
-            # coordinator, which has its own /metrics.
+            # controller, which has its own /metrics.
             m.add("ferryman_pool_epoch", pool.epoch if pool.epoch >= 0 else None, pool=name)
             if pool.current:
                 m.add("ferryman_pool_current_key", 1, pool=name, key=pool.current)
-            m.add("ferryman_coordinator_reachable", int(pool.reachable), pool=name)
+            m.add("ferryman_controller_reachable", int(pool.reachable), pool=name)
     return m.render()
 
 
-def coordinator_metrics(co: Coordinator) -> str:
+def controller_metrics(co: Controller) -> str:
     m = Exposition()
-    m.add("ferryman_coordinator_info", 1, version=__version__)
+    m.add("ferryman_controller_info", 1, version=__version__)
     for pool in co.pools.values():
         _pool(m, pool.describe())
     for name in co.cfg.agents:

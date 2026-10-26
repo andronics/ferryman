@@ -1,7 +1,7 @@
-# ferryman coordinator config for the cluster. Reference: the wiki's
-# Coordinator page.
+# ferryman controller config for the cluster. Reference: the wiki's
+# Controller page.
 
-# Inside the pod: reachable through the ferryman-coordinator Service.
+# Inside the pod: reachable through the ferryman-controller Service.
 # forwarded_allow_ips: the address(es) X-Forwarded-For is trusted from, for
 # logging (Traefik's pods; "*" trusts any, acceptable behind the
 # NetworkPolicy, which admits only the agents and Traefik).
@@ -11,7 +11,7 @@ listen:
   forwarded_allow_ips: "*"
 
 # The PersistentVolumeClaim, mounted here.
-state: /var/lib/ferryman-coordinator
+state: /var/lib/ferryman-controller
 
 # The web UI at /ui/, behind Traefik's forward-auth (see the wiki).
 ui:

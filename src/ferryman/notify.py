@@ -2,7 +2,7 @@
 mail (the host's sendmail) and/or a JSON webhook.
 
 Every event is kept in a short in-memory history (`ferryman events`, the
-coordinator's UI). Only those at or above `notify.level` are sent, and not
+controller's UI). Only those at or above `notify.level` are sent, and not
 one by one: a network blip restarts every unit at once, so events are
 collected for `batch` seconds and go out as one message. A problem that
 stays open (a unit crash-looping, a transfer failing every run) is sent once

@@ -82,7 +82,7 @@ jobs:
         run: |
           uv run --no-sync python -c "from ferryman.config import Config; print('✓ ferryman.config imports successfully')"
           uv run --no-sync python -c "from ferryman.agent import Agent; print('✓ ferryman.agent imports successfully')"
-          uv run --no-sync python -c "from ferryman.coordinator import Coordinator; print('✓ ferryman.coordinator imports successfully')"
+          uv run --no-sync python -c "from ferryman.controller import Controller; print('✓ ferryman.controller imports successfully')"
           uv run --no-sync python -c "from ferryman.cli import main; print('✓ ferryman.cli imports successfully')"
           echo "✓ All critical imports successful"
 

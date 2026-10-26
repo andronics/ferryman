@@ -1,18 +1,18 @@
-# ferryman coordinator. Install to /etc/systemd/system/ferryman-coordinator.service;
+# ferryman controller. Install to /etc/systemd/system/ferryman-controller.service;
 # see the wiki's Deployment page.
 #
 # Unlike the agent it needs no root: it only reads its config and the key
 # files, and writes its state. It runs as the `ferryman` system user
 # (contrib/systemd/ferryman.sysusers), sandboxed. Give that user read access:
-#   chgrp -R ferryman /etc/ferryman/coordinator.yaml /etc/ferryman/keys
-#   chmod 0640 /etc/ferryman/coordinator.yaml /etc/ferryman/keys/*.json
+#   chgrp -R ferryman /etc/ferryman/controller.yaml /etc/ferryman/keys
+#   chmod 0640 /etc/ferryman/controller.yaml /etc/ferryman/keys/*.json
 #   chmod 0750 /etc/ferryman/keys
 #
 # ProtectHome= hides /root and /home, so the venv's Python must live
 # elsewhere: the system's if it is >= 3.13, otherwise one uv installs
 # outside home (UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv ...).
 [Unit]
-Description=ferryman coordinator: shared service-account key pools, claims and web UI
+Description=ferryman controller: shared service-account key pools, claims and web UI
 Wants=network-online.target
 After=network-online.target
 
@@ -20,14 +20,14 @@ After=network-online.target
 Type=exec
 User=ferryman
 Group=ferryman
-ExecStart=/usr/local/bin/ferryman coordinator -c /etc/ferryman/coordinator.yaml
+ExecStart=/usr/local/bin/ferryman controller -c /etc/ferryman/controller.yaml
 Restart=on-failure
 RestartSec=5
 # In-flight long polls are cut after 2s; agents simply retry.
 TimeoutStopSec=15
 
 # The config's default `state:` (pool rotation state, claims).
-StateDirectory=ferryman-coordinator
+StateDirectory=ferryman-controller
 StateDirectoryMode=0700
 UMask=0077
 

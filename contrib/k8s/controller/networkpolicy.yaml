@@ -1,15 +1,15 @@
 # Leases carry key credentials over plain HTTP: only the agents and
-# Traefik may reach the coordinator. Adjust the traefik namespace's name
+# Traefik may reach the controller. Adjust the traefik namespace's name
 # if yours differs.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: ferryman-coordinator
+  name: ferryman-controller
 spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/name: ferryman
-      app.kubernetes.io/component: coordinator
+      app.kubernetes.io/component: controller
   policyTypes: [Ingress]
   ingress:
     - from:

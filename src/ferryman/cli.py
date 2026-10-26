@@ -24,8 +24,8 @@ from .transfer import describe, iec
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 
 DEFAULT_CONFIG = Path(os.environ.get("FERRYMAN_CONFIG", "/etc/ferryman/config.yaml"))
-DEFAULT_COORDINATOR_CONFIG = Path(
-    os.environ.get("FERRYMAN_COORDINATOR_CONFIG", "/etc/ferryman/coordinator.yaml")
+DEFAULT_CONTROLLER_CONFIG = Path(
+    os.environ.get("FERRYMAN_CONTROLLER_CONFIG", "/etc/ferryman/controller.yaml")
 )
 
 
@@ -142,14 +142,14 @@ def verify(ctx: typer.Context) -> None:
     else:
         typer.echo(f"[FAIL] rclone: {cfg.rclone.binary} not found")
         failed += 1
-    if cfg.coordinator:
-        tf = cfg.coordinator.token_file
+    if cfg.controller:
+        tf = cfg.controller.token_file
         ok = os.access(tf, os.R_OK) and bool(tf.read_text().strip())
-        typer.echo(f"[{'PASS' if ok else 'FAIL'}] coordinator {cfg.coordinator.url}: token {tf}")
+        typer.echo(f"[{'PASS' if ok else 'FAIL'}] controller {cfg.controller.url}: token {tf}")
         failed += not ok
     for name, p in cfg.pools.items():
-        if p.coordinator:
-            typer.echo(f"[PASS] pool {name}: served by the coordinator")
+        if p.controller:
+            typer.echo(f"[PASS] pool {name}: served by the controller")
             continue
         pool = LocalPool(name, p, layout.pool_state(name))
         errors = []
@@ -511,21 +511,29 @@ def events(ctx: typer.Context, limit: Annotated[int, typer.Option(help="How many
     ctx.obj.show(ctx.obj.request("GET", "/v1/events", params={"limit": limit}), render)
 
 
+@app.command(hidden=True, context_settings={"ignore_unknown_options": True,
+                                            "allow_extra_args": True})  # fmt: skip
+def coordinator() -> None:
+    """Renamed in 0.3."""
+    _die("`ferryman coordinator` was renamed in 0.3: run `ferryman controller` "
+         "(config: controller.yaml, state: /var/lib/ferryman-controller)")  # fmt: skip
+
+
 @app.command()
-def coordinator(
+def controller(
     config: Annotated[
-        Path, typer.Option("--config", "-c", help="Coordinator config file")
-    ] = DEFAULT_COORDINATOR_CONFIG,
+        Path, typer.Option("--config", "-c", help="Controller config file")
+    ] = DEFAULT_CONTROLLER_CONFIG,
     log_level: Annotated[str, typer.Option(help="Python log level")] = "INFO",
 ) -> None:
-    """Run the coordinator (plain HTTP; put Traefik in front for TLS)."""
-    from .config import CoordinatorConfig
-    from .coordinator import run
+    """Run the controller (plain HTTP; put Traefik in front for TLS)."""
+    from .config import ControllerConfig
+    from .controller import run
 
     logging.basicConfig(level=log_level.upper(), stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")  # fmt: skip
     try:
-        cfg = CoordinatorConfig.load(config)
+        cfg = ControllerConfig.load(config)
     except FileNotFoundError:
         _die(f"config not found: {config}")
     except ValueError as e:
@@ -536,10 +544,10 @@ def coordinator(
 @app.command()
 def token() -> None:
     """Make an agent token: the token for the agent's token_file, and its
-    sha256 for the coordinator's config."""
+    sha256 for the controller's config."""
     import secrets
 
-    from .coordinator import token_hash
+    from .controller import token_hash
 
     t = secrets.token_urlsafe(32)
     typer.echo(f"token:        {t}")

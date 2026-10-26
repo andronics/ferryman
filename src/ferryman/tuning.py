@@ -571,17 +571,17 @@ class Tuner:
 
     @property
     def _uplink_path(self) -> str | None:
-        if self.cfg.uplink and self.agent.coordinator is not None:
+        if self.cfg.uplink and self.agent.controller is not None:
             return f"/v1/tune-lock/{self.cfg.uplink}"
         return None
 
     async def _lock_uplink(self, seconds: float) -> None:
-        """Hold the coordinator's lock on this host's uplink for the tune."""
+        """Hold the controller's lock on this host's uplink for the tune."""
         if (path := self._uplink_path) is None:
             return
-        assert self.agent.coordinator is not None
+        assert self.agent.controller is not None
         try:
-            r = await self.agent.coordinator.request("POST", path, json={"ttl": seconds + 300})
+            r = await self.agent.controller.request("POST", path, json={"ttl": seconds + 300})
         except PoolError as e:
             raise TuneError(f"cannot take the uplink {self.cfg.uplink} lock: {e}") from e
         if not r["granted"]:
@@ -590,9 +590,9 @@ class Tuner:
     async def _unlock_uplink(self) -> None:
         if (path := self._uplink_path) is None:
             return
-        assert self.agent.coordinator is not None
+        assert self.agent.controller is not None
         try:
-            await self.agent.coordinator.request("DELETE", path)
+            await self.agent.controller.request("DELETE", path)
         except PoolError as e:
             log.warning("tune: could not release the uplink lock (it expires): %s", e)
 

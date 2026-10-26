@@ -73,6 +73,8 @@ def test_rejects(make_config: Callable[..., Config], overrides: dict, message: s
         ({"units": {"u": {"mountpoint": "tv", "pool": "p"}}}, "mountpoint removed in 0.2"),
         ({"units": {"u": {"mount": False, "pool": "p"}}}, "mount removed in 0.2"),
         ({"transfers": {"t": {"unit": "u"}}}, "source is required since 0.2"),
+        ({"coordinator": {"url": "http://c", "token_file": "/t"}}, "renamed in 0.3"),
+        ({"pools": {"p": {"coordinator": True}}}, "pool p: coordinator was renamed in 0.3"),
     ],
 )
 def test_removed_keys_name_their_replacement(data: dict, message: str) -> None:  # type: ignore[type-arg]
@@ -144,7 +146,7 @@ def test_example_config_is_valid_and_complete() -> None:
     for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
         value = getattr(cfg, section)
         assert value == type(value)(), f"{section} differs from its defaults"
-    assert cfg.hostname is None and cfg.coordinator is None
+    assert cfg.hostname is None and cfg.controller is None
 
     raw = yaml.safe_load(EXAMPLE.read_text())
 
@@ -157,7 +159,7 @@ def test_example_config_is_valid_and_complete() -> None:
         assert set(raw[section]) == names(model), section
     for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
         shown = set().union(*(set(v) for v in raw[key].values()))
-        # A pool's probe is the coordinator's (the agent refuses it).
+        # A pool's probe is the controller's (the agent refuses it).
         wanted = names(model) - ({"probe"} if key == "pools" else set())
         assert shown == wanted, f"{key}: missing {wanted - shown}"
     mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
@@ -440,3 +442,12 @@ def test_port_check_names_the_clash() -> None:
         with pytest.raises(OSError, match=f"127.0.0.1:{port} is not available"):
             _port_free("127.0.0.1", port)
     _port_free("127.0.0.1", port)
+
+
+def test_the_old_coordinator_command_names_its_replacement() -> None:
+    from typer.testing import CliRunner
+
+    from ferryman.cli import app
+
+    r = CliRunner().invoke(app, ["coordinator", "-c", "/etc/ferryman/coordinator.yaml"])
+    assert r.exit_code == 1 and "ferryman controller" in r.output
