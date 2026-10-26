@@ -113,7 +113,7 @@ def agent(
     from .agent import Agent
 
     cfg = ctx.obj.config()
-    if problems := Layout(cfg).check_placeholders():
+    if problems := Layout(cfg).check_paths():
         _die("\n".join(problems))
     logging.basicConfig(
         level=log_level.upper(),
@@ -167,7 +167,7 @@ def verify(ctx: typer.Context) -> None:
         typer.echo(f"[{'PASS' if ok else 'FAIL'}] notify: mail to {', '.join(mail.to)} "
                    f"via {mail.sendmail}")  # fmt: skip
         failed += not ok
-    for problem in layout.check_placeholders():
+    for problem in layout.check_paths():
         typer.echo(f"[FAIL] {problem}")
         failed += 1
     typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s)")
@@ -187,6 +187,12 @@ def status(ctx: typer.Context) -> None:
                 f"{u['unit']:24} {u['state']:9} {_ago(u['since']):>12} {u['restarts']:>8}  "
                 f"{_warm(u.get('warm')):28}  {(u['last_error'] or '')[:60]}"
             )
+        mounts = [(u["unit"], m) for u in d["units"] for m in u.get("mounts") or []]
+        if mounts:
+            typer.echo(f"\n{'MOUNT':48} {'UNIT':24} STATE")
+            for unit, m in mounts:
+                state = m["state"] + (" (primary)" if m["primary"] else "")
+                typer.echo(f"{m['path']:48} {unit:24} {state}")
         # Read settings only where they differ from ferryman's built-ins.
         tuned = [(u["unit"], {k: v for k, v in (u.get("read") or {}).items()
                               if v["source"] != "built-in"}) for u in d["units"]]  # fmt: skip

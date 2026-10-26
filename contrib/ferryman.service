@@ -4,9 +4,9 @@
 Description=ferryman: Google Drive mounts and local->Drive moves (rclone)
 Wants=network-online.target
 After=network-online.target
-# The local root and the cache must be mounted first: set these to your
-# roots.local and paths.cache.
-#RequiresMountsFor=/pool/local /var/cache/ferryman
+# The filesystems holding your mount paths' parents, transfer sources and
+# paths.cache must be mounted first: list them here.
+#RequiresMountsFor=/pool/google /pool/ceph /var/cache/ferryman
 
 [Service]
 # The agent sends READY=1 once its API socket is up and its units are

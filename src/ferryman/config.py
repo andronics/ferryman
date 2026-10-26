@@ -1,8 +1,10 @@
-"""Config model: units (one rclone process each), pools of service-account keys,
-and transfers (move/copy/sync jobs run inside a unit's process).
+"""Config model: units (one rclone process each, with any number of mounts),
+pools of service-account keys, and transfers (move/copy/sync jobs run inside
+a unit's process).
 
-Loaded once from YAML at startup. Every path ferryman touches derives from
-`paths` and `roots` through `Layout`, so nothing else builds paths by hand.
+Loaded once from YAML at startup. Mount paths and transfer sources are
+absolute and given in full; everything ferryman keeps for itself derives
+from `paths` through `Layout`.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import re
 import socket
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from croniter import croniter
@@ -21,6 +23,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from . import placeholders as ph
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# A mount hides whatever is at its path. Never under these trees, and never
+# exactly at one of the top-level directories (below them is fine).
+_SYSTEM_TREES = tuple(map(Path, ("/proc", "/sys", "/dev", "/etc", "/usr", "/boot", "/bin",
+                                 "/sbin", "/lib", "/lib32", "/lib64")))  # fmt: skip
+_TOP_LEVEL = frozenset({"/", "/var", "/run", "/home", "/root", "/srv", "/mnt", "/media",
+                        "/opt", "/tmp", "/var/lib", "/var/cache", "/var/log"})  # fmt: skip
 
 
 class _Model(BaseModel):
@@ -32,13 +40,6 @@ class Paths(_Model):
     cache: Path = Path("/var/cache/ferryman")
     state: Path = Path("/var/lib/ferryman")
     logs: Path = Path("/var/log/ferryman")
-
-
-class Roots(_Model):
-    # Staged files waiting to be moved up live under `local`; mounts appear
-    # under `remote`. A unit's mountpoint is relative to both.
-    local: Path
-    remote: Path
 
 
 class Listen(_Model):
@@ -120,8 +121,8 @@ class UnitDefaults(_Model):
     vfs_cache_mode: CacheMode = "full"
     vfs_read_chunk_size: str = "128M"  # size of each ranged read from the remote
     vfs_read_ahead: str = "0"  # extra on-disk read-ahead; full cache mode only
-    # Mode for directories ferryman creates under roots.remote (mountpoints
-    # and their missing parents), owned by the unit's uid/gid.
+    # Mode of a mount directory ferryman creates (only the directory itself:
+    # its parent must exist), owned by the unit's uid/gid.
     dir_mode: int = 0o775
 
     @field_validator("buffer_size", "vfs_read_chunk_size", "vfs_read_ahead")
@@ -238,15 +239,35 @@ class CoordinatorRef(_Model):
     commands: bool = True
 
 
+class Mount(_Model):
+    """One path a unit's remote is mounted at. All of a unit's mounts share
+    its process, connection and VFS cache, so only FUSE options can differ
+    between them: a VFS setting that differed would give the path its own
+    cache (see the read settings, which are per unit)."""
+
+    # Absolute; takes {hostname}, {unit} and {env:NAME}.
+    path: str
+    allow_other: bool = True  # other users (a media server) may use the mount
+    default_permissions: bool = True  # the kernel enforces the mode bits
+
+    @field_validator("path")
+    @classmethod
+    def _absolute(cls, v: str) -> str:
+        ph.parse(v, ph.MOUNT)
+        if not v.startswith("/") or ".." in PurePosixPath(v).parts:
+            raise ValueError(f"mount path {v!r} must be absolute, without '..'")
+        return v
+
+
 class Unit(_Model):
-    mountpoint: str
     backend: str = "drive"
     pool: str | None = None
     drive_id: str | None = None
     # Extra rclone remote options, rendered verbatim into the unit's config.
     options: dict[str, str] = Field(default_factory=dict)
-    # false: no FUSE mount, the process is an `rclone rcd` that only runs transfers.
-    mount: bool = True
+    # The first is the process's own `rclone mount`; the rest are added to it
+    # over rc. None: no FUSE, the process is an `rclone rcd`.
+    mounts: list[Mount] = Field(default_factory=list)
     uid: int | None = None
     gid: int | None = None
     cache_max_size: str | None = None
@@ -271,14 +292,6 @@ class Unit(_Model):
     def _mode(cls, v: object) -> object:
         return _cache_mode(v)
 
-    @field_validator("mountpoint")
-    @classmethod
-    def _relative(cls, v: str) -> str:
-        p = PurePosixPath(v)
-        if not v or p.is_absolute() or ".." in p.parts:
-            raise ValueError("mountpoint must be a relative path without '..'")
-        return str(p)
-
     @model_validator(mode="after")
     def _drive_needs_pool(self) -> Unit:
         if self.backend == "drive" and not self.pool:
@@ -289,10 +302,9 @@ class Unit(_Model):
 class Transfer(_Model):
     unit: str
     mode: Literal["move", "copy", "sync"] = "move"
-    # default: <roots.local>/<unit mountpoint>; relative paths resolve under
-    # roots.local. Takes the fixed placeholders ({hostname}, {transfer},
-    # {unit}, {env:NAME}); see placeholders.py.
-    source: Path | None = None
+    # Absolute. Takes the fixed placeholders ({hostname}, {transfer}, {unit},
+    # {env:NAME}); see placeholders.py.
+    source: str
     # Path inside the unit's remote. Takes the fixed placeholders and the
     # per-run time ones ({now:FORMAT}, {date}, {weekday}).
     dest: str = ""
@@ -326,9 +338,10 @@ class Transfer(_Model):
 
     @field_validator("source")
     @classmethod
-    def _source_placeholders(cls, v: Path | None) -> Path | None:
-        if v is not None:
-            ph.parse(str(v), ph.FIXED)
+    def _source_placeholders(cls, v: str) -> str:
+        ph.parse(v, ph.FIXED)
+        if not v.startswith("/") or ".." in PurePosixPath(v).parts:
+            raise ValueError(f"source {v!r} must be absolute, without '..'")
         return v
 
     @model_validator(mode="after")
@@ -350,7 +363,6 @@ class Config(_Model):
     hostname: str | None = None
     coordinator: CoordinatorRef | None = None
     paths: Paths = Paths()
-    roots: Roots
     api: Api = Api()
     rclone: Rclone = Rclone()
     health: Health = Health()
@@ -360,6 +372,30 @@ class Config(_Model):
     pools: dict[str, Pool] = Field(default_factory=dict)
     units: dict[str, Unit] = Field(default_factory=dict)
     transfers: dict[str, Transfer] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _removed(cls, data: Any) -> Any:
+        """Name the 0.2 replacement for a key that was removed, rather than
+        leave a bare 'extra inputs are not permitted'."""
+        if not isinstance(data, dict):
+            return data
+        if "roots" in data:
+            raise ValueError(
+                "roots was removed in 0.2: give each unit `mounts: [{path: "
+                "/absolute/path}]` and each transfer an absolute `source`"
+            )
+        for name, u in (data.get("units") or {}).items():
+            if isinstance(u, dict) and (gone := sorted({"mountpoint", "mount"} & u.keys())):
+                raise ValueError(
+                    f"unit {name}: {' and '.join(gone)} removed in 0.2: use "
+                    "`mounts: [{path: /absolute/path}]` (no mounts: no FUSE)"
+                )
+        for name, t in (data.get("transfers") or {}).items():
+            if isinstance(t, dict) and "source" not in t:
+                raise ValueError(f"transfer {name}: source is required since 0.2 "
+                                 "(an absolute path)")  # fmt: skip
+        return data
 
     @model_validator(mode="after")
     def _references(self) -> Config:
@@ -376,23 +412,14 @@ class Config(_Model):
                 if pool.coordinator:
                     raise ValueError(f"pool {name} is served by the coordinator, but no "
                                      "coordinator is configured")  # fmt: skip
-        seen: dict[str, str] = {}
         for name, unit in self.units.items():
             if unit.pool and unit.pool not in self.pools:
                 raise ValueError(f"unit {name}: unknown pool {unit.pool!r}")
-            if unit.mount:
-                if unit.mountpoint in seen:
-                    raise ValueError(
-                        f"units {seen[unit.mountpoint]} and {name} share mountpoint "
-                        f"{unit.mountpoint!r}"
-                    )
-                seen[unit.mountpoint] = name
-        for name, unit in self.units.items():
             set_here = [k for k in READ_SETTINGS if getattr(unit, k) is not None]
-            if not unit.mount and set_here:
+            if not unit.mounts and set_here:
                 raise ValueError(f"unit {name}: {', '.join(set_here)} only apply to mounts")
             r = read_settings(self, name)
-            if unit.mount and r["vfs_read_ahead"]["value"] != "0" and \
+            if unit.mounts and r["vfs_read_ahead"]["value"] != "0" and \
                     r["vfs_cache_mode"]["value"] != "full":  # fmt: skip
                 raise ValueError(f"unit {name}: vfs_read_ahead only applies with "
                                  "vfs_cache_mode: full")  # fmt: skip
@@ -419,11 +446,11 @@ class Layout:
     def api_socket(self) -> Path:
         return self.cfg.api.socket or self.cfg.paths.runtime / "api.sock"
 
-    def mount_path(self, unit: str) -> Path:
-        return self.cfg.roots.remote / self.cfg.units[unit].mountpoint
-
-    def local_path(self, unit: str) -> Path:
-        return self.cfg.roots.local / self.cfg.units[unit].mountpoint
+    def mount_paths(self, unit: str) -> list[Path]:
+        """The unit's mount paths, placeholders expanded; the first is the
+        process's own mount."""
+        values = {"hostname": self.hostname, "unit": unit}
+        return [Path(ph.expand(m.path, values)) for m in self.cfg.units[unit].mounts]
 
     def runtime_dir(self, unit: str) -> Path:
         return self.cfg.paths.runtime / "units" / unit
@@ -469,11 +496,7 @@ class Layout:
         return {"hostname": self.hostname, "transfer": name, "unit": self.cfg.transfers[name].unit}
 
     def transfer_source(self, name: str) -> Path:
-        t = self.cfg.transfers[name]
-        if t.source is None:
-            return self.local_path(t.unit)
-        src = Path(ph.expand(str(t.source), self._placeholders(name)))
-        return src if src.is_absolute() else self.cfg.roots.local / src
+        return Path(ph.expand(self.cfg.transfers[name].source, self._placeholders(name)))
 
     def transfer_dest(self, name: str, now: datetime | None = None) -> str:
         """The dest for a run starting at `now` (default: now)."""
@@ -484,17 +507,61 @@ class Layout:
         same on every run (all of it, unless it has time placeholders)."""
         return ph.fixed_prefix(self.cfg.transfers[name].dest, self._placeholders(name))
 
-    def check_placeholders(self) -> list[str]:
-        """Problems expanding each transfer's source and dest here (an unset
-        {env:NAME}), for `verify` and agent startup."""
-        problems = []
+    def check_paths(self) -> list[str]:
+        """Problems with the paths as they expand on this host, for `verify`
+        and agent startup: placeholders that don't expand (an unset
+        {env:NAME}), mount paths that would hide something, and transfer
+        sources that overlap a mount."""
+        problems: list[str] = []
+        mounts: dict[Path, str] = {}
+        for unit in self.cfg.units:
+            try:
+                paths = self.mount_paths(unit)
+            except ph.PlaceholderError as e:
+                problems.append(f"unit {unit}: {e}")
+                continue
+            for p in paths:
+                if why := self._unsafe_mount(p):
+                    problems.append(f"unit {unit}: mount path {p} {why}")
+                if p in mounts:
+                    owner = mounts[p]
+                    problems.append(f"unit {unit} mounts {p} twice" if owner == unit
+                                    else f"units {owner} and {unit} both mount {p}")  # fmt: skip
+                mounts.setdefault(p, unit)
+        for a, ua in mounts.items():
+            for b, ub in mounts.items():
+                if a != b and a.is_relative_to(b):
+                    problems.append(f"unit {ua}: mount path {a} is inside unit {ub}'s mount {b}")
         for name in self.cfg.transfers:
             try:
-                self.transfer_source(name)
+                src = self.transfer_source(name)
                 self.transfer_dest(name)
             except ph.PlaceholderError as e:
                 problems.append(f"transfer {name}: {e}")
+                continue
+            if not src.is_absolute():
+                problems.append(f"transfer {name}: source {src} is not absolute")
+            for m, unit in mounts.items():
+                if src.is_relative_to(m):
+                    problems.append(
+                        f"transfer {name}: source {src} is inside unit {unit}'s "
+                        f"mount {m}: it would move files from Drive to Drive"
+                    )
+                elif m.is_relative_to(src):
+                    problems.append(f"transfer {name}: source {src} contains unit {unit}'s "
+                                    f"mount {m}: a run would walk into the mount")  # fmt: skip
         return problems
+
+    def _unsafe_mount(self, p: Path) -> str | None:
+        if not p.is_absolute():
+            return "is not absolute"
+        if str(p) in _TOP_LEVEL or any(p.is_relative_to(t) for t in _SYSTEM_TREES):
+            return "is a system directory: mounting there would hide what is in it"
+        for own in (self.cfg.paths.runtime, self.cfg.paths.cache, self.cfg.paths.state,
+                    self.cfg.paths.logs):  # fmt: skip
+            if p.is_relative_to(own) or own.is_relative_to(p):
+                return f"overlaps ferryman's own {own}"
+        return None
 
     def leased_keys(self, pool: str) -> Path:
         # Keys leased from the coordinator, on the runtime (tmpfs) dir only.

@@ -42,12 +42,22 @@ def make_config(tmp_path: Path) -> Callable[..., Config]:
                 "state": str(tmp_path / "state"),
                 "logs": str(tmp_path / "logs"),
             },
-            "roots": {"local": str(tmp_path / "local"), "remote": str(tmp_path / "remote")},
             "pools": {"main": {"keys_dir": str(tmp_path / "keys"), "keys": KEYS}},
-            "units": {"media-tv": {"mountpoint": "media/tv", "pool": "main", "drive_id": "0A"}},
+            "units": {
+                "media-tv": {
+                    "mounts": [{"path": str(tmp_path / "remote/media/tv")}],
+                    "pool": "main",
+                    "drive_id": "0A",
+                }
+            },
             "transfers": {"media-tv": {"unit": "media-tv"}},
         }
         data.update(overrides)
+        # Every transfer needs a source; tests that don't care get one under
+        # <tmp>/local/<transfer>.
+        for name, t in (data.get("transfers") or {}).items():
+            if isinstance(t, dict):
+                t.setdefault("source", str(tmp_path / "local" / name))
         return Config.model_validate(data)
 
     return make
@@ -156,10 +166,9 @@ async def agent(
 ) -> AsyncIterator[Agent]:
     """An agent whose media-tv unit is 'ready' on the fake rc server, with
     something staged to move."""
-    # mount: false - these tests drive the rc API only; real mounts are
-    # covered by test_integration.
-    agent = Agent(make_config(units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
-                                                  "drive_id": "0A", "mount": False}}))  # fmt: skip
+    # No mounts: these tests drive the rc API only; real mounts are covered
+    # by test_integration.
+    agent = Agent(make_config(units={"media-tv": {"pool": "main", "drive_id": "0A"}}))
     agent.job_poll_interval = 0.01
     sup = agent.units["media-tv"]
     sup.layout.runtime_dir("media-tv").mkdir(parents=True)
@@ -167,6 +176,6 @@ async def agent(
     sup.key, sup.key_path = lease.key, lease.path
     sup.write_conf()
     sup.state = State.READY
-    (tmp_path / "local/media/tv").mkdir(parents=True)
+    (tmp_path / "local/media-tv").mkdir(parents=True)
     async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media-tv")):
         yield agent

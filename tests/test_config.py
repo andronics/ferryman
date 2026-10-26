@@ -12,79 +12,105 @@ from ferryman.config import Config, Layout, resolved
 def test_defaults_and_layout(make_config: Callable[..., Config], tmp_path: Path) -> None:
     cfg = make_config(defaults={"uid": 1000, "gid": 984})
     layout = Layout(cfg)
-    assert layout.mount_path("media-tv") == tmp_path / "remote/media/tv"
-    assert layout.transfer_source("media-tv") == tmp_path / "local/media/tv"
+    assert layout.mount_paths("media-tv") == [tmp_path / "remote/media/tv"]
+    assert layout.transfer_source("media-tv") == tmp_path / "local/media-tv"
     assert layout.api_socket == tmp_path / "run/api.sock"
     assert layout.rc_socket("media-tv") == tmp_path / "run/units/media-tv/rc.sock"
     assert resolved(cfg, "media-tv") == (1000, 984, "10G", True)
+    assert not layout.check_paths()
 
 
 def test_unit_overrides_defaults(make_config: Callable[..., Config]) -> None:
     cfg = make_config(
-        units={
-            "media-tv": {
-                "mountpoint": "media/tv",
-                "pool": "main",
-                "cache_max_size": "150G",
-                "warm": False,
-                "uid": 0,
-            }
-        }
+        units={"media-tv": {"pool": "main", "cache_max_size": "150G", "warm": False, "uid": 0}}
     )
     assert resolved(cfg, "media-tv") == (0, None, "150G", False)
 
 
-def test_relative_transfer_source(make_config: Callable[..., Config], tmp_path: Path) -> None:
-    cfg = make_config(transfers={"t": {"unit": "media-tv", "source": "staging/tv"}})
-    assert Layout(cfg).transfer_source("t") == tmp_path / "local/staging/tv"
+def test_mount_paths_take_placeholders(make_config: Callable[..., Config]) -> None:
+    cfg = make_config(
+        hostname="pve-02",
+        units={"tv": {"pool": "main", "mounts": [
+            {"path": "/pool/{hostname}/{unit}"},
+            {"path": "/srv/tv", "allow_other": False, "default_permissions": False},
+        ]}},
+        transfers={},
+    )  # fmt: skip
+    assert Layout(cfg).mount_paths("tv") == [Path("/pool/pve-02/tv"), Path("/srv/tv")]
+    m = cfg.units["tv"].mounts[1]
+    assert (m.allow_other, m.default_permissions) == (False, False)
+    assert cfg.units["tv"].mounts[0].allow_other  # true unless said otherwise
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"units": {"u": {"mountpoint": "x"}}}, "drive units need a pool"),
-        ({"units": {"u": {"mountpoint": "x", "pool": "nope"}}}, "unknown pool"),
-        ({"units": {"u": {"mountpoint": "/abs", "pool": "main"}}}, "relative path"),
-        ({"units": {"u": {"mountpoint": "../up", "pool": "main"}}}, "relative path"),
-        (
-            {
-                "units": {
-                    "a": {"mountpoint": "m", "pool": "main"},
-                    "b": {"mountpoint": "m", "pool": "main"},
-                }
-            },
-            "share mountpoint",
-        ),
+        ({"units": {"u": {}}}, "drive units need a pool"),
+        ({"units": {"u": {"pool": "nope"}}}, "unknown pool"),
+        ({"units": {"u": {"pool": "main", "mounts": [{"path": "rel/tv"}]}}}, "absolute"),
+        ({"units": {"u": {"pool": "main", "mounts": [{"path": "/a/../b"}]}}}, "absolute"),
+        ({"units": {"u": {"pool": "main", "mounts": [{"path": "/a/{transfer}"}]}}},
+         "not a placeholder here"),
+        ({"units": {"u": {"pool": "main", "mounts": [{"path": "/a", "uid": 0}]}}},
+         "Extra inputs"),  # VFS settings are per unit: a per-mount one would split the cache
         ({"transfers": {"t": {"unit": "missing"}}}, "unknown unit"),
+        ({"transfers": {"t": {"unit": "media-tv", "source": "staging/tv"}}}, "absolute"),
         ({"transfers": {"t": {"unit": "media-tv", "schedule": "every day"}}}, "invalid cron"),
-        ({"units": {"bad name": {"mountpoint": "x", "pool": "main"}}}, "invalid unit name"),
+        ({"units": {"bad name": {"pool": "main"}}}, "invalid unit name"),
         ({"bogus": 1}, "Extra inputs"),
     ],
-)
+)  # fmt: skip
 def test_rejects(make_config: Callable[..., Config], overrides: dict, message: str) -> None:  # type: ignore[type-arg]
     overrides.setdefault("transfers", {})
     with pytest.raises(ValidationError, match=message):
         make_config(**overrides)
 
 
-def test_transfer_only_units_may_share_mountpoint(make_config: Callable[..., Config]) -> None:
-    make_config(
-        units={
-            "a": {"mountpoint": "m", "pool": "main"},
-            "b": {"mountpoint": "m", "pool": "main", "mount": False},
-        },
-        transfers={},
-    )
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        ({"roots": {"local": "/l", "remote": "/r"}}, "roots was removed in 0.2"),
+        ({"units": {"u": {"mountpoint": "tv", "pool": "p"}}}, "mountpoint removed in 0.2"),
+        ({"units": {"u": {"mount": False, "pool": "p"}}}, "mount removed in 0.2"),
+        ({"transfers": {"t": {"unit": "u"}}}, "source is required since 0.2"),
+    ],
+)
+def test_removed_keys_name_their_replacement(data: dict, message: str) -> None:  # type: ignore[type-arg]
+    with pytest.raises(ValidationError, match=message):
+        Config.model_validate(data)
+
+
+def test_path_checks(make_config: Callable[..., Config], tmp_path: Path) -> None:
+    def problems(units: dict, transfers: dict | None = None) -> list[str]:  # type: ignore[type-arg]
+        units = {n: {"pool": "main", "mounts": [{"path": p} for p in ps]}
+                 for n, ps in units.items()}  # fmt: skip
+        return Layout(make_config(units=units, transfers=transfers or {})).check_paths()
+
+    r = str(tmp_path / "remote")
+    assert problems({"a": [f"{r}/a", f"{r}/a2"], "b": [f"{r}/b"]}) == []
+    assert "system directory" in problems({"a": ["/etc/tv"]})[0]
+    assert "system directory" in problems({"a": ["/mnt"]})[0]
+    assert problems({"a": ["/mnt/tv"]}) == []  # below a top-level directory is fine
+    assert "overlaps ferryman's own" in problems({"a": [str(tmp_path / "cache/x")]})[0]
+    assert "overlaps ferryman's own" in problems({"a": [str(tmp_path)]})[0]
+    assert problems({"a": [f"{r}/a"], "b": [f"{r}/a"]}) == [f"units a and b both mount {r}/a"]
+    assert problems({"a": [f"{r}/a", f"{r}/a"]}) == [f"unit a mounts {r}/a twice"]
+    assert "is inside unit a's mount" in problems({"a": [f"{r}/a"], "b": [f"{r}/a/b"]})[0]
+    inside = {"t": {"unit": "a", "source": f"{r}/a/staging"}}
+    assert "from Drive to Drive" in problems({"a": [f"{r}/a"]}, inside)[0]
+    above = {"t": {"unit": "a", "source": r}}
+    assert "walk into the mount" in problems({"a": [f"{r}/a"]}, above)[0]
 
 
 def test_load_yaml(tmp_path: Path) -> None:
     path = tmp_path / "c.yaml"
     path.write_text(
-        "roots: {local: /l, remote: /r}\n"
-        "units:\n  docs: {mountpoint: docs, backend: alias, options: {remote: /srv}}\n"
+        "units:\n  docs:\n    backend: alias\n    options: {remote: /srv}\n"
+        "    mounts: [{path: /pool/docs}]\n"
     )
     cfg = Config.load(path)
     assert cfg.units["docs"].options == {"remote": "/srv"}
+    assert cfg.units["docs"].mounts[0].path == "/pool/docs"
     assert cfg.paths.runtime == Path("/run/ferryman")
 
 
@@ -110,10 +136,10 @@ def test_example_config_is_valid_and_complete() -> None:
     import yaml
     from pydantic import BaseModel
 
-    from ferryman.config import Pool, Transfer, Unit
+    from ferryman.config import Mount, Pool, Transfer, Unit
 
     cfg = Config.load(EXAMPLE)
-    assert not Layout(cfg).check_placeholders()
+    assert not Layout(cfg).check_paths()
     for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
         value = getattr(cfg, section)
         assert value == type(value)(), f"{section} differs from its defaults"
@@ -131,6 +157,8 @@ def test_example_config_is_valid_and_complete() -> None:
     for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
         shown = set().union(*(set(v) for v in raw[key].values()))
         assert shown == names(model), f"{key}: missing {names(model) - shown}"
+    mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
+    assert set().union(*(set(m) for m in mounts)) == names(Mount)
 
 
 # ---------------------------------------------------------- read settings
@@ -141,7 +169,7 @@ def test_read_settings_built_in_defaults_and_unit(make_config: Callable[..., Con
 
     cfg = make_config(
         defaults={"buffer_size": "8M", "vfs_cache_mode": "full"},  # full restates the built-in
-        units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+        units={"media-tv": {"mounts": [{"path": "/pool/tv"}], "pool": "main",
                             "buffer_size": "0", "vfs_read_chunk_size": "4M"}},
     )  # fmt: skip
     assert read_settings(cfg, "media-tv") == {
@@ -156,16 +184,18 @@ def test_read_settings_built_in_defaults_and_unit(make_config: Callable[..., Con
     ("override", "error"),
     [
         ({"defaults": {"buffer_size": "16777216"}}, "needs a unit suffix"),
-        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_read_chunk_size": "4096"}}},
+        ({"units": {"m": {"mounts": [{"path": "/m"}], "pool": "main",
+                          "vfs_read_chunk_size": "4096"}}},
          "needs a unit suffix"),
-        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "most"}}},
+        ({"units": {"m": {"mounts": [{"path": "/m"}], "pool": "main", "vfs_cache_mode": "most"}}},
          "vfs_cache_mode"),
-        ({"units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "writes",
+        ({"units": {"m": {"mounts": [{"path": "/m"}], "pool": "main", "vfs_cache_mode": "writes",
                           "vfs_read_ahead": "64M"}}}, "only applies with vfs_cache_mode: full"),
         ({"defaults": {"vfs_read_ahead": "64M"},
-          "units": {"m": {"mountpoint": "m", "pool": "main", "vfs_cache_mode": "minimal"}}},
+          "units": {"m": {"mounts": [{"path": "/m"}], "pool": "main",
+                          "vfs_cache_mode": "minimal"}}},
          "only applies with vfs_cache_mode: full"),
-        ({"units": {"m": {"mountpoint": "m", "pool": "main", "mount": False,
+        ({"units": {"m": {"pool": "main",
                           "buffer_size": "0"}}}, "only apply to mounts"),
     ],
 )  # fmt: skip
@@ -180,7 +210,7 @@ def test_mount_argv_carries_read_settings(make_config: Callable[..., Config]) ->
     from ferryman.unit import UnitSupervisor
 
     cfg = make_config(
-        units={"media-tv": {"mountpoint": "media/tv", "pool": "main",
+        units={"media-tv": {"mounts": [{"path": "/pool/tv"}], "pool": "main",
                             "buffer_size": "0", "vfs_read_chunk_size": "4M",
                             "mount_args": ["--buffer-size=1M"]}},
     )  # fmt: skip
@@ -201,11 +231,10 @@ def test_bare_off_cache_mode_means_off(tmp_path: Path) -> None:
     # YAML 1.1 turns a bare `off` into false.
     path = tmp_path / "config.yaml"
     path.write_text(
-        "roots: {local: /l, remote: /r}\n"
         "pools: {p: {keys_dir: /k, keys: [a]}}\n"
         "defaults: {vfs_cache_mode: off}\n"
-        "units:\n  m: {mountpoint: m, pool: p, vfs_cache_mode: off}\n"
-        "  n: {mountpoint: n, pool: p}\n"
+        "units:\n  m: {mounts: [{path: /pool/m}], pool: p, vfs_cache_mode: off}\n"
+        "  n: {mounts: [{path: /pool/n}], pool: p}\n"
     )
     cfg = Config.load(path)
     assert cfg.defaults.vfs_cache_mode == "off"

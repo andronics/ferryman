@@ -18,12 +18,6 @@ paths:
   state: /var/lib/ferryman        # pool state, granted claims, tuning profiles
   logs: /var/log/ferryman         # one rclone log per unit, plus tune.log
 
-# Required. A unit's mountpoint is relative to both: staged files wait under
-# <local>/<mountpoint>, the mount appears at <remote>/<mountpoint>.
-roots:
-  local: /pool/local
-  remote: /pool/remote
-
 api:
   socket: null                    # null: <paths.runtime>/api.sock (the CLI talks to it)
   socket_mode: 0660               # YAML octal
@@ -41,7 +35,7 @@ rclone:
 
 health:
   interval: 120                   # seconds between health checks
-  stat_timeout: 10                # seconds a stat of a mountpoint may take before it counts as wedged
+  stat_timeout: 10                # seconds a stat of a mount path may take before it counts as wedged
 
 notify:
   level: warning                  # info | warning | error: the least severe event sent
@@ -64,7 +58,7 @@ defaults:
   cache_max_size: 10G             # per mount (--vfs-cache-max-size): not a total
   cache_min_free_space: 100G      # --vfs-cache-min-free-space, guards the shared cache disk
   warm: true                      # walk the dir cache after each start
-  dir_mode: 0775                  # mode of mount dirs ferryman creates (YAML octal)
+  dir_mode: 0775                  # mode of a mount dir ferryman creates; its parent must exist (YAML octal)
   # How mounts read (sizes need a suffix: a bare number is KiB to rclone).
   # Small on purpose: scanners open every file to probe it, and each open
   # pulls the read-ahead window into the cache.
@@ -118,36 +112,45 @@ pools:
   # shared: {coordinator: true}
 
 # One rclone process per unit. Names: letters, digits, _ . - (not leading).
+# Mount paths are absolute; ferryman creates the last directory only, so the
+# parent must exist. Never a system directory, inside another mount, or
+# overlapping a transfer's source (checked by `ferryman verify` and at start).
 units:
   media-tv:                       # a shared drive, mounted for a media server
     drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive's id (from its URL)
-    mountpoint: media/tv          # -> /pool/remote/media/tv, staging /pool/local/media/tv
     pool: uploads                 # required for drive units
-    uid: 1000                     # override defaults.uid/gid for this mount
-    gid: 1000
+    uid: 1000                     # unit-level: every mount of the unit shares one cache,
+    gid: 1000                     #   so uid/gid and the read settings apply to all of them
     cache_max_size: 150G          # a library worth caching
+    mounts:                       # the first runs the process; the rest join it
+      - path: /pool/google/media/tv
+        allow_other: true         # other users (the media server) may use it (default)
+        default_permissions: true # the kernel enforces mode bits (default)
+      - path: /pool/google/{hostname}/tv   # placeholders: {hostname} {unit} {env:NAME}
+        allow_other: false        # this path for root only; same files, same cache
   media-movies:
     drive_id: 0ABBBBBBBBBBBBBBBBB
-    mountpoint: media/movies
     pool: uploads
     warm: false                   # skip the dir-cache walk after start
     mount_args: [--read-only]     # extra flags, appended to `rclone mount`
+    mounts:
+      - path: /pool/google/media/movies
   media-music:                    # many small random reads: fetch less per open
     drive_id: 0ADDDDDDDDDDDDDDDDD
-    mountpoint: media/music
     pool: uploads
+    mounts:
+      - path: /pool/google/media/music
     buffer_size: "0"              # no in-memory read-ahead
     vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
     vfs_cache_mode: full          # keep cached re-reads (writes would stop caching reads)
     vfs_read_ahead: "0"           # status shows each value's source: unit, defaults or built-in
-  backups:                        # transfer-only: no FUSE mount, just `rclone rcd`
+  backups:                        # no mounts: no FUSE, just `rclone rcd` for transfers
     drive_id: 0ACCCCCCCCCCCCCCCCC
-    mountpoint: backups           # still required: names the default transfer source
     pool: uploads
-    mount: false
   scratch:                        # any rclone backend; options go into its conf verbatim
     backend: alias
-    mountpoint: scratch
+    mounts:
+      - path: /pool/google/scratch
     options:
       remote: /srv/scratch
     # A drive unit's options can override what ferryman renders, e.g.
@@ -155,8 +158,9 @@ units:
 
 # Move, copy or sync jobs, run inside their unit's process.
 transfers:
-  media-tv:                       # staging: whatever lands in /pool/local/media/tv goes up
+  media-tv:                       # staging: whatever lands in the source goes up
     unit: media-tv
+    source: /pool/ceph/staging/tv # required: absolute, placeholders allowed; not in or above a mount
     mode: move                    # files are deleted locally once uploaded
     schedule: "0 */4 * * *"       # cron, host's timezone; omit to run on demand only
     min_age: 5m                   # skip files still being written
@@ -164,7 +168,7 @@ transfers:
   pve-dump:                       # a backup: a mirror per weekday, 7 rolling copies
     unit: backups
     mode: sync                    # deletes at the destination what the source lacks
-    source: /var/lib/vz/dump      # absolute, or relative to roots.local
+    source: /var/lib/vz/dump
     dest: proxmox/{hostname}/{weekday}
     schedule: "30 3 * * *"
     max_delete: 50                # abort the job after this many deletions

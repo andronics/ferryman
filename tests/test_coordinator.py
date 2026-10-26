@@ -194,11 +194,10 @@ def agent_config(tmp_path: Path, site: str, dest: str = "", mode: str = "move") 
             "hostname": hostname,
             "coordinator": {"url": "http://co", "token_file": str(root / "token")},
             "paths": {k: str(root / k) for k in ("runtime", "cache", "state", "logs")},
-            "roots": {"local": str(root / "local"), "remote": str(root / "remote")},
             "pools": {"main": {"coordinator": True}},
-            "units": {"media": {"mountpoint": "media", "pool": "main", "drive_id": "0A",
-                                "mount": False}},
-            "transfers": {"media": {"unit": "media", "dest": dest, "mode": mode}},
+            "units": {"media": {"pool": "main", "drive_id": "0A"}},
+            "transfers": {"media": {"unit": "media", "source": str(root / "local/media"),
+                                    "dest": dest, "mode": mode}},
         }
     )  # fmt: skip
 
@@ -211,7 +210,7 @@ async def ready_agent(agent: Agent) -> None:
     sup.key, sup.key_path = lease.key, lease.path
     sup.write_conf()
     sup.state = State.READY
-    (agent.layout.local_path("media")).mkdir(parents=True, exist_ok=True)
+    agent.layout.transfer_source("media").mkdir(parents=True, exist_ok=True)
 
 
 @pytest.fixture

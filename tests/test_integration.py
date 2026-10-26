@@ -42,21 +42,29 @@ async def test_mount_transfer_crash_and_api(
     backing = tmp_path / "drive"
     backing.mkdir()
     (backing / "hello.txt").write_text("hello\n")
+    (tmp_path / "remote").mkdir()
     cfg = make_config(
-        units={"docs": {"mountpoint": "docs", "backend": "alias",
-                        "options": {"remote": str(backing)}, "warm": True}},
+        units={"docs": {"backend": "alias", "options": {"remote": str(backing)}, "warm": True,
+                        "mounts": [{"path": str(tmp_path / "remote/docs")},
+                                   {"path": str(tmp_path / "remote/docs2"),
+                                    "allow_other": False}]}},
         transfers={"docs": {"unit": "docs"}},
     )  # fmt: skip
     agent = Agent(cfg)
     sup: UnitSupervisor = agent.units["docs"]
-    mount = agent.layout.mount_path("docs")
+    mount, extra = agent.layout.mount_paths("docs")
     server = await serve(agent)
     try:
         await agent.start()
         await wait_for(lambda: sup.ready)
-        assert mountutil.is_mounted(mount)
+        assert mountutil.is_mounted(mount) and mountutil.is_mounted(extra)
         assert await asyncio.to_thread((mount / "hello.txt").read_text) == "hello\n"
         await wait_for(lambda: sup.warm is not None and sup.warm["state"] == "done")
+        # One process, one VFS: a write through one path shows through the
+        # other at once, despite the 1000h dir cache.
+        await asyncio.to_thread((mount / "both.txt").write_text, "both\n")
+        assert await asyncio.to_thread((extra / "both.txt").read_text) == "both\n"
+        assert [m["state"] for m in sup.status()["mounts"]] == ["mounted", "mounted"]
 
         # A staged file moves up through the unit's own process.
         staged = tmp_path / "local/docs/sub"
@@ -75,9 +83,18 @@ async def test_mount_transfer_crash_and_api(
         await wait_for(lambda: not sup.ready)
         await wait_for(lambda: sup.ready and sup.pid != old_pid)
         assert sup.restarts == 1
-        assert await mountutil.responsive(mount)
-        assert await asyncio.to_thread((mount / "hello.txt").read_text) == "hello\n"
+        assert await mountutil.responsive(mount) and await mountutil.responsive(extra)
+        assert await asyncio.to_thread((extra / "hello.txt").read_text) == "hello\n"
         assert await agent.check_health() == {"docs": "healthy"}
+
+        # An extra mount lost on its own is re-added in place: no restart.
+        assert await mountutil.unmount(extra)
+        health = await agent.check_health()
+        assert health["docs"] == f"healthy; {extra} not mounted: re-mounted", health
+        assert sup.restarts == 1 and mountutil.is_mounted(extra)
+        assert await asyncio.to_thread((extra / "hello.txt").read_text) == "hello\n"
+        kinds = [e["kind"] for e in agent.notifier.recent(10)]
+        assert "mount.lost" in kinds and kinds[-1] == "mount.recovered"
 
         # The CLI against the live API (in a thread: it is a blocking client).
         def cli(*args: str) -> str:
@@ -94,7 +111,7 @@ async def test_mount_transfer_crash_and_api(
     finally:
         await agent.stop()
         await server.stop()
-    assert not mountutil.is_mounted(mount)
+    assert not mountutil.is_mounted(mount) and not mountutil.is_mounted(extra)
     assert not agent.layout.api_socket.exists()
 
 
@@ -103,11 +120,12 @@ async def test_stop_while_starting_is_prompt(
 ) -> None:
     backing = tmp_path / "drive"
     backing.mkdir()
+    (tmp_path / "remote").mkdir()
     cfg = make_config(
         units={
-            "docs": {"mountpoint": "docs", "backend": "alias", "options": {"remote": str(backing)}},
-            "rcd": {"mountpoint": "rcd", "backend": "alias", "mount": False,
-                    "options": {"remote": str(backing)}},
+            "docs": {"backend": "alias", "options": {"remote": str(backing)},
+                     "mounts": [{"path": str(tmp_path / "remote/docs")}]},
+            "rcd": {"backend": "alias", "options": {"remote": str(backing)}},
         },
         transfers={},
     )  # fmt: skip
@@ -117,7 +135,7 @@ async def test_stop_while_starting_is_prompt(
     async with asyncio.timeout(5):
         await agent.stop()
     assert all(sup.state.value == "stopped" for sup in agent.units.values())
-    assert not mountutil.is_mounted(agent.layout.mount_path("docs"))
+    assert not mountutil.is_mounted(agent.layout.mount_paths("docs")[0])
 
 
 async def test_backup_sync_through_an_rcd_unit(
@@ -132,8 +150,7 @@ async def test_backup_sync_through_an_rcd_unit(
     (dump / "vzdump-101.vma.zst.tmp").write_text("partial\n")
     cfg = make_config(
         hostname="pve-01",
-        units={"backups": {"mountpoint": "backups", "backend": "alias", "mount": False,
-                           "options": {"remote": str(backing)}}},
+        units={"backups": {"backend": "alias", "options": {"remote": str(backing)}}},
         transfers={"dump": {"unit": "backups", "mode": "sync", "source": str(dump),
                             "dest": "proxmox/{hostname}", "exclude": ["*.tmp"]}},
     )  # fmt: skip
