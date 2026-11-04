@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""meta media: the media centre's module for the `meta` front door (brain record 0019).
+
+Reads the *arr apps, qBittorrent and LazyLibrarian over their HTTP APIs and answers the verbs the
+`meta` core runs: status, list, show and queue. Read-only: HTTP GETs only, plus qBittorrent's login
+POST, which only opens a session, and LazyLibrarian's read commands, sent as a POST body so its key
+stays out of URLs. Standard library only.
+
+Credentials come from `pass show services/<app>/<field>` at run time, are held in memory and sent
+in a header or a POST body; never in argv, the environment, output, a cache or a log.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from http.cookies import SimpleCookie
+from typing import Any, NoReturn
+
+CENTRE = "media"
+PROG = f"meta {CENTRE}"
+WIDTH = 100
+PER_REQUEST_TIMEOUT = 5.0
+DEFAULT_BUDGET = 20.0
+
+MANIFEST: dict[str, Any] = {
+    "meta": 1,
+    "centre": CENTRE,
+    "owner": "media-coordinator",
+    "summary": "The *arr apps, qBittorrent and LazyLibrarian: reachable, health, queues",
+    "verbs": {
+        "status": {
+            "summary": "each app reachable, its queue and health; qBittorrent speeds",
+            "cache": 60,
+        },
+        "list": {"summary": "apps", "args": ["what"], "complete": ["apps"], "cache": 900},
+        "show": {
+            "summary": "one app in detail",
+            "args": ["app"],
+            "complete": "list apps",
+            "cache": 60,
+        },
+        "queue": {"summary": "the download queue across qBittorrent and the *arrs", "cache": 30},
+    },
+    "results": [1, 5],
+}
+
+
+@dataclass(frozen=True)
+class App:
+    name: str
+    kind: str  # arr, bazarr, qbittorrent, lazylibrarian
+    host: str  # the ingress host's first label
+    api: str = ""  # *arr API version path, e.g. "v3"
+    has_queue: bool = False
+    fields: tuple[str, ...] = ("api-key",)
+
+
+APPS: dict[str, App] = {
+    a.name: a
+    for a in (
+        App("sonarr", "arr", "sonarr", "v3", True),
+        App("radarr", "arr", "radarr", "v3", True),
+        App("lidarr", "arr", "lidarr", "v1", True),
+        App("readarr", "arr", "readarr", "v1", True),
+        App("prowlarr", "arr", "prowlarr", "v1", False),
+        App("bazarr", "bazarr", "bazarr"),
+        App("qbittorrent", "qbittorrent", "qbt", fields=("webui-username", "webui-password")),
+        App("lazylibrarian", "lazylibrarian", "lazylibrarian"),
+    )
+}
+
+
+class Unreachable(Exception):
+    """The app did not answer with its API; the message is safe to print."""
+
+
+class NoCredential(Exception):
+    """A pass entry is missing; the message names the path only."""
+
+
+# ---------------------------------------------------------------- config and credentials
+
+
+def app_url(app: App) -> str:
+    """The app's base URL: MEDIA_META_<APP>_URL, else its ingress host. "off" disables it."""
+    override = os.environ.get(f"MEDIA_META_{app.name.upper()}_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    return f"https://{app.host}.andronics.io"
+
+
+def enabled(app: App) -> bool:
+    return app_url(app).lower() != "off"
+
+
+def url_host(app: App) -> str:
+    url = app_url(app)
+    if url.lower() == "off":
+        return "off"
+    parts = urllib.parse.urlsplit(url)
+    return parts.netloc or url
+
+
+def credential(app: App, fld: str, deadline: float) -> str:
+    """Read services/<app>/<field> from pass into memory. Never printed."""
+    path = f"services/{app.name}/{fld}"
+    if shutil.which("pass") is None:
+        raise NoCredential(f"no credential at {path} (pass not found)")
+    try:
+        proc = subprocess.run(
+            ["pass", "show", path],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=max(1.0, min(10.0, deadline - time.monotonic())),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise NoCredential(f"no credential at {path} (pass did not answer)") from None
+    value = proc.stdout.decode("utf-8", "replace").split("\n", 1)[0].strip()
+    if proc.returncode != 0 or not value:
+        raise NoCredential(f"no credential at {path}")
+    return value
+
+
+# ---------------------------------------------------------------- HTTP
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+@dataclass
+class Response:
+    status: int
+    body: bytes
+    headers: Any = None
+
+    def json(self) -> Any:
+        try:
+            return json.loads(self.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise Unreachable(
+                "answered, but not with the app's API (a web page or another server)"
+            ) from None
+
+
+def request(
+    url: str,
+    deadline: float,
+    headers: dict[str, str] | None = None,
+    data: dict[str, str] | None = None,
+) -> Response:
+    """One GET (or a form POST when data is given). Errors become Unreachable, safe to print."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.2:
+        raise Unreachable("out of time")
+    timeout = min(PER_REQUEST_TIMEOUT, remaining)
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, headers=headers or {})
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "meta-media/1")
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return Response(resp.status, resp.read(4_000_000), resp.headers)
+    except urllib.error.HTTPError as e:
+        status = e.code
+        if 300 <= status < 400:
+            target = urllib.parse.urlsplit(e.headers.get("Location", "")).netloc
+            if target.startswith("auth."):
+                raise Unreachable(f"sent to sign-in at {target} (edge single sign-on)") from None
+            raise Unreachable(f"redirected ({status}) to {target or 'elsewhere'}") from None
+        if status in (401, 403):
+            raise Unreachable(f"credential refused ({status})") from None
+        raise Unreachable(f"HTTP {status}") from None
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, socket.gaierror):
+            raise Unreachable("name not found") from None
+        if isinstance(reason, ConnectionRefusedError):
+            raise Unreachable("connection refused") from None
+        if isinstance(reason, TimeoutError):
+            raise Unreachable(f"no answer in {timeout:.0f}s") from None
+        if isinstance(reason, ssl.SSLError):
+            raise Unreachable("TLS error") from None
+        raise Unreachable("unreachable") from None
+    except TimeoutError:
+        raise Unreachable(f"no answer in {timeout:.0f}s") from None
+    except (OSError, ValueError):
+        raise Unreachable("unreachable") from None
+
+
+# ---------------------------------------------------------------- probing one app
+
+
+@dataclass
+class Probe:
+    """What one app said. Only names, counts, versions and states; no paths, hashes or URLs."""
+
+    app: App
+    reachable: bool = False
+    state: str = "unknown"  # ok, warn, fail, unknown
+    detail: str = ""
+    version: str = ""
+    queue_count: int | None = None
+    health: list[dict[str, str]] = field(default_factory=list)
+    queue: list[dict[str, Any]] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+def _arr(p: Probe, base: str, deadline: float, want_queue: bool) -> None:
+    app = p.app
+    hdr = {"X-Api-Key": credential(app, "api-key", deadline)}
+    api = f"{base}/api/{app.api}"
+    status = request(f"{api}/system/status", deadline, hdr).json()
+    if not isinstance(status, dict) or "version" not in status:
+        raise Unreachable("answered, but not with the app's API")
+    p.reachable = True
+    p.version = str(status.get("version", ""))
+    for item in request(f"{api}/health", deadline, hdr).json() or []:
+        if isinstance(item, dict) and item.get("type") in ("warning", "error"):
+            p.health.append(
+                {
+                    "source": str(item.get("source", "")),
+                    "type": str(item.get("type", "")),
+                    "message": str(item.get("message", "")),
+                }
+            )
+    if app.has_queue:
+        size = 200 if want_queue else 1
+        q = request(f"{api}/queue?page=1&pageSize={size}", deadline, hdr).json()
+        if isinstance(q, dict):
+            p.queue_count = int(q.get("totalRecords", 0) or 0)
+            for rec in q.get("records", []) if want_queue else []:
+                if not isinstance(rec, dict):
+                    continue
+                total = float(rec.get("size", 0) or 0)
+                left = float(rec.get("sizeleft", 0) or 0)
+                p.queue.append(
+                    {
+                        "source": app.name,
+                        "name": str(rec.get("title", "")),
+                        "progress": round(1 - left / total, 3) if total > 0 else 0.0,
+                        "state": str(rec.get("trackedDownloadState") or rec.get("status") or ""),
+                        "size": int(total),
+                    }
+                )
+
+
+def _bazarr(p: Probe, base: str, deadline: float, want_queue: bool) -> None:
+    hdr = {"X-API-KEY": credential(p.app, "api-key", deadline)}
+    status = request(f"{base}/api/system/status", deadline, hdr).json()
+    data = status.get("data") if isinstance(status, dict) else None
+    if not isinstance(data, dict):
+        raise Unreachable("answered, but not with the app's API")
+    p.reachable = True
+    p.version = str(data.get("bazarr_version", ""))
+    health = request(f"{base}/api/system/health", deadline, hdr).json()
+    for item in health.get("data", []) if isinstance(health, dict) else []:
+        if isinstance(item, dict):
+            p.health.append(
+                {
+                    "source": str(item.get("object", "")),
+                    "type": "warning",
+                    "message": str(item.get("issue", "")),
+                }
+            )
+
+
+_QBT_DOWNLOADING = {
+    "downloading",
+    "metaDL",
+    "forcedMetaDL",
+    "stalledDL",
+    "queuedDL",
+    "forcedDL",
+    "checkingDL",
+    "pausedDL",
+    "stoppedDL",
+    "allocating",
+}
+
+
+def _qbittorrent(p: Probe, base: str, deadline: float, want_queue: bool) -> None:
+    user = credential(p.app, "webui-username", deadline)
+    password = credential(p.app, "webui-password", deadline)
+    login = request(
+        f"{base}/api/v2/auth/login",
+        deadline,
+        {"Referer": base, "Origin": base},
+        {"username": user, "password": password},
+    )
+    if b"Fails" in login.body:
+        raise Unreachable("login refused")
+    cookies: SimpleCookie = SimpleCookie()
+    raw_cookies = login.headers.get_all("Set-Cookie") if login.headers is not None else None
+    for raw in raw_cookies or []:
+        cookies.load(raw)
+    hdr = {"Referer": base}
+    if cookies:
+        hdr["Cookie"] = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
+    version = request(f"{base}/api/v2/app/version", deadline, hdr)
+    text = version.body.decode("utf-8", "replace").strip()
+    if not text or text.startswith("<"):
+        raise Unreachable("answered, but not with the app's API")
+    p.reachable = True
+    p.version = text
+    info = request(f"{base}/api/v2/transfer/info", deadline, hdr).json()
+    if not isinstance(info, dict):
+        raise Unreachable("answered, but not with the app's API")
+    torrents = request(f"{base}/api/v2/torrents/info", deadline, hdr).json()
+    if not isinstance(torrents, list):
+        raise Unreachable("answered, but not with the app's API")
+    active = stalled = 0
+    for t in torrents:
+        if not isinstance(t, dict):
+            continue
+        state = str(t.get("state", ""))
+        if (t.get("dlspeed") or 0) > 0 or (t.get("upspeed") or 0) > 0:
+            active += 1
+        if state == "stalledDL":
+            stalled += 1
+        if state in _QBT_DOWNLOADING and float(t.get("progress", 0) or 0) < 1:
+            p.queue.append(
+                {
+                    "source": "qbittorrent",
+                    "name": str(t.get("name", "")),
+                    "progress": round(float(t.get("progress", 0) or 0), 3),
+                    "state": state,
+                    "size": int(t.get("size", 0) or 0),
+                }
+            )
+    p.queue_count = len(p.queue)
+    if not want_queue:
+        p.queue = []
+    p.extra = {
+        "down_speed": int(info.get("dl_info_speed", 0) or 0),
+        "up_speed": int(info.get("up_info_speed", 0) or 0),
+        "active": active,
+        "stalled": stalled,
+        "torrents": len(torrents),
+    }
+
+
+def _lazylibrarian(p: Probe, base: str, deadline: float, want_queue: bool) -> None:
+    key = credential(p.app, "api-key", deadline)
+    # The key goes in the POST body, never the URL (CherryPy reads form fields like query ones).
+    resp = request(f"{base}/api", deadline, data={"apikey": key, "cmd": "getVersion"})
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise Unreachable("answered, but not with the app's API")
+    p.reachable = True
+    p.version = str(data.get("current_version") or data.get("version") or "")
+    p.extra["last_search"] = None
+    p.extra["last_search_why"] = "its API gives no last-search time"
+
+
+_PROBERS = {
+    "arr": _arr,
+    "bazarr": _bazarr,
+    "qbittorrent": _qbittorrent,
+    "lazylibrarian": _lazylibrarian,
+}
+
+
+def probe(app: App, deadline: float, want_queue: bool = False) -> Probe:
+    p = Probe(app)
+    try:
+        _PROBERS[app.kind](p, app_url(app), deadline, want_queue)
+    except NoCredential as e:
+        p.state, p.detail = "unknown", str(e)
+        return p
+    except Unreachable as e:
+        p.state = "fail"
+        p.detail = str(e) if not p.reachable else f"reachable, then {e}"
+        return p
+    judge(p)
+    return p
+
+
+def judge(p: Probe) -> None:
+    parts: list[str] = []
+    state = "ok"
+    if p.queue_count is not None:
+        parts.append(f"queue {p.queue_count}")
+    if p.app.kind == "qbittorrent":
+        x = p.extra
+        parts = [
+            f"down {human_speed(x['down_speed'])}",
+            f"up {human_speed(x['up_speed'])}",
+            f"{x['active']} active",
+            f"{x['stalled']} stalled",
+        ]
+        if x["stalled"]:
+            state = "warn"
+    if p.app.kind == "lazylibrarian":
+        parts.append(f"last search unknown: {p.extra['last_search_why']}")
+    if p.health:
+        n = len(p.health)
+        parts.append(f"{n} health warning{'s' if n != 1 else ''} ({p.health[0]['source']})")
+        state = "fail" if any(h["type"] == "error" for h in p.health) else "warn"
+    elif p.app.kind not in ("qbittorrent", "lazylibrarian"):
+        parts.append("no health warnings")
+    p.state, p.detail = state, ", ".join(parts)
+
+
+def probe_all(apps: list[App], want_queue: bool = False) -> list[Probe]:
+    """Probe apps in parallel inside META_TIMEOUT; an app that runs out of time is a fail."""
+    try:
+        budget = float(os.environ.get("META_TIMEOUT", DEFAULT_BUDGET))
+    except ValueError:
+        budget = DEFAULT_BUDGET
+    start = time.monotonic()
+    deadline = start + max(1.0, budget - 1.0)
+    results: dict[str, Probe] = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(apps)))
+    futures = {pool.submit(probe, a, deadline, want_queue): a for a in apps}
+    done, _ = concurrent.futures.wait(futures, timeout=max(0.5, deadline - time.monotonic() + 0.5))
+    for fut in done:
+        results[futures[fut].name] = fut.result()
+    for a in futures.values():
+        if a.name not in results:
+            results[a.name] = Probe(a, state="fail", detail="no answer in the time allowed")
+    pool.shutdown(wait=False, cancel_futures=True)
+    return [results[a.name] for a in apps]
+
+
+# ---------------------------------------------------------------- output
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def human_speed(n: float) -> str:
+    return human_size(n) + "/s"
+
+
+def out(line: str = "") -> None:
+    sys.stdout.write(line[:WIDTH].rstrip() + "\n")
+
+
+def warn(msg: str) -> None:
+    sys.stderr.write(f"{PROG}: {msg}"[:WIDTH] + "\n")
+
+
+def emit_json(value: Any) -> None:
+    sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+def want_json(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False)) or os.environ.get("META_JSON") == "1"
+
+
+_ORDER = {"ok": 0, "unknown": 1, "warn": 2, "fail": 3}
+
+
+def exit_for(probes: list[Probe], results: list[str]) -> int:
+    if probes and not any(p.reachable for p in probes) and any(p.state == "fail" for p in probes):
+        return 4
+    return 0 if all(s == "ok" for s in results) else 1
+
+
+# ---------------------------------------------------------------- verbs
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    apps = [a for a in APPS.values() if enabled(a)]
+    probes = probe_all(apps)
+    states = [p.state for p in probes]
+    worst = max(states, key=lambda s: _ORDER[s]) if states else "unknown"
+    reachable = sum(p.reachable for p in probes)
+    warnings = sum(len(p.health) for p in probes)
+    queued = sum(p.queue_count or 0 for p in probes if p.app.kind == "arr")
+    summary = (
+        f"{reachable} of {len(probes)} apps reachable, {warnings} health warnings, "
+        f"{queued} in the *arr queues"
+    )
+    code = exit_for(probes, states)
+    if code == 4:
+        warn("no media app answered")
+    if want_json(args):
+        emit_json(
+            {
+                "summary": summary,
+                "state": worst,
+                "checks": [
+                    {"name": p.app.name, "state": p.state, "detail": p.detail} for p in probes
+                ],
+            }
+        )
+        return code
+    out(f"{worst}: {summary}")
+    for p in probes:
+        out(f"{p.state:<8}{p.app.name:<15}{p.detail}")
+    return code
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    names = sorted(APPS)
+    if want_json(args):
+        emit_json(
+            [{"name": n, "url_host": url_host(APPS[n]), "enabled": enabled(APPS[n])} for n in names]
+        )
+        return 0
+    for n in names:
+        out(n)
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    app = APPS.get(args.app)
+    if app is None:
+        warn(f"no app named {args.app!r}; see `meta media list apps`")
+        return 5
+    if not enabled(app):
+        fields_off: dict[str, Any] = {"name": app.name, "url_host": "off", "enabled": False}
+        if want_json(args):
+            emit_json(fields_off)
+        else:
+            out(f"name: {app.name}")
+            out("enabled: no (MEDIA_META_" + app.name.upper() + "_URL=off)")
+        return 0
+    p = probe_all([app])[0]
+    data: dict[str, Any] = {
+        "name": app.name,
+        "url_host": url_host(app),
+        "version": p.version or None,
+        "reachable": p.reachable,
+        "state": p.state,
+        "detail": p.detail,
+        "queue": p.queue_count,
+        "health_warnings": p.health,
+    }
+    if app.kind == "qbittorrent" and p.reachable:
+        data.update(p.extra)
+    if app.kind == "lazylibrarian" and p.reachable:
+        data["last_search"] = None
+        data["last_search_why"] = p.extra.get("last_search_why")
+    code = 4 if p.state == "fail" and not p.reachable else 0
+    if want_json(args):
+        emit_json(data)
+        return code
+    out(f"name: {app.name}")
+    out(f"url host: {data['url_host']}")
+    out(f"version: {p.version or 'unknown'}")
+    out(f"reachable: {'yes' if p.reachable else 'no'}")
+    out(f"state: {p.state}")
+    if p.queue_count is not None:
+        out(f"queue: {p.queue_count}")
+    if app.kind == "qbittorrent" and p.reachable:
+        x = p.extra
+        out(f"down speed: {human_speed(x['down_speed'])}")
+        out(f"up speed: {human_speed(x['up_speed'])}")
+        out(f"active: {x['active']}")
+        out(f"stalled: {x['stalled']}")
+        out(f"torrents: {x['torrents']}")
+    if app.kind == "lazylibrarian" and p.reachable:
+        out(f"last search: unknown ({p.extra['last_search_why']})")
+    if app.kind in ("arr", "bazarr") and p.reachable:
+        out(f"health warnings: {len(p.health)}")
+    out()
+    out(p.detail)
+    for h in p.health:
+        out(f"  {h['type']}: {h['source']}: {h['message']}")
+    return code
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    apps = [a for a in APPS.values() if enabled(a) and (a.has_queue or a.kind == "qbittorrent")]
+    probes = probe_all(apps, want_queue=True)
+    items: list[dict[str, Any]] = []
+    failed = 0
+    for p in probes:
+        if not p.reachable or (p.state == "fail" and p.queue_count is None):
+            failed += 1
+            warn(f"{p.app.name}: {p.detail}")
+            continue
+        items.extend(p.queue)
+    items.sort(key=lambda i: (i["source"], i["name"].lower()))
+    code = 1 if failed else 0
+    if probes and failed == len(probes):
+        code = 4
+    if want_json(args):
+        emit_json(items)
+        return code
+    if not items:
+        out("nothing queued" if code != 4 else "no queue source answered")
+        return code
+    out(f"{'SOURCE':<12} {'DONE':>5} {'STATE':<16} {'SIZE':>9}  NAME")
+    for i in items:
+        pct = f"{i['progress'] * 100:.0f}%"
+        size = human_size(i["size"])
+        out(f"{i['source']:<12} {pct:>5} {i['state'][:16]:<16} {size:>9}  {i['name']}")
+    return code
+
+
+# ---------------------------------------------------------------- parser
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{PROG}: {message}\n")
+        raise SystemExit(2)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = Parser(
+        prog=PROG,
+        description="The media centre's module for meta: the *arr apps, qBittorrent and "
+        "LazyLibrarian. Read-only.",
+        epilog='Config: MEDIA_META_<APP>_URL overrides an app\'s URL ("off" skips it); '
+        "META_TIMEOUT is the time budget in seconds (default 20); META_JSON=1 is --json.",
+    )
+    parser.add_argument("--meta-manifest", action="store_true", help="print the manifest as JSON")
+    parser.add_argument("--json", action="store_true", help="print one JSON value")
+    sub = parser.add_subparsers(dest="verb", metavar="VERB", parser_class=Parser)
+
+    def verb(name: str, help_: str) -> argparse.ArgumentParser:
+        p = sub.add_parser(name, help=help_, description=help_)
+        p.add_argument("--json", action="store_true", help="print one JSON value")
+        return p
+
+    p_status = verb("status", "each app reachable, its queue and health; qBittorrent's speeds")
+    p_status.set_defaults(func=cmd_status)
+    p_list = verb("list", "list the things of one kind, one per line, sorted")
+    p_list.add_argument("what", choices=["apps"], help="what to list: apps")
+    p_list.set_defaults(func=cmd_list)
+    p_show = verb("show", "one app in detail: url host, version, reachable, queue, health")
+    p_show.add_argument("app", help="the app's name, from `list apps`")
+    p_show.set_defaults(func=cmd_show)
+    p_queue = verb("queue", "the download queue across qBittorrent and the *arrs")
+    p_queue.set_defaults(func=cmd_queue)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.meta_manifest:
+        emit_json(MANIFEST)
+        return 0
+    if not args.verb:
+        parser.print_help(sys.stderr)
+        return 2
+    code: int = args.func(args)
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
