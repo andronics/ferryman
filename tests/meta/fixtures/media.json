@@ -1,0 +1,181 @@
+{
+ "sonarr/api/v3/system/status": {
+  "appName": "Sonarr",
+  "version": "4.0.15.2941",
+  "isProduction": true,
+  "branch": "main"
+ },
+ "sonarr/api/v3/health": [
+  {
+   "source": "IndexerStatusCheck",
+   "type": "warning",
+   "message": "Indexers unavailable due to failures: Example",
+   "wikiUrl": "https://wiki.servarr.com/x"
+  },
+  {
+   "source": "UpdateCheck",
+   "type": "notice",
+   "message": "An update is available"
+  }
+ ],
+ "sonarr/api/v3/queue": {
+  "page": 1,
+  "pageSize": 200,
+  "totalRecords": 2,
+  "records": [
+   {
+    "id": 0,
+    "title": "Example Show S01E01 1080p",
+    "size": 2000000000,
+    "sizeleft": 500000000,
+    "status": "downloading",
+    "trackedDownloadState": "downloading",
+    "downloadId": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    "outputPath": "/pool/distributed/ingest/qbt/x",
+    "indexer": "Example Indexer",
+    "downloadClient": "qbt"
+   },
+   {
+    "id": 1,
+    "title": "Another Show S02E03 720p",
+    "size": 1000000000,
+    "sizeleft": 1000000000,
+    "status": "downloading",
+    "trackedDownloadState": "importPending",
+    "downloadId": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    "outputPath": "/pool/distributed/ingest/qbt/x",
+    "indexer": "Example Indexer",
+    "downloadClient": "qbt"
+   }
+  ]
+ },
+ "radarr/api/v3/system/status": {
+  "appName": "Radarr",
+  "version": "5.26.2.10099",
+  "isProduction": true,
+  "branch": "main"
+ },
+ "radarr/api/v3/health": [],
+ "radarr/api/v3/queue": {
+  "page": 1,
+  "pageSize": 200,
+  "totalRecords": 1,
+  "records": [
+   {
+    "id": 0,
+    "title": "Example Film 2024 2160p",
+    "size": 30000000000,
+    "sizeleft": 15000000000,
+    "status": "downloading",
+    "trackedDownloadState": "downloading",
+    "downloadId": "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    "outputPath": "/pool/distributed/ingest/qbt/x",
+    "indexer": "Example Indexer",
+    "downloadClient": "qbt"
+   }
+  ]
+ },
+ "lidarr/api/v1/system/status": {
+  "appName": "Lidarr",
+  "version": "2.13.3.4711",
+  "isProduction": true,
+  "branch": "main"
+ },
+ "lidarr/api/v1/health": [],
+ "lidarr/api/v1/queue": {
+  "page": 1,
+  "pageSize": 200,
+  "totalRecords": 0,
+  "records": []
+ },
+ "readarr/api/v1/system/status": {
+  "appName": "Readarr",
+  "version": "0.4.18.2805",
+  "isProduction": true,
+  "branch": "main"
+ },
+ "readarr/api/v1/health": [],
+ "readarr/api/v1/queue": {
+  "page": 1,
+  "pageSize": 200,
+  "totalRecords": 0,
+  "records": []
+ },
+ "prowlarr/api/v1/system/status": {
+  "appName": "Prowlarr",
+  "version": "1.37.0.5076",
+  "isProduction": true,
+  "branch": "main"
+ },
+ "prowlarr/api/v1/health": [],
+ "bazarr/api/system/status": {
+  "data": {
+   "bazarr_version": "1.5.2",
+   "python_version": "3.12.3",
+   "operating_system": "Linux"
+  }
+ },
+ "bazarr/api/system/health": {
+  "data": []
+ },
+ "qbittorrent/api/v2/app/version": "v5.1.2",
+ "qbittorrent/api/v2/transfer/info": {
+  "dl_info_speed": 1250000,
+  "up_info_speed": 300000,
+  "dl_info_data": 1,
+  "up_info_data": 2,
+  "connection_status": "connected"
+ },
+ "qbittorrent/api/v2/torrents/info": [
+  {
+   "name": "Example.Show.S01E01.1080p",
+   "hash": "0123456789abcdef0123456789abcdef01234567",
+   "progress": 0.75,
+   "state": "downloading",
+   "size": 2000000000,
+   "dlspeed": 1000000,
+   "upspeed": 0,
+   "save_path": "/pool/distributed/ingest/qbt",
+   "tracker": "https://tracker.example.test/announce/PASSKEY0123456789"
+  },
+  {
+   "name": "Example.Film.2024.2160p",
+   "hash": "1123456789abcdef0123456789abcdef01234567",
+   "progress": 0.5,
+   "state": "stalledDL",
+   "size": 30000000000,
+   "dlspeed": 0,
+   "upspeed": 0,
+   "save_path": "/pool/distributed/ingest/qbt",
+   "tracker": "https://tracker.example.test/announce/PASSKEY0123456789"
+  },
+  {
+   "name": "Seeding.Thing",
+   "hash": "2123456789abcdef0123456789abcdef01234567",
+   "progress": 1.0,
+   "state": "uploading",
+   "size": 5000000,
+   "dlspeed": 0,
+   "upspeed": 250000,
+   "save_path": "/pool/distributed/ingest/qbt",
+   "tracker": "https://tracker.example.test/announce/PASSKEY0123456789"
+  },
+  {
+   "name": "Seeding.Idle",
+   "hash": "3123456789abcdef0123456789abcdef01234567",
+   "progress": 1.0,
+   "state": "stalledUP",
+   "size": 7000000,
+   "dlspeed": 0,
+   "upspeed": 0,
+   "save_path": "/pool/distributed/ingest/qbt",
+   "tracker": "https://tracker.example.test/announce/PASSKEY0123456789"
+  }
+ ],
+ "lazylibrarian/api:getVersion": {
+  "install_type": "git",
+  "current_version": "8f2c1e0",
+  "latest_version": "8f2c1e0",
+  "commits_behind": 0
+ }
+}
