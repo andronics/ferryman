@@ -1,0 +1,70 @@
+# ferryman controller config for the cluster. Reference: the wiki's
+# Controller page.
+
+# Inside the pod: reachable through the ferryman-controller Service.
+# forwarded_allow_ips: the address(es) X-Forwarded-For is trusted from, for
+# logging (Traefik's pods; "*" trusts any, acceptable behind the
+# NetworkPolicy, which admits only the agents and Traefik).
+listen:
+  host: 0.0.0.0
+  port: 8470
+  forwarded_allow_ips: "*"
+
+# The PersistentVolumeClaim, mounted here.
+state: /var/lib/ferryman-controller
+
+# The web UI at /ui/, behind Traefik's forward-auth (see the wiki).
+ui:
+  enabled: false
+  user_header: X-authentik-username
+
+# Keys come from the ferryman-keys Secret: sa-01.json for
+# sa-01@my-project.iam.gserviceaccount.com (a Secret can't name a file
+# with an @; <client_email>.json works anywhere else).
+pools:
+  uploads:
+    keys_dir: /etc/ferryman-keys
+    keys:
+      - sa-01@my-project.iam.gserviceaccount.com
+      - sa-02@my-project.iam.gserviceaccount.com
+    # Test each exhausted key hourly with a small upload, and return it to
+    # the pool as soon as one lands, rather than after the whole
+    # quota_window (the cap is reported to roll). The drive: the first
+    # unit's on this pool (drive: first), each unit's in turn (drive:
+    # rotate), or a drive_id of its own.
+    # probe:
+    #   interval: 3600
+    #   size: 1K
+    #   drive: first
+
+# What each unit is, on whichever node runs it.
+units:
+  media-tv:
+    drive_id: 0AAAAAAAAAAAAAAAAAA
+    pool: uploads
+
+# One entry per node: the agent on each node uses the token stored under
+# its node's name in the ferryman-agent-tokens Secret (`ferryman token`
+# prints a token and its sha256). Each binds the units it runs: where it
+# mounts them. The nodes are alike, so they share one binding.
+agents:
+  talos-01: &node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    defaults:
+      uid: 1000                   # who owns the files in the mounts: the apps' uid
+      gid: 1000
+    units:
+      # Mount paths live under /var/lib/drive, the DaemonSet's Bidirectional
+      # hostPath, so they show on the node and in consumer pods. Not under
+      # /var/lib/ferryman (paths.state): the agent refuses that.
+      media-tv:
+        mounts: [{path: /var/lib/drive/media-tv}]
+    # Transfers read from paths inside the pod: add a hostPath volume for
+    # each source to the agent's daemonset.yaml, at the same path.
+    transfers: {}
+  talos-02:
+    <<: *node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+  talos-03:
+    <<: *node
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000003"

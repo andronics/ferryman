@@ -1,0 +1,40 @@
+# ferryman agent config: every setting, with its default.
+#
+# Copy to /etc/ferryman/agent.yaml. It holds only what the host itself
+# knows and what the agent needs before it can reach the controller: units,
+# transfers, pools and every other setting come from the controller's
+# config (contrib/controller.example.yaml). Check it with `ferryman verify`.
+# Unknown keys are errors, so a typo fails loudly.
+
+# The controller this agent takes its config and keys from.
+controller:
+  url: https://ferryman.example.org
+  token_file: /etc/ferryman/token # from `ferryman token`; its sha256 goes in the controller's config
+  agent: null                     # informational; the token identifies the agent
+  report_interval: 15             # seconds between status reports
+  commands: true                  # take restart/run/tune commands from the controller
+
+# What {hostname} expands to. null: $FERRYMAN_HOSTNAME, else the system's
+# name (in a pod, set the env from the node name).
+hostname: null
+
+paths:
+  runtime: /run/ferryman          # sockets, rendered rclone.conf (use tmpfs)
+  cache: /var/cache/ferryman      # VFS cache, one dir per unit; tuning's probe data
+  state: /var/lib/ferryman        # the controller's last config and leased key, tuning profiles
+  logs: /var/log/ferryman         # one rclone log per unit, plus tune.log
+
+api:
+  socket: null                    # null: <paths.runtime>/api.sock (the CLI talks to it)
+  socket_mode: 0660               # YAML octal
+  # TCP listener for /healthz, /readyz and /metrics only (no control), for
+  # Prometheus and Kubernetes probes. Off unless set:
+  listen: null
+  # listen:
+  #   host: 127.0.0.1
+  #   port: 8470
+  #   forwarded_allow_ips: 127.0.0.1    # the proxy, if one is in front
+
+rclone:
+  binary: rclone                  # >= 1.75; distribution packages are often older
+  log_level: INFO                 # rclone's --log-level

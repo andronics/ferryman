@@ -108,14 +108,15 @@ def expand(template: str, values: Mapping[str, str], now: datetime | None = None
     )
 
 
-def fixed_prefix(template: str, values: Mapping[str, str]) -> str:
+def fixed_prefix(template: str, values: Mapping[str, str], stop: frozenset[str] = TIME) -> str:
     """The part of a dest that is the same on every run: everything before
     the first time placeholder, cut back to a whole directory. With none,
-    the whole expansion."""
+    the whole expansion. `stop` adds placeholders whose value isn't known
+    here (the controller can't see an agent's environment: TIME | {"env"})."""
     out = []
     for literal, name, spec in parse(template, FIXED | TIME):
         out.append(literal)
-        if name in TIME:
+        if name in stop:
             head = "".join(out)
             return head[: head.rfind("/") + 1].rstrip("/")
         if name:

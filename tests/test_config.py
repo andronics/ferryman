@@ -73,6 +73,8 @@ def test_rejects(make_config: Callable[..., Config], overrides: dict, message: s
         ({"units": {"u": {"mountpoint": "tv", "pool": "p"}}}, "mountpoint removed in 0.2"),
         ({"units": {"u": {"mount": False, "pool": "p"}}}, "mount removed in 0.2"),
         ({"transfers": {"t": {"unit": "u"}}}, "source is required since 0.2"),
+        ({"coordinator": {"url": "http://c", "token_file": "/t"}}, "renamed in 0.3"),
+        ({"pools": {"p": {"coordinator": True}}}, "pool p: coordinator was renamed in 0.3"),
     ],
 )
 def test_removed_keys_name_their_replacement(data: dict, message: str) -> None:  # type: ignore[type-arg]
@@ -127,43 +129,31 @@ def test_transfer_dest_placeholders_and_sync_options(make_config: Callable[..., 
         make_config(transfers={"t": {"unit": "media-tv", "mode": "copy", "allow_empty": True}})
 
 
-EXAMPLE = Path(__file__).parent.parent / "contrib/config.example.yaml"
+EXAMPLE = Path(__file__).parent.parent / "contrib/agent.example.yaml"
 
 
-def test_example_config_is_valid_and_complete() -> None:
-    """contrib/config.example.yaml loads, shows the global sections at their
-    defaults, and mentions every setting, so it cannot fall behind the code."""
+def test_agent_example_is_valid_and_complete() -> None:
+    """contrib/agent.example.yaml loads, shows every setting at its default
+    (but the controller, which has none), so it cannot fall behind the code."""
     import yaml
     from pydantic import BaseModel
 
-    from ferryman.config import Mount, Pool, Serve, Transfer, Unit
+    from ferryman.config import AgentBootstrap, ControllerRef
 
-    cfg = Config.load(EXAMPLE)
-    # Its secret files and TLS certs are examples: absent here, and that's all.
-    assert [p for p in Layout(cfg).check_paths() if not p.endswith("does not exist")] == []
-    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
-        value = getattr(cfg, section)
+    b = AgentBootstrap.load(EXAMPLE)
+    for section in ("paths", "api", "rclone"):
+        value = getattr(b, section)
         assert value == type(value)(), f"{section} differs from its defaults"
-    assert cfg.hostname is None and cfg.coordinator is None
-
+    assert b.hostname is None
     raw = yaml.safe_load(EXAMPLE.read_text())
 
     def names(model: type[BaseModel]) -> set[str]:
         return {f.alias or n for n, f in model.model_fields.items()}
 
-    assert set(raw) == names(Config)
-    for section in ("paths", "api", "rclone", "health", "notify", "defaults", "tuning"):
-        model = type(getattr(cfg, section))
-        assert set(raw[section]) == names(model), section
-    for key, model in (("pools", Pool), ("units", Unit), ("transfers", Transfer)):
-        shown = set().union(*(set(v) for v in raw[key].values()))
-        # A pool's probe is the coordinator's (the agent refuses it).
-        wanted = names(model) - ({"probe"} if key == "pools" else set())
-        assert shown == wanted, f"{key}: missing {wanted - shown}"
-    mounts = [m for u in raw["units"].values() for m in u.get("mounts") or []]
-    assert set().union(*(set(m) for m in mounts)) == names(Mount)
-    serves = [sv for u in raw["units"].values() for sv in u.get("serve") or []]
-    assert set().union(*(set(sv) for sv in serves)) == names(Serve)
+    assert set(raw) == names(AgentBootstrap)
+    assert set(raw["controller"]) == names(ControllerRef)
+    for section in ("paths", "api", "rclone"):
+        assert set(raw[section]) == names(type(getattr(b, section))), section
 
 
 # ---------------------------------------------------------- read settings
@@ -440,3 +430,12 @@ def test_port_check_names_the_clash() -> None:
         with pytest.raises(OSError, match=f"127.0.0.1:{port} is not available"):
             _port_free("127.0.0.1", port)
     _port_free("127.0.0.1", port)
+
+
+def test_the_old_coordinator_command_names_its_replacement() -> None:
+    from typer.testing import CliRunner
+
+    from ferryman.cli import app
+
+    r = CliRunner().invoke(app, ["coordinator", "-c", "/etc/ferryman/coordinator.yaml"])
+    assert r.exit_code == 1 and "ferryman controller" in r.output

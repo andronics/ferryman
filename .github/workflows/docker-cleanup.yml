@@ -37,6 +37,6 @@ jobs:
           # PACKAGES_DELETE_TOKEN and this falls back to it automatically.
           token: ${{ secrets.PACKAGES_DELETE_TOKEN || secrets.GITHUB_TOKEN }}
           image-names: ferryman
-          image-tags: "dev-* feat-*"
+          image-tags: "dev-* feat-* next-*"   # next-<sha>; the `next` tag itself stays
           cut-off: 7d
           dry-run: ${{ inputs['dry-run'] || false }}

@@ -352,7 +352,7 @@ class Tuner:
 
     def unit_settings(self, unit: str) -> dict[str, Any]:
         """The unit's upload chunk size and where it comes from."""
-        u = self.agent.cfg.units[unit]
+        u = self.agent.units[unit].unit  # the running unit's own config
         if "chunk_size" in u.options:
             return {"chunk_size": u.options["chunk_size"], "source": "config"}
         if (p := self.active) and u.backend == BACKEND:
@@ -362,8 +362,8 @@ class Tuner:
     def transfer_settings(self, name: str) -> dict[str, Any]:
         """Transfers and checkers for a transfer's jobs: its own config, else
         an applied profile's transfer count (for drive units), else 8."""
-        t = self.agent.cfg.transfers[name]
-        p = self.active if self.agent.cfg.units[t.unit].backend == BACKEND else None
+        t = self.agent.transfers[name].t
+        p = self.active if self.agent.units[t.unit].unit.backend == BACKEND else None
         fallback, source = (p.transfers, "profile") if p else (DEFAULT_TRANSFERS, "default")
         return {
             "transfers": t.transfers or fallback,
@@ -436,7 +436,7 @@ class Tuner:
     def busy(self) -> str | None:
         """Why a tune would measure a shared link right now, if it would."""
         for tr in self.agent.transfers.values():
-            if tr.running and self.agent.cfg.units[tr.t.unit].backend == BACKEND:
+            if tr.running and self.agent.units[tr.t.unit].unit.backend == BACKEND:
                 return f"transfer {tr.name} is running"
         return None
 
@@ -506,8 +506,8 @@ class Tuner:
         """Compare a finished transfer run's rate with the profile in effect
         (else the latest); enough slow runs in a row mean the link changed."""
         ref = self.active or self.profile
-        t = self.agent.cfg.transfers[transfer]
-        if ref is None or self.agent.cfg.units[t.unit].backend != BACKEND:
+        t = self.agent.transfers[transfer].t
+        if ref is None or self.agent.units[t.unit].unit.backend != BACKEND:
             return
         size, files = int(result.get("bytes", 0)), int(result.get("files", 0))
         secs = float(result.get("transfer_time") or 0)
@@ -571,17 +571,17 @@ class Tuner:
 
     @property
     def _uplink_path(self) -> str | None:
-        if self.cfg.uplink and self.agent.coordinator is not None:
-            return f"/v1/tune-lock/{self.cfg.uplink}"
+        if self.cfg.uplink and self.agent.controller is not None:
+            return f"/v2/tune-lock/{self.cfg.uplink}"
         return None
 
     async def _lock_uplink(self, seconds: float) -> None:
-        """Hold the coordinator's lock on this host's uplink for the tune."""
+        """Hold the controller's lock on this host's uplink for the tune."""
         if (path := self._uplink_path) is None:
             return
-        assert self.agent.coordinator is not None
+        assert self.agent.controller is not None
         try:
-            r = await self.agent.coordinator.request("POST", path, json={"ttl": seconds + 300})
+            r = await self.agent.controller.request("POST", path, json={"ttl": seconds + 300})
         except PoolError as e:
             raise TuneError(f"cannot take the uplink {self.cfg.uplink} lock: {e}") from e
         if not r["granted"]:
@@ -590,9 +590,9 @@ class Tuner:
     async def _unlock_uplink(self) -> None:
         if (path := self._uplink_path) is None:
             return
-        assert self.agent.coordinator is not None
+        assert self.agent.controller is not None
         try:
-            await self.agent.coordinator.request("DELETE", path)
+            await self.agent.controller.request("DELETE", path)
         except PoolError as e:
             log.warning("tune: could not release the uplink lock (it expires): %s", e)
 

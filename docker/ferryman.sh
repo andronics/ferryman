@@ -8,7 +8,7 @@
 # The agent (and every CLI command) runs as root: FUSE mounts, kernel
 # read-only binds and the agent's 0660 root-owned API socket need it.
 #
-# The coordinator needs no root. Started as root (the image default), it
+# The controller needs no root. Started as root (the image default), it
 # makes sure its state directory belongs to PUID:PGID (default 1000:1000,
 # the ferryman user), then drops to that user. Started as anyone else
 # (`--user`, Kubernetes runAsUser): run as-is, and leave ownership to
@@ -29,7 +29,7 @@ for arg in "$@"; do
     esac
 done
 
-if [ "$cmd" != "coordinator" ] || [ "$(id -u)" != "0" ]; then
+if [ "$cmd" != "controller" ] || [ "$(id -u)" != "0" ]; then
     exec "$FERRYMAN_BIN" "$@"
 fi
 
@@ -39,7 +39,7 @@ case "$PUID$PGID" in
     *[!0-9]*) echo "ERROR: PUID and PGID must be numeric (got PUID=$PUID PGID=$PGID)" >&2; exit 1 ;;
 esac
 
-STATE_DIR="${FERRYMAN_COORDINATOR_STATE:-/var/lib/ferryman-coordinator}"
+STATE_DIR="${FERRYMAN_CONTROLLER_STATE:-/var/lib/ferryman-controller}"
 mkdir -p "$STATE_DIR"
 if [ "$(stat -c %u:%g "$STATE_DIR")" != "$PUID:$PGID" ]; then
     echo "INFO: Setting ownership of $STATE_DIR to $PUID:$PGID" >&2

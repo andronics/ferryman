@@ -1,0 +1,273 @@
+# ferryman controller config: every setting, with its default.
+#
+# Copy to /etc/ferryman/controller.yaml and keep what you change. Unknown
+# keys are errors, so a typo fails loudly; a config that fails a check never
+# reaches an agent.
+#
+# Units say WHAT is mounted (a drive, its key pool, how it is read). Each
+# agent's bindings say HOW that host runs it (where, as whom, with what
+# cache and servers), so one unit can be mounted differently on every host.
+# Sections down to `defaults` show their defaults exactly; pools, units and
+# agents are worked examples to adapt.
+
+listen:
+  host: 127.0.0.1
+  port: 8470
+  forwarded_allow_ips: 127.0.0.1  # Traefik's address(es), trusted for X-Forwarded-For
+
+state: /var/lib/ferryman-controller   # pool rotation state, probes
+watch_timeout: 30                 # seconds a long poll (watch, commands) waits
+
+ui:
+  enabled: false
+  user_header: X-authentik-username   # null disables the check (testing only)
+
+rclone:                           # runs key probes; needed only with `probe:`
+  binary: rclone
+  log_level: INFO
+
+# Events from every agent and the controller itself.
+events:
+  retention_days: 30              # how long the controller keeps them
+  silent_after: 120               # seconds without a report before agent.silent
+
+# Notifications: only the controller sends them (agents send it their
+# events). Without `rules`, one default rule sends every warning and error
+# to every channel, as 0.2 agents did. A firing rule opens a problem: sent
+# once, again at most every `repeat`, and closed (and its recovery sent)
+# by the matching recovery event, e.g. unit.recovered for unit.failed.
+notify:
+  batch: 60                       # collect this long, then one message per channel
+  repeat: 6h                      # re-send a problem still open after this long
+  channels: {}                    # none: nothing is sent
+  #   ops:
+  #     smtp:                     # the controller usually runs without sendmail
+  #       host: smtp.example.org
+  #       port: 587
+  #       starttls: true          # the default on 587; for 465 set ssl: true instead
+  #       user: ferryman
+  #       pass_file: /etc/ferryman/smtp.pass
+  #       from: ferryman@example.org
+  #       to: [ops@example.org]
+  #   ha:
+  #     webhook: {url: https://ha.example.org/api/webhook/ferryman, headers: {}}
+  #   local:
+  #     sendmail: {sendmail: /usr/sbin/sendmail, to: [root]}
+  rules: null                     # null: the default rule
+  # rules:
+  #   - name: errors              # every error, once, then every `repeat`
+  #     match: {severity: error}
+  #     send: [ops]
+  #   - name: crash-loop          # 3 failures of one unit on one agent in 15 minutes
+  #     match: {kind: unit.failed}
+  #     when: {count: 3, within: 15m, per: [agent, subject]}
+  #     send: [ops, ha]
+  #   - name: down-everywhere     # every agent bound to the unit failed it
+  #     match: {kind: unit.failed}
+  #     when: {agents: all-bound, within: 5m}
+  #     send: [ha]
+  #   - name: quiet-agent         # globs: kind, agent ("controller": its own), subject
+  #     match: {kind: agent.silent, agent: controller}
+  #     send: [ha]
+  #
+  # A rule can also act (`do`, with or instead of `send`): restart a unit,
+  # retry a failed transfer, run a transfer, re-tune a host, rotate a pool.
+  # Targets default to the event's own; agent/unit/transfer/pool take
+  # {agent} and {subject}. Never on events that arrived late (a backlog).
+  #   - name: heal
+  #     match: {kind: unit.failed}
+  #     when: {count: 3, within: 15m}
+  #     send: [ops]
+  #     do:
+  #       action: restart         # restart | retry | run | tune | rotate
+  #       delay: 1m               # cancelled if the unit recovers meanwhile
+  #       limit: {count: 3, within: 1h}   # most actions per target; then action.limited
+  #       every: null             # act again while the problem stays open; null: once
+  #       dry_run: false          # true: only record what it would do
+  #   - name: catch-up
+  #     match: {kind: unit.recovered, subject: media-tv}
+  #     do: {action: run, transfer: tv-staging, agent: "{agent}"}
+
+# false: every rule's `do` only records what it would have done
+# (action.planned): a kill switch, and a way to try new rules.
+actions:
+  enabled: true
+
+# Every agent's health check.
+health:
+  interval: 120                   # seconds between health checks
+  stat_timeout: 10                # seconds a stat of a mount path may take before it counts as wedged
+
+# Every agent's upload tuning; an agent's `tuning:` overrides it field by
+# field (its own uplink and memory).
+tuning:
+  budget: 32G
+  probe_bytes: 2G
+  max_memory: 2G
+  warmup: 3
+  window: 15
+  repeats: 2
+  chunk_sizes: [8M, 16M, 32M, 64M, 128M, 256M]
+  transfers: [1, 2, 4, 8, 12, 16]
+  apply: suggest
+  schedule: null
+  uplink: null
+  drift: 0.6
+  drift_runs: 3
+
+# Precedence. A unit's read policy (the read settings and warm): these,
+# then the unit, then a binding. A host's settings (uid, gid, cache sizes,
+# dir_mode): these, then the agent's `defaults`, then a binding.
+defaults:
+  uid: null
+  gid: null
+  cache_max_size: 10G             # per unit: not a total
+  cache_min_free_space: 100G
+  warm: true
+  dir_mode: 0775
+  buffer_size: 16M
+  vfs_cache_mode: full
+  vfs_read_chunk_size: 128M
+  vfs_read_ahead: "0"
+
+pools:
+  uploads:
+    keys_dir: /etc/ferryman/keys  # one <client_email>.json (or <local part>.json) per key
+    keys:
+      - sa-01@my-project.iam.gserviceaccount.com
+      - sa-02@my-project.iam.gserviceaccount.com
+    quota_window: 86400           # seconds a capped key stays exhausted, at most
+    controller: false             # always false here: these are the controller's own pools
+    # Test each exhausted key with a small upload; return it to the pool as
+    # soon as one lands. The drive: the first unit's on this pool (first),
+    # each unit's in turn (rotate), or drive_id, which wins.
+    probe:
+      interval: 3600
+      size: 1K
+      drive: first
+      drive_id: null
+
+# WHAT each unit is: no paths, no hosts. Names: letters, digits, _ . - (not
+# leading). One rclone process per unit on each agent that binds it.
+units:
+  media-tv:                       # a shared drive, mounted for media servers
+    backend: drive
+    drive_id: 0AAAAAAAAAAAAAAAAAA # the shared drive's id (from its URL)
+    pool: uploads                 # required for drive units
+    options: {}                   # extra rclone remote options, verbatim
+    warm: null                    # null: defaults
+    buffer_size: null             # read settings: null takes `defaults`
+    vfs_cache_mode: null
+    vfs_read_chunk_size: null
+    vfs_read_ahead: null
+  media-music:                    # many small random reads: fetch less per open
+    drive_id: 0ADDDDDDDDDDDDDDDDD
+    pool: uploads
+    buffer_size: "0"              # no in-memory read-ahead
+    vfs_read_chunk_size: 4M       # small ranged reads instead of 128M ones
+  media-photos:
+    drive_id: 0AEEEEEEEEEEEEEEEEE
+    pool: uploads
+  backups:                        # bound without mounts: no FUSE, just `rclone rcd` for transfers
+    drive_id: 0ACCCCCCCCCCCCCCCCC
+    pool: uploads
+  scratch:                        # any rclone backend; options go into its conf verbatim
+    backend: alias
+    options:
+      remote: /srv/scratch
+    # A drive unit's options can override what ferryman renders, e.g.
+    # chunk_size: 64M (always with a suffix: a bare number is KiB to rclone).
+
+# Each agent: its token's sha256 (`ferryman token` makes both), and HOW it
+# runs the units it binds. It may lease the pools of those units.
+#
+# Mount paths are absolute; the agent creates the last directory only, so
+# the parent must exist. Never a system directory, inside another mount, or
+# overlapping a transfer's source (the agent checks, and refuses a slice
+# that fails). Paths take {hostname} {unit} {env:NAME}.
+agents:
+  pve-01:                         # a Proxmox host: mounts, serves, uploads
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    defaults:                     # this host's own: uid, gid, cache sizes, dir_mode
+      uid: 1000
+      gid: 1000
+      cache_max_size: 50G
+      cache_min_free_space: 200G
+      dir_mode: 0775
+    tuning:                       # over the controller's, field by field
+      uplink: home
+    units:
+      media-tv:
+        mounts:                   # the first runs the process; the rest join it
+          - path: /pool/google/media/tv
+            allow_other: true     # other users (the media server) may use it (default)
+            default_permissions: true   # the kernel enforces mode bits (default)
+          - path: /pool/google/{hostname}/tv
+            allow_other: false    # this path for root only; same files, same cache
+          - path: /pool/google/ro/tv
+            read_only: true       # a kernel ro bind of the first writable mount (root only)
+        cache_max_size: 150G      # a library worth caching
+      media-music:
+        mounts: [{path: /pool/google/media/music}]
+      media-photos:               # no mounts, served instead: no FUSE
+        serve:                    # servers inside the unit's process: same cache and key
+          - type: webdav          # dlna ftp http nfs restic s3 sftp webdav
+            addr: 127.0.0.1:8081  # required and unique per host: host:port
+            htpasswd: /etc/ferryman/secrets/photos.htpasswd   # http, webdav, restic
+            cert: /etc/ferryman/tls/photos.crt                # TLS (ftp: implicit FTPS)
+            key: /etc/ferryman/tls/photos.key
+          - type: ftp
+            addr: 0.0.0.0:2121    # beyond loopback: authentication required
+            passive_port: 30000-30099   # ftp only, required; ranges may not overlap
+            user: photos          # with pass_file (s3: access key id + secret key)
+            pass_file: /etc/ferryman/secrets/photos-ftp       # read at start; mode 0600
+            options:              # passed to rclone as-is (its flag names, _ for -);
+              public_ip: 10.0.100.5   # VFS settings are refused: they are the unit's
+          - type: sftp
+            addr: 127.0.0.1:2022
+            host_key: /etc/ferryman/secrets/photos-ssh-host-key   # sftp only; mode 0600
+          - type: dlna            # no auth exists for dlna/nfs: beyond loopback only with
+            addr: :7879
+            allow_unauthenticated: true
+      backups: {}
+      scratch:
+        mounts: [{path: /pool/google/scratch}]
+    transfers:                    # this host's: each reads a local source
+      tv-staging:                 # whatever lands in the source goes up
+        unit: media-tv
+        source: /pool/ceph/staging/tv   # absolute, placeholders allowed; not in or above a mount
+        mode: move                # files are deleted locally once uploaded
+        schedule: "0 */4 * * *"   # cron, host's timezone; omit to run on demand only
+        min_age: 5m               # skip files still being written
+        exclude: ["*.part", "*.tmp"]    # rclone filter patterns to leave alone
+      pve-dump:                   # a backup: a mirror per weekday, 7 rolling copies
+        unit: backups
+        mode: sync                # deletes at the destination what the source lacks
+        source: /var/lib/vz/dump
+        dest: proxmox/{hostname}/{weekday}
+        schedule: "30 3 * * *"
+        max_delete: 50            # abort the job after this many deletions
+        allow_empty: false        # refuse a sync from an empty source (the default)
+      configs:                    # dated archives: copy, never sync, into a dated folder
+        unit: backups
+        mode: copy
+        source: /etc
+        dest: configs/{hostname}/{now:%Y/%m}
+        schedule: "0 2 1 * *"
+        transfers: 2              # pin these instead of the tuning profile (else 8)
+        checkers: 4
+
+  emby-01:                        # inside the Emby container: read-only, its own uid
+    token_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+    units:
+      media-tv:
+        mounts: [{path: /media/tv, read_only: true}]
+        uid: 1001
+        gid: 1001
+        cache_max_size: 20G
+        mount_args: []            # raw rclone flags, appended last (prefer the settings)
+        warm: false               # this host only: overrides the unit's policy
+        buffer_size: 64M
+        vfs_cache_mode: full
+        vfs_read_chunk_size: 128M
+        vfs_read_ahead: 256M

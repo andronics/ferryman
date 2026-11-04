@@ -1,4 +1,4 @@
-"""The coordinator's API, the agent's coordinator pool, and two agents sharing
+"""The controller's API, the agent's controller pool, and two agents sharing
 one pool through it."""
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ import httpx
 import pytest
 
 from ferryman.agent import Agent
-from ferryman.config import Config, CoordinatorConfig, Ui
-from ferryman.coordinator import Coordinator, build_app, overlaps, token_hash
-from ferryman.coordinator_pool import CoordinatorClient, CoordinatorError, CoordinatorPool
+from ferryman.config import Config, ControllerConfig, Ui, overlaps
+from ferryman.controller import Controller, build_app, token_hash
+from ferryman.controller_pool import ControllerClient, ControllerError, ControllerPool
 from ferryman.pool import PoolExhausted
 from ferryman.unit import State
 from tests.conftest import KEYS, FakeRclone, serve_unix, write_keys
@@ -27,30 +27,32 @@ QUOTA = "googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded"
 
 
 @pytest.fixture
-def coordinator(tmp_path: Path) -> Coordinator:
+def controller(tmp_path: Path) -> Controller:
     write_keys(tmp_path / "keys", KEYS)
-    cfg = CoordinatorConfig.model_validate(
+    cfg = ControllerConfig.model_validate(
         {
             "state": str(tmp_path / "co-state"),
             "watch_timeout": 0.5,
             "pools": {"main": {"keys_dir": str(tmp_path / "keys"), "keys": KEYS}},
+            # An agent may lease the pools of the units bound to it.
+            "units": {"tv": {"drive_id": "0A", "pool": "main"}},
             "agents": {
-                "site-a": {"token_sha256": token_hash("token-a"), "pools": ["main"]},
-                "site-b": {"token_sha256": token_hash("token-b"), "pools": ["main"]},
-                "nobody": {"token_sha256": token_hash("token-c"), "pools": []},
+                "site-a": {"token_sha256": token_hash("token-a"), "units": {"tv": {}}},
+                "site-b": {"token_sha256": token_hash("token-b"), "units": {"tv": {}}},
+                "nobody": {"token_sha256": token_hash("token-c")},
             },
         }
     )
-    return Coordinator(cfg)
+    return Controller(cfg)
 
 
 @pytest.fixture
-def transport(coordinator: Coordinator) -> httpx.ASGITransport:
-    return httpx.ASGITransport(app=build_app(coordinator))
+def transport(controller: Controller) -> httpx.ASGITransport:
+    return httpx.ASGITransport(app=build_app(controller))
 
 
-def client(transport: httpx.AsyncBaseTransport, agent: str) -> CoordinatorClient:
-    return CoordinatorClient("http://co", TOKENS[agent], transport=transport)
+def client(transport: httpx.AsyncBaseTransport, agent: str) -> ControllerClient:
+    return ControllerClient("http://co", TOKENS[agent], transport=transport)
 
 
 async def raw(transport: httpx.AsyncBaseTransport, method: str, path: str,
@@ -65,11 +67,11 @@ async def raw(transport: httpx.AsyncBaseTransport, method: str, path: str,
 
 async def test_auth_and_scope(transport: httpx.ASGITransport) -> None:
     assert (await raw(transport, "GET", "/healthz")).status_code == 200
-    assert (await raw(transport, "GET", "/v1/pools/main/lease")).status_code == 401
-    assert (await raw(transport, "GET", "/v1/pools/main/lease", "wrong")).status_code == 401
-    assert (await raw(transport, "GET", "/v1/pools/main/lease", "token-c")).status_code == 403
-    assert (await raw(transport, "GET", "/v1/pools/nope/lease", "token-a")).status_code == 404
-    r = await raw(transport, "GET", "/v1/pools/main/lease", "token-a")
+    assert (await raw(transport, "GET", "/v2/pools/main/lease")).status_code == 401
+    assert (await raw(transport, "GET", "/v2/pools/main/lease", "wrong")).status_code == 401
+    assert (await raw(transport, "GET", "/v2/pools/main/lease", "token-c")).status_code == 403
+    assert (await raw(transport, "GET", "/v2/pools/nope/lease", "token-a")).status_code == 404
+    r = await raw(transport, "GET", "/v2/pools/main/lease", "token-a")
     body = r.json()
     assert body["key"] == A and body["epoch"] == 0 and body["size"] == 3
     assert body["credentials"]["client_email"] == A
@@ -78,8 +80,8 @@ async def test_auth_and_scope(transport: httpx.ASGITransport) -> None:
 async def test_cap_hits_from_two_agents_rotate_once(transport: httpx.ASGITransport) -> None:
     a, b = client(transport, "site-a"), client(transport, "site-b")
     ra, rb = await asyncio.gather(
-        a.request("POST", "/v1/pools/main/exhausted", json={"expected": A}),
-        b.request("POST", "/v1/pools/main/exhausted", json={"expected": A}),
+        a.request("POST", "/v2/pools/main/exhausted", json={"expected": A}),
+        b.request("POST", "/v2/pools/main/exhausted", json={"expected": A}),
     )
     assert ra["key"] == rb["key"] == B
     assert ra["epoch"] == rb["epoch"] == 1
@@ -87,28 +89,28 @@ async def test_cap_hits_from_two_agents_rotate_once(transport: httpx.ASGITranspo
 
 async def test_all_exhausted_is_a_409_with_frees_at(transport: httpx.ASGITransport) -> None:
     a = client(transport, "site-a")
-    await a.request("GET", "/v1/pools/main/lease")  # settles on A
+    await a.request("GET", "/v2/pools/main/lease")  # settles on A
     for key in (A, B):
-        await a.request("POST", "/v1/pools/main/exhausted", json={"expected": key})
+        await a.request("POST", "/v2/pools/main/exhausted", json={"expected": key})
     # Only C is left: rotating by hand stays on it, a 409 rather than a server error.
-    r = await raw(transport, "POST", "/v1/pools/main/exhausted", "token-a")
+    r = await raw(transport, "POST", "/v2/pools/main/exhausted", "token-a")
     assert r.status_code == 409 and "no other usable key" in r.json()["error"]
     with pytest.raises(PoolExhausted) as exc:
-        await a.request("POST", "/v1/pools/main/exhausted", json={"expected": C})
+        await a.request("POST", "/v2/pools/main/exhausted", json={"expected": C})
     assert exc.value.frees_at > 0
     # Every key exhausted: rotating by hand gets the same answer.
-    r = await raw(transport, "POST", "/v1/pools/main/exhausted", "token-a")
+    r = await raw(transport, "POST", "/v2/pools/main/exhausted", "token-a")
     assert r.status_code == 409 and "frees_at" in r.json()
 
 
 async def test_watch_wakes_on_rotation_and_times_out(transport: httpx.ASGITransport) -> None:
     a, b = client(transport, "site-a"), client(transport, "site-b")
     # Nothing changes: the long poll returns the same epoch after the timeout.
-    r = await a.request("GET", "/v1/pools/main/watch", params={"epoch": 0})
+    r = await a.request("GET", "/v2/pools/main/watch", params={"epoch": 0})
     assert r["epoch"] == 0
-    watcher = asyncio.create_task(a.request("GET", "/v1/pools/main/watch", params={"epoch": 0}))
+    watcher = asyncio.create_task(a.request("GET", "/v2/pools/main/watch", params={"epoch": 0}))
     await asyncio.sleep(0.05)
-    await b.request("POST", "/v1/pools/main/exhausted", json={"expected": A})
+    await b.request("POST", "/v2/pools/main/exhausted", json={"expected": A})
     r = await asyncio.wait_for(watcher, 1)
     assert r["epoch"] == 1 and r["key"] == B
 
@@ -121,36 +123,13 @@ def test_overlaps() -> None:
     assert not overlaps("a/b", "a/c")
 
 
-async def test_claims(transport: httpx.ASGITransport) -> None:
-    a, b = client(transport, "site-a"), client(transport, "site-b")
-
-    def claim(t: str, dest: str, mode: str) -> dict[str, str]:
-        return {"transfer": t, "target": "drive-1", "dest": dest, "mode": mode}
-
-    r = await a.request("PUT", "/v1/claims", json=[claim("a-mirror", "backups/a", "sync")])
-    assert r == {"accepted": ["a-mirror"], "conflicts": []}
-    r = await b.request("PUT", "/v1/claims", json=[
-        claim("b-up", "backups", "move"),        # contains a's mirror: refused
-        claim("b-media", "media", "move"),       # elsewhere: fine
-    ])  # fmt: skip
-    assert r["accepted"] == ["b-media"]
-    assert r["conflicts"] == [{"transfer": "b-up", "owner": "site-a",
-                               "owner_transfer": "a-mirror"}]  # fmt: skip
-    # Two moves into the same place are fine.
-    r = await a.request("PUT", "/v1/claims", json=[claim("a-media", "media", "move")])
-    assert r["accepted"] == ["a-media"]
-    # a dropped its mirror by re-claiming without it, so b's move is now fine.
-    r = await b.request("PUT", "/v1/claims", json=[claim("b-up", "backups", "move")])
-    assert r["accepted"] == ["b-up"]
-
-
 # ------------------------------------------------------------ agent client
 
 
-async def test_coordinator_pool_writes_leased_keys(
+async def test_controller_pool_writes_leased_keys(
     transport: httpx.ASGITransport, tmp_path: Path
 ) -> None:
-    pool = CoordinatorPool("main", client(transport, "site-a"), tmp_path / "leased")
+    pool = ControllerPool("main", client(transport, "site-a"), tmp_path / "leased")
     lease = await pool.lease()
     assert lease.key == A and pool.size == 3 and pool.rotates
     assert json.loads(lease.path.read_text())["client_email"] == A
@@ -163,7 +142,7 @@ async def test_coordinator_pool_writes_leased_keys(
     assert (await pool.info())["epoch"] == 1
 
 
-async def test_coordinator_outage_keeps_last_lease(
+async def test_controller_outage_keeps_last_lease(
     transport: httpx.ASGITransport, tmp_path: Path
 ) -> None:
     class Flaky(httpx.AsyncBaseTransport):
@@ -175,16 +154,16 @@ async def test_coordinator_outage_keeps_last_lease(
             return await transport.handle_async_request(request)
 
     flaky = Flaky()
-    pool = CoordinatorPool("main", client(flaky, "site-a"), tmp_path / "leased")
-    with pytest.raises(CoordinatorError):
+    pool = ControllerPool("main", client(flaky, "site-a"), tmp_path / "leased")
+    with pytest.raises(ControllerError):
         flaky.down = True
         await pool.lease()  # never leased: nothing to fall back on
     flaky.down = False
     first = await pool.lease()
     flaky.down = True
     assert await pool.lease() == first
-    with pytest.raises(CoordinatorError):
-        await pool.exhausted(A)  # rotation needs the coordinator
+    with pytest.raises(ControllerError):
+        await pool.exhausted(A)  # rotation needs the controller
 
 
 # ------------------------------------------------------- two agents, one pool
@@ -198,9 +177,9 @@ def agent_config(tmp_path: Path, site: str, dest: str = "", mode: str = "move") 
     return Config.model_validate(
         {
             "hostname": hostname,
-            "coordinator": {"url": "http://co", "token_file": str(root / "token")},
+            "controller": {"url": "http://co", "token_file": str(root / "token")},
             "paths": {k: str(root / k) for k in ("runtime", "cache", "state", "logs")},
-            "pools": {"main": {"coordinator": True}},
+            "pools": {"main": {"controller": True}},
             "units": {"media": {"pool": "main", "drive_id": "0A"}},
             "transfers": {"media": {"unit": "media", "source": str(root / "local/media"),
                                     "dest": dest, "mode": mode}},
@@ -223,12 +202,11 @@ async def ready_agent(agent: Agent) -> None:
 async def two_agents(
     transport: httpx.ASGITransport, tmp_path: Path
 ) -> AsyncIterator[tuple[Agent, FakeRclone, Agent, FakeRclone]]:
-    a = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=transport)
-    b = Agent(agent_config(tmp_path, "site-b"), coordinator_transport=transport)
+    a = Agent(agent_config(tmp_path, "site-a"), controller_transport=transport)
+    b = Agent(agent_config(tmp_path, "site-b"), controller_transport=transport)
     fa, fb = FakeRclone(), FakeRclone()
     for agent in (a, b):
         agent.job_poll_interval = 0.01
-        agent.claim_blocks = {}  # claims have their own tests
     async with (
         serve_unix(fa.app(), a.layout.rc_socket("media")),
         serve_unix(fb.app(), b.layout.rc_socket("media")),
@@ -243,14 +221,14 @@ async def test_cap_hit_on_one_agent_moves_the_other(
 ) -> None:
     a, fa, b, fb = two_agents
     pool_b = b.pools["main"]
-    assert isinstance(pool_b, CoordinatorPool)
+    assert isinstance(pool_b, ControllerPool)
     watch = asyncio.create_task(pool_b.watch(b.apply))
     try:
         fa.job_outcomes = [QUOTA, None]
         result = await a.transfers["media"].run()
         assert result["ok"]
 
-        # site-b never hit the cap; the coordinator's epoch moved it anyway.
+        # site-b never hit the cap; the controller's epoch moved it anyway.
         async with asyncio.timeout(2):
             while b.units["media"].key != B:
                 await asyncio.sleep(0.01)
@@ -263,68 +241,12 @@ async def test_cap_hit_on_one_agent_moves_the_other(
         watch.cancel()
 
 
-async def test_conflicting_sync_claim_blocks_the_transfer(
-    transport: httpx.ASGITransport, tmp_path: Path
-) -> None:
-    owner = client(transport, "site-a")
-    await owner.request("PUT", "/v1/claims", json=[
-        {"transfer": "mirror", "target": "0A", "dest": "backups", "mode": "sync"}])  # fmt: skip
-
-    b = Agent(agent_config(tmp_path, "site-b", dest="backups/b", mode="move"),
-              coordinator_transport=transport)  # fmt: skip
-    # Never granted before: blocked until the coordinator answers.
-    assert "awaiting" in b.claim_blocks["media"]
-    task = asyncio.create_task(b._claims_loop())
-    try:
-        async with asyncio.timeout(2):
-            while "awaiting" in b.claim_blocks.get("media", "awaiting"):
-                await asyncio.sleep(0.01)
-    finally:
-        task.cancel()
-    assert "site-a's transfer mirror" in b.claim_blocks["media"]
-    result = await b.transfers["media"].run()
-    assert not result["ok"] and "overlaps" in result["error"]
-
-
-async def test_granted_claims_survive_a_coordinator_outage(
-    transport: httpx.ASGITransport, tmp_path: Path
-) -> None:
-    a = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=transport)
-    task = asyncio.create_task(a._claims_loop())
-    try:
-        async with asyncio.timeout(2):
-            while a.claim_blocks:
-                await asyncio.sleep(0.01)
-    finally:
-        task.cancel()
-    # A restarted agent that can't reach the coordinator still runs it.
-    restarted = Agent(agent_config(tmp_path, "site-a"))
-    assert restarted.claim_blocks == {}
-
-
-async def test_hostname_dests_keep_two_nodes_syncs_apart(
-    transport: httpx.ASGITransport, tmp_path: Path
-) -> None:
-    """One config on every node: `{hostname}` gives each sync its own folder."""
-    agents = [
-        Agent(agent_config(tmp_path, site, dest="backups/{hostname}", mode="sync"),
-              coordinator_transport=transport)
-        for site in ("site-a", "site-b")
-    ]  # fmt: skip
-    for agent in agents:
-        assert agent.coordinator
-        r = await agent.coordinator.request("PUT", "/v1/claims", json=agent._claims())
-        assert r == {"accepted": ["media"], "conflicts": []}
-    claims = await raw(transport, "GET", "/v1/claims", "token-a")
-    assert claims.json()["site-b"][0]["dest"] == "backups/site-b"
-
-
 # ------------------------------------------------------------- UI, commands
 
 
 @pytest.fixture
-def ui_transport(coordinator: Coordinator) -> httpx.ASGITransport:
-    co = Coordinator(coordinator.cfg.model_copy(update={"ui": Ui(enabled=True)}))
+def ui_transport(controller: Controller) -> httpx.ASGITransport:
+    co = Controller(controller.cfg.model_copy(update={"ui": Ui(enabled=True)}))
     return httpx.ASGITransport(app=build_app(co))
 
 
@@ -370,15 +292,14 @@ async def test_ui_rotate_moves_the_pool(ui_transport: httpx.ASGITransport) -> No
 async def test_report_command_and_result_round_trip(
     ui_transport: httpx.ASGITransport, tmp_path: Path, fake_rclone: FakeRclone
 ) -> None:
-    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=ui_transport)
-    agent.claim_blocks = {}
+    agent = Agent(agent_config(tmp_path, "site-a"), controller_transport=ui_transport)
     async with serve_unix(fake_rclone.app(), agent.layout.rc_socket("media")):
         await ready_agent(agent)
-        assert agent.coordinator
+        assert agent.controller
         # Commands only go to units an agent has reported.
         r = await ui(ui_transport, "POST", "/ui/api/agents/site-a/units/media/restart")
         assert r.status_code == 404
-        await agent.coordinator.request("PUT", "/v1/report", json=await agent.report())
+        await agent.controller.request("PUT", "/v2/report", json=await agent.report())
         state = (await ui(ui_transport, "GET", "/ui/api/state")).json()
         reported = state["agents"][0]
         assert reported["report"]["status"]["hostname"] == "site-a"
@@ -409,25 +330,23 @@ async def test_report_command_and_result_round_trip(
 
 
 async def test_agent_reports_bad_commands(
-    transport: httpx.ASGITransport, coordinator: Coordinator, tmp_path: Path
+    transport: httpx.ASGITransport, controller: Controller, tmp_path: Path
 ) -> None:
-    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=transport)
-    cmd = await coordinator.queue("site-a", "restart", "nope", "test")
+    agent = Agent(agent_config(tmp_path, "site-a"), controller_transport=transport)
+    cmd = await controller.queue("site-a", "restart", "nope", "test")
     assert (await agent.execute(cmd)) == {"ok": False, "error": "not found: nope"}
-    cmd = await coordinator.queue("site-a", "explode", "media", "test")
+    cmd = await controller.queue("site-a", "explode", "media", "test")
     assert "unknown action" in (await agent.execute(cmd))["error"]
-    assert [c["state"] for c in coordinator.commands] == ["failed", "failed"]
+    assert [c["state"] for c in controller.commands] == ["failed", "failed"]
 
 
-async def test_coordinator_metrics(
-    transport: httpx.ASGITransport, coordinator: Coordinator
-) -> None:
-    coordinator.report("site-a", {"status": {"units": [{"state": "ready"}, {"state": "backoff"}]}})
+async def test_controller_metrics(transport: httpx.ASGITransport, controller: Controller) -> None:
+    controller.report("site-a", {"status": {"units": [{"state": "ready"}, {"state": "backoff"}]}})
     text = (await raw(transport, "GET", "/metrics")).text
     assert 'ferryman_agent_units_ready{agent="site-a"} 1.0' in text
     assert 'ferryman_agent_units{agent="site-a"} 2.0' in text
     assert f'ferryman_pool_current_key{{pool="main",key="{A}"}} 1.0' not in text  # not settled
-    await raw(transport, "GET", "/v1/pools/main/lease", "token-a")
+    await raw(transport, "GET", "/v2/pools/main/lease", "token-a")
     text = (await raw(transport, "GET", "/metrics")).text
     assert f'ferryman_pool_current_key{{pool="main",key="{A}"}} 1.0' in text
     assert 'ferryman_agent_last_report_timestamp_seconds{agent="site-b"}' not in text
@@ -437,21 +356,21 @@ async def test_coordinator_metrics(
 
 
 async def test_tune_lock_one_agent_per_uplink(
-    transport: httpx.ASGITransport, coordinator: Coordinator
+    transport: httpx.ASGITransport, controller: Controller
 ) -> None:
     a, b = client(transport, "site-a"), client(transport, "site-b")
-    assert (await a.request("POST", "/v1/tune-lock/home", json={"ttl": 600}))["granted"]
-    r = await b.request("POST", "/v1/tune-lock/home", json={"ttl": 600})
+    assert (await a.request("POST", "/v2/tune-lock/home", json={"ttl": 600}))["granted"]
+    r = await b.request("POST", "/v2/tune-lock/home", json={"ttl": 600})
     assert r == {"granted": False, "holder": "site-a", "until": r["until"]}
-    assert (await b.request("POST", "/v1/tune-lock/office", json={"ttl": 600}))["granted"]
-    await b.request("DELETE", "/v1/tune-lock/home")  # not b's to release
-    assert not (await b.request("POST", "/v1/tune-lock/home"))["granted"]
-    await a.request("DELETE", "/v1/tune-lock/home")
-    assert (await b.request("POST", "/v1/tune-lock/home"))["granted"]
+    assert (await b.request("POST", "/v2/tune-lock/office", json={"ttl": 600}))["granted"]
+    await b.request("DELETE", "/v2/tune-lock/home")  # not b's to release
+    assert not (await b.request("POST", "/v2/tune-lock/home"))["granted"]
+    await a.request("DELETE", "/v2/tune-lock/home")
+    assert (await b.request("POST", "/v2/tune-lock/home"))["granted"]
     # A holder that never releases loses the lock when it expires.
-    coordinator.tune_locks["home"]["until"] = 0
-    assert (await a.request("POST", "/v1/tune-lock/home"))["granted"]
-    assert set(coordinator.state()["tune_locks"]) == {"home", "office"}
+    controller.tune_locks["home"]["until"] = 0
+    assert (await a.request("POST", "/v2/tune-lock/home"))["granted"]
+    assert set(controller.state()["tune_locks"]) == {"home", "office"}
 
 
 async def test_tuner_waits_for_the_uplink_lock(
@@ -461,8 +380,8 @@ async def test_tuner_waits_for_the_uplink_lock(
     from ferryman.tuning import TuneBusy
 
     agent.cfg = agent.cfg.model_copy(update={"tuning": Tuning(uplink="home")})
-    agent.coordinator = client(transport, "site-a")
-    await client(transport, "site-b").request("POST", "/v1/tune-lock/home")
+    agent.controller = client(transport, "site-a")
+    await client(transport, "site-b").request("POST", "/v2/tune-lock/home")
     tuned: list[str] = []
 
     async def fake_tune(sup: Any) -> Any:
@@ -473,21 +392,21 @@ async def test_tuner_waits_for_the_uplink_lock(
     with pytest.raises(TuneBusy, match="site-b is tuning on uplink home"):
         await agent.tuner.run()
     assert tuned == []
-    await client(transport, "site-b").request("DELETE", "/v1/tune-lock/home")
+    await client(transport, "site-b").request("DELETE", "/v2/tune-lock/home")
     with pytest.raises(RuntimeError):
         await agent.tuner.run()
     assert tuned == ["media-tv"]
     # Released even though the tune blew up.
-    assert (await client(transport, "site-b").request("POST", "/v1/tune-lock/home"))["granted"]
+    assert (await client(transport, "site-b").request("POST", "/v2/tune-lock/home"))["granted"]
 
 
 async def test_ui_tune_button_queues_a_command(
     ui_transport: httpx.ASGITransport, tmp_path: Path
 ) -> None:
     assert (await ui(ui_transport, "POST", "/ui/api/agents/site-a/tune")).status_code == 404
-    agent = Agent(agent_config(tmp_path, "site-a"), coordinator_transport=ui_transport)
-    assert agent.coordinator
-    await agent.coordinator.request("PUT", "/v1/report", json=await agent.report())
+    agent = Agent(agent_config(tmp_path, "site-a"), controller_transport=ui_transport)
+    assert agent.controller
+    await agent.controller.request("PUT", "/v2/report", json=await agent.report())
     r = await ui(ui_transport, "POST", "/ui/api/agents/site-a/tune")
     assert r.status_code == 200
     assert (r.json()["action"], r.json()["target"]) == ("tune", "drive")
@@ -495,3 +414,87 @@ async def test_ui_tune_button_queues_a_command(
     result = await agent.execute({"id": 1, "action": "tune", "target": "drive", "args": {}})
     assert result == {"ok": False, "error": "no ready drive unit to borrow a drive and key from"}
     await agent.stop()
+
+
+# ------------------------------------------------------- config for agents
+
+
+def write_config(path: Path, tmp_path: Path, **units: dict[str, Any]) -> Path:
+    """A controller config whose site-a binds `units` (default: tv)."""
+    data = {
+        "state": str(tmp_path / "co-state"),
+        "watch_timeout": 0.5,
+        "pools": {"main": {"keys_dir": str(tmp_path / "keys"), "keys": KEYS}},
+        "units": {"tv": {"drive_id": "0A", "pool": "main"},
+                  "films": {"drive_id": "0B", "pool": "main"}},
+        "agents": {
+            "site-a": {"token_sha256": token_hash("token-a"), "units": units or {"tv": {}}},
+            "site-b": {"token_sha256": token_hash("token-b"), "units": {"films": {}}},
+        },
+    }  # fmt: skip
+    path.write_text(json.dumps(data))  # JSON is YAML
+    return path
+
+
+@pytest.fixture
+def reloading(tmp_path: Path) -> Controller:
+    write_keys(tmp_path / "keys", KEYS)
+    path = write_config(tmp_path / "controller.yaml", tmp_path)
+    return Controller(ControllerConfig.load(path), path)
+
+
+async def test_an_agent_gets_its_slice_and_waits_for_changes(reloading: Controller) -> None:
+    transport = httpx.ASGITransport(app=build_app(reloading))
+    a = client(transport, "site-a")
+    first = await a.request("GET", "/v2/config")
+    assert list(first["units"]) == ["tv"] and first["pools"] == ["main"]
+    # Nothing changed: the long poll ends after watch_timeout with the same version.
+    same = await a.request("GET", "/v2/config", params={"version": first["version"]})
+    assert same == {"version": first["version"]}
+    # A reload that changes site-a's slice answers its waiting poll at once.
+    waiting = asyncio.create_task(
+        a.request("GET", "/v2/config", params={"version": first["version"]})
+    )
+    await asyncio.sleep(0.05)
+    assert reloading.path
+    write_config(reloading.path, reloading.path.parent, tv={"uid": 1001})
+    await reloading.check_config()
+    changed = await asyncio.wait_for(waiting, 1)
+    assert changed["version"] != first["version"]
+    assert changed["units"]["tv"]["unit"]["uid"] == 1001
+
+
+async def test_a_reload_wakes_only_the_agents_whose_slice_changed(
+    reloading: Controller, tmp_path: Path
+) -> None:
+    b_before = reloading._slices["site-b"]["version"]
+    assert reloading.path
+    write_config(reloading.path, tmp_path, tv={"uid": 1001})
+    await reloading.check_config()
+    assert reloading._slices["site-b"]["version"] == b_before
+    write_config(reloading.path, tmp_path, tv={"uid": 1001}, films={})
+    changed = await reloading.reload(ControllerConfig.load(reloading.path))
+    assert changed == ["site-a"]
+    assert reloading.cfg.agent_pools("site-a") == ["main"]
+
+
+async def test_a_bad_config_leaves_the_previous_one_in_force(
+    reloading: Controller, tmp_path: Path
+) -> None:
+    version = reloading._slices["site-a"]["version"]
+    assert reloading.path
+    write_config(reloading.path, tmp_path, nope={})  # binds a unit that doesn't exist
+    await reloading.check_config()
+    assert reloading.config_error and "unknown unit 'nope'" in reloading.config_error
+    assert reloading._slices["site-a"]["version"] == version
+    # Unchanged since: not re-read (and the error stays) until the file changes.
+    await reloading.check_config()
+    assert reloading.config_error
+    write_config(reloading.path, tmp_path)
+    await reloading.check_config(force=True)
+    assert reloading.config_error is None
+
+
+async def test_v1_is_gone(transport: httpx.ASGITransport) -> None:
+    r = await raw(transport, "GET", "/v1/pools/main/lease", "token-a")
+    assert r.status_code == 410 and "/v2" in r.json()["error"]

@@ -36,7 +36,7 @@ spec:
       # Service, or set hostNetwork: true (an FTP server's passive_port range
       # is simplest that way) together with dnsPolicy: ClusterFirstWithHostNet.
       initContainers:
-        # Each node's agent has its own coordinator token: copy this node's
+        # Each node's agent has its own controller token: copy this node's
         # out of the ferryman-agent-tokens Secret (one key per node name).
         - name: token
           image: ghcr.io/andronics/ferryman

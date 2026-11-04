@@ -171,3 +171,19 @@ async def test_exhaustion_ignores_keys_with_bad_files(pool: LocalPool, clock: Cl
     with pytest.raises(PoolExhausted) as exc:
         await pool.advance(expected=B)
     assert exc.value.frees_at == 1_000_000.0 + 100
+
+
+def test_a_key_file_may_be_named_by_its_local_part(pool: LocalPool, tmp_path: Path) -> None:
+    """Kubernetes Secrets can't name a file with an @: sa-01.json will do."""
+    keys = tmp_path / "keys"
+    full = keys / f"{A}.json"
+    short = keys / f"{A.split('@')[0]}.json"
+    full.rename(short)
+    assert pool.key_file(A) == short
+    # Still checked: the file must be that key's.
+    short.write_text(json.dumps({"type": "service_account", "client_email": B}))
+    with pytest.raises(PoolError, match="not a service-account key"):
+        pool.key_file(A)
+    short.unlink()
+    with pytest.raises(PoolError, match="missing"):
+        pool.key_file(A)

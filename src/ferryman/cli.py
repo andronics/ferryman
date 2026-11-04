@@ -1,5 +1,6 @@
 """`ferryman agent` runs the daemon; every other command talks to it over its
-unix socket (except `verify`, which checks the config offline)."""
+unix socket (except `verify`, which checks this host's config and the
+controller's slice for it)."""
 
 from __future__ import annotations
 
@@ -17,15 +18,14 @@ from typing import Annotated, Any, NoReturn
 import httpx
 import typer
 
-from .config import Config, Layout
-from .pool import LocalPool, PoolError
+from .config import AgentBootstrap, Config, Layout
 from .transfer import describe, iec
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=__doc__)
 
-DEFAULT_CONFIG = Path(os.environ.get("FERRYMAN_CONFIG", "/etc/ferryman/config.yaml"))
-DEFAULT_COORDINATOR_CONFIG = Path(
-    os.environ.get("FERRYMAN_COORDINATOR_CONFIG", "/etc/ferryman/coordinator.yaml")
+DEFAULT_CONFIG = Path(os.environ.get("FERRYMAN_CONFIG", "/etc/ferryman/agent.yaml"))
+DEFAULT_CONTROLLER_CONFIG = Path(
+    os.environ.get("FERRYMAN_CONTROLLER_CONFIG", "/etc/ferryman/controller.yaml")
 )
 
 
@@ -33,9 +33,9 @@ class _Ctx:
     def __init__(self, config: Path, socket: Path | None, as_json: bool) -> None:
         self.config_path, self._socket, self.as_json = config, socket, as_json
 
-    def config(self) -> Config:
+    def bootstrap(self) -> AgentBootstrap:
         try:
-            return Config.load(self.config_path)
+            return AgentBootstrap.load(self.config_path)
         except FileNotFoundError:
             _die(f"config not found: {self.config_path}")
         except ValueError as e:
@@ -47,7 +47,8 @@ class _Ctx:
             return self._socket
         if env := os.environ.get("FERRYMAN_SOCKET"):
             return Path(env)
-        return Layout(self.config()).api_socket
+        b = self.bootstrap()
+        return Layout(Config(paths=b.paths, api=b.api)).api_socket
 
     def request(self, method: str, path: str, **kw: Any) -> Any:
         transport = httpx.HTTPTransport(uds=str(self.socket))
@@ -109,12 +110,12 @@ def agent(
     ctx: typer.Context,
     log_level: Annotated[str, typer.Option(help="Python log level")] = "INFO",
 ) -> None:
-    """Run the daemon."""
+    """Run the daemon: its config comes from the controller."""
     from .agent import Agent
+    from .bootstrap import Rejected, start_config
+    from .controller_pool import ControllerClient
 
-    cfg = ctx.obj.config()
-    if problems := Layout(cfg).check_paths():
-        _die("\n".join(problems))
+    b = ctx.obj.bootstrap()
     logging.basicConfig(
         level=log_level.upper(),
         stream=sys.stderr,
@@ -127,50 +128,69 @@ def agent(
     # agent's own at DEBUG.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    asyncio.run(Agent(cfg).run())
+
+    async def main() -> None:
+        client = ControllerClient.from_token_file(b.controller.url, b.controller.token_file)
+        try:
+            start = await start_config(b, client)
+        finally:
+            await client.aclose()
+        await Agent(start.cfg, bootstrap=b, start=start).run()
+
+    try:
+        asyncio.run(main())
+    except Rejected as e:
+        _die(f"the controller's config for this host can't run here, and there is no "
+             f"previous one to fall back on:\n{e}")  # fmt: skip
 
 
 @app.command()
 def verify(ctx: typer.Context) -> None:
-    """Check the config, every pool's key files and the rclone binary (offline)."""
-    cfg = ctx.obj.config()
-    layout, failed = Layout(cfg), 0
-    rclone = shutil.which(cfg.rclone.binary)
+    """Check this host's config, the rclone binary, the controller, and the
+    controller's config for this host (as the agent would check it)."""
+    from .bootstrap import Rejected, build, fetch, load_cached, slice_file
+    from .controller_pool import ControllerClient, ControllerError
+
+    b, failed = ctx.obj.bootstrap(), 0
+    rclone = shutil.which(b.rclone.binary)
     if rclone:
         out = subprocess.run([rclone, "version"], capture_output=True, text=True, check=False)
         typer.echo(f"[PASS] rclone: {out.stdout.splitlines()[0] if out.stdout else rclone}")
     else:
-        typer.echo(f"[FAIL] rclone: {cfg.rclone.binary} not found")
+        typer.echo(f"[FAIL] rclone: {b.rclone.binary} not found")
         failed += 1
-    if cfg.coordinator:
-        tf = cfg.coordinator.token_file
-        ok = os.access(tf, os.R_OK) and bool(tf.read_text().strip())
-        typer.echo(f"[{'PASS' if ok else 'FAIL'}] coordinator {cfg.coordinator.url}: token {tf}")
-        failed += not ok
-    for name, p in cfg.pools.items():
-        if p.coordinator:
-            typer.echo(f"[PASS] pool {name}: served by the coordinator")
-            continue
-        pool = LocalPool(name, p, layout.pool_state(name))
-        errors = []
-        for key in p.keys:
-            try:
-                pool.key_file(key)
-            except PoolError as e:
-                errors.append(str(e))
-        typer.echo(f"[{'FAIL' if errors else 'PASS'}] pool {name}: {len(p.keys)} key(s)")
-        for err in errors:
-            typer.echo(f"  - {err}")
-        failed += bool(errors)
-    if (mail := cfg.notify.mail) is not None:
-        ok = shutil.which(mail.sendmail) is not None
-        typer.echo(f"[{'PASS' if ok else 'FAIL'}] notify: mail to {', '.join(mail.to)} "
-                   f"via {mail.sendmail}")  # fmt: skip
-        failed += not ok
-    for problem in layout.check_paths():
-        typer.echo(f"[FAIL] {problem}")
-        failed += 1
-    typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s)")
+    tf = b.controller.token_file
+    if not (os.access(tf, os.R_OK) and tf.read_text().strip()):
+        typer.echo(f"[FAIL] token {tf}: missing or empty")
+        raise typer.Exit(1)
+    typer.echo(f"[PASS] token {tf}")
+
+    async def get() -> dict[str, Any]:
+        client = ControllerClient.from_token_file(b.controller.url, tf)
+        try:
+            return await fetch(client)
+        finally:
+            await client.aclose()
+
+    try:
+        slc = asyncio.run(get())
+        typer.echo(f"[PASS] controller {b.controller.url}: config version {slc['version']}")
+    except ControllerError as e:
+        cached = load_cached(b)
+        if cached is None:
+            typer.echo(f"[FAIL] controller {b.controller.url}: {e}; no cached config")
+            raise typer.Exit(1) from None
+        slc = cached
+        typer.echo(f"[WARN] controller {b.controller.url}: {e}; checking the config cached "
+                   f"at {slice_file(b)} (version {slc.get('version')})")  # fmt: skip
+    try:
+        cfg = build(b, slc)
+    except Rejected as e:
+        for problem in str(e).split("; "):
+            typer.echo(f"[FAIL] {problem}")
+        raise typer.Exit(1) from None
+    typer.echo(f"[PASS] {len(cfg.units)} unit(s), {len(cfg.transfers)} transfer(s), "
+               f"pools: {', '.join(cfg.pools) or 'none'}")  # fmt: skip
     raise typer.Exit(1 if failed else 0)
 
 
@@ -512,34 +532,104 @@ def events(ctx: typer.Context, limit: Annotated[int, typer.Option(help="How many
 
 
 @app.command()
-def coordinator(
+def migrate(
+    hosts: Annotated[
+        list[str], typer.Argument(metavar="HOST=CONFIG...", help="Each host's 0.2 agent config")
+    ],
+    coordinator: Annotated[Path | None, typer.Option(help="The 0.2 coordinator's config")] = None,
+    controller_url: Annotated[
+        str | None, typer.Option(help="The controller's URL, for hosts that had no coordinator")
+    ] = None,
+    out: Annotated[Path, typer.Option(help="Where to write the 0.3 configs")] = Path(
+        "ferryman-0.3"
+    ),
+) -> None:
+    """Turn 0.2 configs into 0.3: the controller's config and each host's
+    agent.yaml (with a token for hosts that had none)."""
+    import yaml
+
+    from .migrate import MigrateError
+    from .migrate import migrate as run_migrate
+
+    def load(path: Path) -> dict[str, Any]:
+        try:
+            data: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+            return data
+        except (OSError, yaml.YAMLError) as e:
+            _die(f"{path}: {e}")
+
+    parsed = {}
+    for arg in hosts:
+        host, sep, path = arg.partition("=")
+        if not sep or not host or not path:
+            _die(f"{arg!r}: give HOST=CONFIG, e.g. pve-01=/etc/ferryman/config.yaml")
+        parsed[host] = load(Path(path))
+    try:
+        r = run_migrate(parsed, load(coordinator) if coordinator else None, controller_url)
+    except MigrateError as e:
+        _die(f"cannot migrate:\n{e}")
+
+    def write(path: Path, text: str, mode: int = 0o644) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+        typer.echo(f"wrote {path}")
+
+    def dump(data: dict[str, Any]) -> str:
+        return str(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+
+    write(out / "controller.yaml", dump(r.controller), 0o640)
+    for host, boot in r.agents.items():
+        write(out / "agents" / f"{host}.yaml", dump(boot))
+    for host, token in r.tokens.items():
+        write(out / "tokens" / host, token + "\n", 0o600)
+    typer.echo("")
+    for host in r.agents:
+        where = f"its new token is in {out / 'tokens' / host}" if host in r.tokens \
+            else "keeps its coordinator token"  # fmt: skip
+        typer.echo(f"{host}: install {out / 'agents' / (host + '.yaml')} as "
+                   f"/etc/ferryman/agent.yaml; {where}")  # fmt: skip
+    for note in r.notes:
+        typer.echo(f"note: {note}")
+
+
+@app.command(hidden=True, context_settings={"ignore_unknown_options": True,
+                                            "allow_extra_args": True})  # fmt: skip
+def coordinator() -> None:
+    """Renamed in 0.3."""
+    _die("`ferryman coordinator` was renamed in 0.3: run `ferryman controller` "
+         "(config: controller.yaml, state: /var/lib/ferryman-controller)")  # fmt: skip
+
+
+@app.command()
+def controller(
     config: Annotated[
-        Path, typer.Option("--config", "-c", help="Coordinator config file")
-    ] = DEFAULT_COORDINATOR_CONFIG,
+        Path, typer.Option("--config", "-c", help="Controller config file")
+    ] = DEFAULT_CONTROLLER_CONFIG,
     log_level: Annotated[str, typer.Option(help="Python log level")] = "INFO",
 ) -> None:
-    """Run the coordinator (plain HTTP; put Traefik in front for TLS)."""
-    from .config import CoordinatorConfig
-    from .coordinator import run
+    """Run the controller (plain HTTP; put Traefik in front for TLS)."""
+    from .config import ControllerConfig
+    from .controller import run
 
     logging.basicConfig(level=log_level.upper(), stream=sys.stderr,
                         format="%(levelname)s %(name)s: %(message)s")  # fmt: skip
     try:
-        cfg = CoordinatorConfig.load(config)
+        cfg = ControllerConfig.load(config)
     except FileNotFoundError:
         _die(f"config not found: {config}")
     except ValueError as e:
         _die(f"invalid config {config}:\n{e}")
-    run(cfg)
+    run(cfg, config)
 
 
 @app.command()
 def token() -> None:
     """Make an agent token: the token for the agent's token_file, and its
-    sha256 for the coordinator's config."""
+    sha256 for the controller's config."""
     import secrets
 
-    from .coordinator import token_hash
+    from .controller import token_hash
 
     t = secrets.token_urlsafe(32)
     typer.echo(f"token:        {t}")

@@ -2,9 +2,10 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - daemonset.yaml
-# config.yaml becomes the ferryman-config Secret; the hash suffix in its
-# name rolls the DaemonSet when the config changes (the agent reads it once).
+# agent.yaml becomes the ferryman-config Secret; the hash suffix in its
+# name rolls the DaemonSet when it changes (the agent reads it once; the
+# controller's config, which says what the agents run, reloads live).
 secretGenerator:
   - name: ferryman-config
     files:
-      - config.yaml
+      - agent.yaml

@@ -8,8 +8,8 @@ single-key pool never rotates.
 
 State is per pool, not per unit: the quota is per account across every drive
 it touches, so once one consumer exhausts it, all of them move. A pool is
-either local (state in a file on this host) or served by the coordinator
-(state shared by every agent leasing from it; see coordinator_pool.py). Every
+either local (state in a file on this host) or served by the controller
+(state shared by every agent leasing from it; see controller_pool.py). Every
 rotation bumps the pool's epoch, which is how watchers notice it.
 """
 
@@ -266,9 +266,15 @@ class LocalPool:
     def key_file(self, key: str) -> Path:
         """Path of a key, after checking it parses as a service-account key
         for that client_email (an encrypted or wrong file fails here, before
-        rclone ever sees it)."""
+        rclone ever sees it). The file is <key>.json, or <local part>.json
+        (sa-01.json for sa-01@...): a Kubernetes Secret's file names can't
+        hold an @."""
         assert self.cfg.keys_dir is not None  # a local pool always has one
         path = self.cfg.keys_dir / f"{key}.json"
+        if not path.exists() and "@" in key:
+            short = self.cfg.keys_dir / f"{key.split('@', 1)[0]}.json"
+            if short.exists():
+                path = short
         try:
             data = json.loads(path.read_text())
         except FileNotFoundError:

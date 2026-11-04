@@ -9,7 +9,9 @@ from `paths` through `Layout`.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -19,7 +21,15 @@ from typing import Any, Literal
 
 import yaml
 from croniter import croniter
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from . import placeholders as ph
 
@@ -58,23 +68,198 @@ class Api(_Model):
     listen: Listen | None = None
 
 
-class MailNotify(_Model):
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+
+
+def duration(v: object) -> float:
+    """Seconds, from a number or "90s", "15m", "6h", "2d"."""
+    if isinstance(v, int | float) and not isinstance(v, bool):
+        return float(v)
+    m = _DURATION.match(str(v).strip())
+    if not m:
+        raise ValueError(f"invalid duration {v!r} (e.g. 90, 15m, 6h, 2d)")
+    return float(m[1]) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]]
+
+
+# ------------------------------------------------------------- notifications
+# The controller's: agents never notify (they send it their events).
+
+
+class SmtpChannel(_Model):
+    host: str
+    port: int = 587
+    ssl: bool = False  # TLS from the start (465)
+    # STARTTLS on a plain connection (587). Unset: on, unless ssl.
+    starttls: bool | None = None
+    user: str | None = None
+    pass_file: Path | None = None  # the password, read at each send
+    sender: str = Field(alias="from")
     to: list[str] = Field(min_length=1)
-    sender: str | None = Field(default=None, alias="from")  # default ferryman@<hostname>
+
+    @model_validator(mode="after")
+    def _tls(self) -> SmtpChannel:
+        if self.ssl and self.starttls:
+            raise ValueError("smtp: ssl and starttls are alternatives: set one")
+        if self.starttls is None:
+            object.__setattr__(self, "starttls", not self.ssl)
+        if (self.user is None) != (self.pass_file is None):
+            raise ValueError("smtp: user and pass_file go together")
+        return self
+
+
+class SendmailChannel(_Model):
     sendmail: str = "/usr/sbin/sendmail"
+    sender: str | None = Field(default=None, alias="from")  # default ferryman@<host>
+    to: list[str] = Field(min_length=1)
 
 
-class WebhookNotify(_Model):
-    url: str  # receives a JSON POST: {host, title, text, events: [...]}
+class WebhookChannel(_Model):
+    url: str  # receives a JSON POST: {title, text, events: [...]}
     headers: dict[str, str] = Field(default_factory=dict)
 
 
-class Notify(_Model):
-    level: Literal["info", "warning", "error"] = "warning"
-    batch: float = 60.0  # collect events this long, then send them as one message
-    repeat: float = 21600.0  # re-send a problem that is still open after this long
-    mail: MailNotify | None = None
-    webhook: WebhookNotify | None = None
+class Channel(_Model):
+    smtp: SmtpChannel | None = None
+    sendmail: SendmailChannel | None = None
+    webhook: WebhookChannel | None = None
+
+    @model_validator(mode="after")
+    def _one(self) -> Channel:
+        if sum(x is not None for x in (self.smtp, self.sendmail, self.webhook)) != 1:
+            raise ValueError("a channel is exactly one of smtp, sendmail, webhook")
+        return self
+
+
+Severity = Literal["info", "warning", "error"]
+
+
+class RuleMatch(_Model):
+    # All that are set must hold. kind, agent and subject take globs
+    # ("unit.*"); severity is the least that matches.
+    kind: str | None = None
+    severity: Severity | None = None
+    agent: str | None = None  # "controller" for the controller's own events
+    subject: str | None = None
+
+
+class RuleWhen(_Model):
+    # Fires once, within `within`, there are `count` matching events, or
+    # matching events from `agents` distinct agents ("all-bound": every
+    # agent bound to the subject unit). Counted separately per value of
+    # the `per` fields; unset: per agent and subject (count), per subject
+    # (agents).
+    count: int | None = Field(default=None, ge=1)
+    agents: int | Literal["all-bound"] | None = None
+    within: float
+    per: list[Literal["agent", "subject", "kind"]] | None = None
+
+    @field_validator("within", mode="before")
+    @classmethod
+    def _within(cls, v: object) -> float:
+        return duration(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _per(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("per") is None:
+            per = ["agent", "subject"] if data.get("count") is not None else ["subject"]
+            data = {**data, "per": per}
+        return data
+
+    @model_validator(mode="after")
+    def _one(self) -> RuleWhen:
+        if (self.count is None) == (self.agents is None):
+            raise ValueError("when: set count or agents (one)")
+        if self.agents is not None and "agent" in (self.per or []):
+            raise ValueError("when: agents counts across agents, so it can't be per agent")
+        return self
+
+
+class RuleLimit(_Model):
+    count: int = Field(default=3, ge=1)
+    within: float = 3600.0
+
+    @field_validator("within", mode="before")
+    @classmethod
+    def _within(cls, v: object) -> float:
+        return duration(v)
+
+
+Action = Literal["restart", "retry", "run", "tune", "rotate"]
+
+
+# Event families whose subject is a unit: what `restart` restarts by default.
+UNIT_FAMILIES = frozenset({"unit", "warm", "mount", "serve"})
+
+
+class RuleDo(_Model):
+    """What a rule does when it fires (phase 2): restart a unit, retry a
+    failed transfer, run a transfer, re-tune a host, rotate a pool. Targets
+    default to the event's own; agent, unit, transfer and pool take the
+    placeholders {agent} and {subject} (the event's)."""
+
+    action: Action
+    agent: str | None = None
+    unit: str | None = None
+    transfer: str | None = None
+    pool: str | None = None
+    delay: float = 0.0  # wait first; cancelled if the problem closes meanwhile
+    limit: RuleLimit = RuleLimit()  # most actions per rule and target in a window
+    every: float | None = None  # while the problem stays open, act again this often
+    dry_run: bool = False  # record what it would do (action.planned), do nothing
+
+    @field_validator("delay", "every", mode="before")
+    @classmethod
+    def _durations(cls, v: object) -> float | None:
+        return None if v is None else duration(v)
+
+
+class Rule(_Model):
+    name: str
+    match: RuleMatch = RuleMatch()
+    when: RuleWhen | None = None
+    send: list[str] = Field(default_factory=list)  # channel names
+    do: RuleDo | None = None
+
+    @model_validator(mode="after")
+    def _something(self) -> Rule:
+        if not self.send and self.do is None:
+            raise ValueError(f"rule {self.name}: give it send, do, or both")
+        return self
+
+
+class Notifications(_Model):
+    batch: float = 60.0  # collect this long, then one message per channel
+    repeat: float = 21600.0  # an open problem is sent again at most this often
+    channels: dict[str, Channel] = Field(default_factory=dict)
+    # None: one rule, `default`: every warning and error to every channel
+    # (what 0.2 agents did on their own).
+    rules: list[Rule] | None = None
+
+    @field_validator("batch", "repeat", mode="before")
+    @classmethod
+    def _durations(cls, v: object) -> float:
+        return duration(v)
+
+    @model_validator(mode="after")
+    def _references(self) -> Notifications:
+        names = set()
+        for r in self.rules or []:
+            if r.name in names:
+                raise ValueError(f"rule {r.name}: two rules have that name")
+            names.add(r.name)
+            for ch in r.send:
+                if ch not in self.channels:
+                    raise ValueError(f"rule {r.name}: unknown channel {ch!r}")
+        return self
+
+    def effective_rules(self) -> list[Rule]:
+        if self.rules is not None:
+            return self.rules
+        if not self.channels:
+            return []
+        return [Rule(name="default", match=RuleMatch(severity="warning"),
+                     send=list(self.channels))]  # fmt: skip
 
 
 class Rclone(_Model):
@@ -171,7 +356,7 @@ class Tuning(_Model):
     # and re-tune on drift. (`ferryman tune --apply` applies one either way.)
     apply: Literal["suggest", "auto"] = "suggest"
     schedule: str | None = None  # cron for a re-tune; skipped while the link is busy
-    # Hosts behind the same uplink share a name here; with a coordinator, only
+    # Hosts behind the same uplink share a name here; with a controller, only
     # one of them tunes at a time, or each would measure the others' probes.
     uplink: str | None = None
     # Drift: drift_runs qualifying transfer runs in a row below drift x the
@@ -209,13 +394,17 @@ class Tuning(_Model):
 
 
 class Probe(_Model):
-    """Coordinator pools: test each exhausted key every `interval` with a
+    """Controller pools: test each exhausted key every `interval` with a
     small upload, and return it to the pool as soon as one succeeds, rather
     than waiting out the whole quota_window (the cap is reported to roll, so
     a key can upload again well before then). The quota_window still frees
     a key whose probes never succeed."""
 
-    drive_id: str  # a shared drive every key in the pool can write to
+    # The shared drive probes upload to: `first`, the drive of the first unit
+    # (in config order) on this pool; `rotate`, each probe the next of the
+    # pool's units' drives in turn; or a specific drive_id, which wins.
+    drive: Literal["first", "rotate"] = "first"
+    drive_id: str | None = None
     interval: float = Field(default=3600.0, ge=300)
     size: str = "1K"  # each probe's upload; counts against the key's cap
 
@@ -228,19 +417,19 @@ class Probe(_Model):
 
 class Pool(_Model):
     # A local pool names its keys by client_email; each is <keys_dir>/<key>.json.
-    # A coordinator pool (`coordinator: true`) has neither: the coordinator
+    # A controller pool (`controller: true`) has neither: the controller
     # owns the keys and the rotation state, and agents lease from it.
-    coordinator: bool = False
+    controller: bool = False
     keys_dir: Path | None = None
     keys: list[str] = Field(default_factory=list)
     quota_window: int = 86400
-    probe: Probe | None = None  # the coordinator's pools only
+    probe: Probe | None = None  # the controller's pools only
 
     @model_validator(mode="after")
     def _shape(self) -> Pool:
-        if self.coordinator:
+        if self.controller:
             if self.keys or self.keys_dir:
-                raise ValueError("a coordinator pool has no keys or keys_dir of its own")
+                raise ValueError("a controller pool has no keys or keys_dir of its own")
             return self
         if not self.keys or self.keys_dir is None:
             raise ValueError("a local pool needs keys_dir and at least one key")
@@ -249,11 +438,11 @@ class Pool(_Model):
         return self
 
 
-class CoordinatorRef(_Model):
+class ControllerRef(_Model):
     url: str  # e.g. https://ferryman.andronics.io (TLS terminated by Traefik)
     token_file: Path
     agent: str | None = None  # informational; the token identifies the agent
-    # How often the agent reports its status (for the coordinator's UI and
+    # How often the agent reports its status (for the controller's UI and
     # metrics), and whether it takes commands (restart, run) from that UI.
     report_interval: float = 15.0
     commands: bool = True
@@ -526,17 +715,19 @@ class Config(_Model):
     # What `{hostname}` expands to. Default: $FERRYMAN_HOSTNAME, else the
     # host's name (in a pod, set the env from the node name).
     hostname: str | None = None
-    coordinator: CoordinatorRef | None = None
+    controller: ControllerRef | None = None
     paths: Paths = Paths()
     api: Api = Api()
     rclone: Rclone = Rclone()
     health: Health = Health()
-    notify: Notify = Notify()
     defaults: UnitDefaults = UnitDefaults()
     tuning: Tuning = Tuning()
     pools: dict[str, Pool] = Field(default_factory=dict)
     units: dict[str, Unit] = Field(default_factory=dict)
     transfers: dict[str, Transfer] = Field(default_factory=dict)
+    # Built from a controller slice: unit -> {read setting: "unit" | "binding"},
+    # where each set read setting came from (read_settings reports it).
+    _set_by: dict[str, dict[str, str]] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -545,6 +736,12 @@ class Config(_Model):
         leave a bare 'extra inputs are not permitted'."""
         if not isinstance(data, dict):
             return data
+        if "coordinator" in data:
+            raise ValueError("coordinator was renamed in 0.3: it is `controller` now")
+        for name, p in (data.get("pools") or {}).items():
+            if isinstance(p, dict) and "coordinator" in p:
+                raise ValueError(f"pool {name}: coordinator was renamed in 0.3: it is "
+                                 "`controller` now")  # fmt: skip
         if "roots" in data:
             raise ValueError(
                 "roots was removed in 0.2: give each unit `mounts: [{path: "
@@ -574,13 +771,13 @@ class Config(_Model):
                     raise ValueError(f"invalid {kind} name: {name!r}")
         for name, pool in self.pools.items():
             if pool.probe is not None:
-                raise ValueError(f"pool {name}: probe is a coordinator setting (its pools "
+                raise ValueError(f"pool {name}: probe is a controller setting (its pools "
                                  "probe their exhausted keys)")  # fmt: skip
-        if self.coordinator is None:
+        if self.controller is None:
             for name, pool in self.pools.items():
-                if pool.coordinator:
-                    raise ValueError(f"pool {name} is served by the coordinator, but no "
-                                     "coordinator is configured")  # fmt: skip
+                if pool.controller:
+                    raise ValueError(f"pool {name} is served by the controller, but no "
+                                     "controller is configured")  # fmt: skip
         for name, unit in self.units.items():
             if unit.pool and unit.pool not in self.pools:
                 raise ValueError(f"unit {name}: unknown pool {unit.pool!r}")
@@ -698,11 +895,6 @@ class Layout:
         """The dest for a run starting at `now` (default: now)."""
         return ph.expand(self.cfg.transfers[name].dest, self._placeholders(name), now)
 
-    def claim_dest(self, name: str) -> str:
-        """What a coordinator claim covers: the part of the dest that is the
-        same on every run (all of it, unless it has time placeholders)."""
-        return ph.fixed_prefix(self.cfg.transfers[name].dest, self._placeholders(name))
-
     def check_paths(self) -> list[str]:
         """Problems with the paths as they expand on this host, for `verify`
         and agent startup: placeholders that don't expand (an unset
@@ -771,23 +963,27 @@ class Layout:
                 return f"overlaps ferryman's own {own}"
         return None
 
-    def leased_keys(self, pool: str) -> Path:
-        # Keys leased from the coordinator, on the runtime (tmpfs) dir only.
-        return self.cfg.paths.runtime / "keys" / pool
-
     @property
-    def claims_file(self) -> Path:
-        return self.cfg.paths.state / "claims.json"
+    def outbox(self) -> Path:
+        # Events not yet delivered to the controller.
+        return self.cfg.paths.state / "controller" / "outbox.jsonl"
+
+    def leased_keys(self, pool: str) -> Path:
+        # The key leased from the controller, kept (root-only) in the state
+        # dir so a restart during a controller outage can still mount.
+        return self.cfg.paths.state / "controller" / "keys" / pool
 
 
 def read_settings(cfg: Config, unit: str) -> dict[str, dict[str, str]]:
-    """Each mount read setting's value and where it comes from: the unit,
-    the config's `defaults`, or ferryman's built-in default."""
+    """Each mount read setting's value and where it comes from: the unit (or,
+    from the controller, the agent's binding of it), the config's
+    `defaults`, or ferryman's built-in default."""
     u, d = cfg.units[unit], cfg.defaults
+    set_by = cfg._set_by.get(unit, {})
     out = {}
     for k in READ_SETTINGS:
         if (v := getattr(u, k)) is not None:
-            out[k] = {"value": v, "source": "unit"}
+            out[k] = {"value": v, "source": set_by.get(k, "unit")}
         else:
             # A defaults entry that restates the built-in value changes nothing.
             built_in = type(d).model_fields[k].default
@@ -807,13 +1003,156 @@ def resolved(cfg: Config, unit: str) -> tuple[int | None, int | None, str, bool]
     )
 
 
-# ---------------------------------------------------------------- coordinator
+def unit_spec(cfg: Config, unit: str) -> dict[str, Any]:
+    """Everything a unit's process is built from. Two configs giving a unit
+    the same spec run it the same way: a new slice restarts a unit only if
+    its spec changed. (Its pool's key isn't in it: a lease moves a running
+    unit in place.)"""
+    return {
+        # Raw, less what takes a default: those count by resolved value, so
+        # the same value from somewhere else restarts nothing.
+        "unit": cfg.units[unit].model_dump(
+            mode="json", exclude={*READ_SETTINGS, "uid", "gid", "cache_max_size", "warm"}
+        ),
+        "read": {k: v["value"] for k, v in read_settings(cfg, unit).items()},
+        "resolved": resolved(cfg, unit),
+        "cache_min_free_space": cfg.defaults.cache_min_free_space,
+        "dir_mode": cfg.defaults.dir_mode,
+        "stat_timeout": cfg.health.stat_timeout,
+        "rclone": cfg.rclone.model_dump(mode="json"),
+    }
 
 
-class AgentEntry(_Model):
+# ---------------------------------------------------------------- controller
+
+
+# Settings a host owns (its disk, its users): the controller's `defaults`,
+# then an agent's `defaults`, then a binding.
+HOST_FIELDS = ("uid", "gid", "cache_max_size", "cache_min_free_space", "dir_mode")
+# A unit's policy: the controller's `defaults`, then the unit, then a binding.
+# An agent's `defaults` never change it: only a binding of that unit does.
+POLICY_FIELDS = (*READ_SETTINGS, "warm")
+# Bumped when the slice's shape changes; an agent refuses one it doesn't know.
+SLICE_SCHEMA = 1
+
+
+def overlaps(a: str, b: str) -> bool:
+    """Whether two paths inside a drive are the same or one contains the other."""
+    pa, pb = PurePosixPath("/", a).parts, PurePosixPath("/", b).parts
+    n = min(len(pa), len(pb))
+    return pa[:n] == pb[:n]
+
+
+class UnitSpec(_Model):
+    """What a unit is, wherever it runs: the remote, its key pool and how it
+    is read. Where and how an agent runs it is that agent's Binding."""
+
+    backend: str = "drive"
+    pool: str | None = None
+    drive_id: str | None = None
+    # Extra rclone remote options, rendered verbatim into the unit's config.
+    options: dict[str, str] = Field(default_factory=dict)
+    warm: bool | None = None
+    # Read settings; unset takes `defaults`. A binding may override them.
+    buffer_size: str | None = None
+    vfs_cache_mode: CacheMode | None = None
+    vfs_read_chunk_size: str | None = None
+    vfs_read_ahead: str | None = None
+
+    @field_validator("buffer_size", "vfs_read_chunk_size", "vfs_read_ahead")
+    @classmethod
+    def _sizes(cls, v: str | None) -> str | None:
+        return _rclone_size(v)
+
+    @field_validator("vfs_cache_mode", mode="before")
+    @classmethod
+    def _mode(cls, v: object) -> object:
+        return _cache_mode(v)
+
+    @model_validator(mode="after")
+    def _drive_needs_pool(self) -> UnitSpec:
+        if self.backend == "drive" and not self.pool:
+            raise ValueError("drive units need a pool")
+        return self
+
+
+class Binding(_Model):
+    """How one agent runs a unit: where it is mounted, its servers, as whom,
+    with what cache; and, for this host only, the unit's read policy."""
+
+    mounts: list[Mount] = Field(default_factory=list)
+    serve: list[Serve] = Field(default_factory=list)
+    uid: int | None = None
+    gid: int | None = None
+    cache_max_size: str | None = None
+    mount_args: list[str] = Field(default_factory=list)
+    warm: bool | None = None
+    buffer_size: str | None = None
+    vfs_cache_mode: CacheMode | None = None
+    vfs_read_chunk_size: str | None = None
+    vfs_read_ahead: str | None = None
+
+    @field_validator("buffer_size", "vfs_read_chunk_size", "vfs_read_ahead")
+    @classmethod
+    def _sizes(cls, v: str | None) -> str | None:
+        return _rclone_size(v)
+
+    @field_validator("vfs_cache_mode", mode="before")
+    @classmethod
+    def _mode(cls, v: object) -> object:
+        return _cache_mode(v)
+
+
+class HostDefaults(_Model):
+    """An agent's own defaults: only what belongs to the host."""
+
+    uid: int | None = None
+    gid: int | None = None
+    cache_max_size: str | None = None
+    cache_min_free_space: str | None = None
+    dir_mode: int | None = None
+
+
+class AgentSpec(_Model):
     # sha256 of the agent's bearer token (`ferryman token` makes both).
     token_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    pools: list[str] = Field(default_factory=list)
+    defaults: HostDefaults = HostDefaults()
+    # Field by field over the controller's `tuning` (its uplink, its memory).
+    tuning: dict[str, Any] = Field(default_factory=dict)
+    units: dict[str, Binding] = Field(default_factory=dict)
+    # On this agent: each reads a local `source`.
+    transfers: dict[str, Transfer] = Field(default_factory=dict)
+
+
+# What an agent's own file held up to 0.2 and the controller holds from 0.3.
+_CONTROLLER_KEYS = frozenset({"pools", "units", "transfers", "defaults", "tuning"})
+
+
+class AgentBootstrap(_Model):
+    """The agent's own file from 0.3: what it needs before it can reach the
+    controller, and what only the host knows. Everything else comes from
+    the controller."""
+
+    controller: ControllerRef
+    hostname: str | None = None
+    paths: Paths = Paths()
+    api: Api = Api()
+    rclone: Rclone = Rclone()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _moved(cls, data: Any) -> Any:
+        moved = sorted(_CONTROLLER_KEYS & data.keys()) if isinstance(data, dict) else []
+        if moved:
+            raise ValueError(f"{', '.join(moved)} moved to the controller's config in 0.3 "
+                             "(see `ferryman migrate`)")  # fmt: skip
+        return data
+
+    @classmethod
+    def load(cls, path: Path) -> AgentBootstrap:
+        with path.open() as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)
 
 
 class Ui(_Model):
@@ -822,38 +1161,229 @@ class Ui(_Model):
     # Header the auth proxy sets to the signed-in user. When set, requests
     # without it are refused, and actions are logged with the user. It is
     # only as trustworthy as the network path: nothing but the proxy must be
-    # able to reach the coordinator's port.
+    # able to reach the controller's port.
     user_header: str | None = "X-authentik-username"
 
 
-class CoordinatorConfig(_Model):
+class Events(_Model):
+    retention_days: int = Field(default=30, ge=1)  # how long the controller keeps events
+    # An agent that hasn't reported for this long raises agent.silent.
+    silent_after: float = Field(default=120.0, ge=30)
+
+
+class Actions(_Model):
+    # false: every rule's `do` only records what it would do (action.planned).
+    enabled: bool = True
+
+
+class ControllerConfig(_Model):
     listen: Listen = Listen()
     ui: Ui = Ui()
     rclone: Rclone = Rclone()  # runs key probes (pools with `probe:`)
-    state: Path = Path("/var/lib/ferryman-coordinator")
+    state: Path = Path("/var/lib/ferryman-controller")
     watch_timeout: float = 30.0
+    events: Events = Events()
+    notify: Notifications = Notifications()
+    actions: Actions = Actions()
+    health: Health = Health()
+    tuning: Tuning = Tuning()
+    defaults: UnitDefaults = UnitDefaults()
     pools: dict[str, Pool] = Field(default_factory=dict)
-    agents: dict[str, AgentEntry] = Field(default_factory=dict)
+    units: dict[str, UnitSpec] = Field(default_factory=dict)
+    agents: dict[str, AgentSpec] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _references(self) -> CoordinatorConfig:
+    def _references(self) -> ControllerConfig:
         for name, pool in self.pools.items():
-            if pool.coordinator:
-                raise ValueError(f"pool {name}: the coordinator serves local pools only")
+            if pool.controller:
+                raise ValueError(f"pool {name}: the controller serves local pools only")
+            if pool.probe and not self.probe_drives(name):
+                raise ValueError(f"pool {name}: probe needs a drive_id, or a unit on the "
+                                 "pool with one")  # fmt: skip
+        for name, u in self.units.items():
+            if not _NAME.match(name):
+                raise ValueError(f"invalid unit name: {name!r}")
+            if u.pool and u.pool not in self.pools:
+                raise ValueError(f"unit {name}: unknown pool {u.pool!r}")
         hashes: set[str] = set()
-        for name, agent in self.agents.items():
+        for name, a in self.agents.items():
             if not _NAME.match(name):
                 raise ValueError(f"invalid agent name: {name!r}")
-            for pool_name in agent.pools:
-                if pool_name not in self.pools:
-                    raise ValueError(f"agent {name}: unknown pool {pool_name!r}")
-            if agent.token_sha256 in hashes:
+            if a.token_sha256 in hashes:
                 raise ValueError(f"agent {name}: token shared with another agent")
-            hashes.add(agent.token_sha256)
+            hashes.add(a.token_sha256)
+            for unit in a.units:
+                if unit not in self.units:
+                    raise ValueError(f"agent {name}: unknown unit {unit!r}")
+            for t, tr in a.transfers.items():
+                if tr.unit not in a.units:
+                    raise ValueError(f"agent {name}: transfer {t}: unit {tr.unit!r} is not "
+                                     "bound on this agent")  # fmt: skip
+            # Everything the agent itself would check, short of its host: the
+            # slice as the flat config it becomes there.
+            try:
+                effective_config(_PLACEHOLDER_BOOTSTRAP, self.slice(name))
+            except ValidationError as e:
+                raise ValueError(f"agent {name}: {_errors(e)}") from None
+        self._sync_overlaps()
+        for rule in self.notify.rules or []:
+            if rule.do is not None:
+                self._check_do(rule)
         return self
 
+    def _check_do(self, rule: Rule) -> None:
+        """An action's target must be workable out from the events it
+        matches, or given, and what's named must exist."""
+        do, kind = rule.do, rule.match.kind or ""
+        assert do is not None
+        family = kind.split(".", 1)[0] if kind else ""
+
+        def fixed(v: str | None) -> str | None:
+            return v if v is not None and "{" not in v else None
+
+        err = f"rule {rule.name}: {do.action}"
+        if do.action == "restart" and do.unit is None and family not in UNIT_FAMILIES:
+            raise ValueError(f"{err} needs a unit: match unit.*, warm.*, mount.* or "
+                             "serve.* events, or give unit")  # fmt: skip
+        if do.action == "retry" and family != "transfer":
+            raise ValueError(f"{err} retries the failed transfer: match transfer.* events")
+        if do.action == "run" and do.transfer is None:
+            raise ValueError(f"{err} needs a transfer")
+        if do.action == "rotate" and do.pool is None and family not in ("pool", "transfer"):
+            raise ValueError(f"{err} needs a pool: match pool.* or transfer.* events or give pool")
+        agent = fixed(do.agent)
+        if agent is not None and agent not in self.agents:
+            raise ValueError(f"{err}: unknown agent {agent!r}")
+        if (pool := fixed(do.pool)) is not None and pool not in self.pools:
+            raise ValueError(f"{err}: unknown pool {pool!r}")
+        if (unit := fixed(do.unit)) is not None:
+            if unit not in self.units:
+                raise ValueError(f"{err}: unknown unit {unit!r}")
+            if agent is not None and unit not in self.agents[agent].units:
+                raise ValueError(f"{err}: unit {unit} is not bound on {agent}")
+        if (transfer := fixed(do.transfer)) is not None:
+            on = [a for a, spec in self.agents.items() if transfer in spec.transfers]
+            if not on or (agent is not None and agent not in on):
+                where = f"on {agent}" if agent else "on any agent"
+                raise ValueError(f"{err}: no transfer {transfer!r} {where}")
+
+    def _sync_overlaps(self) -> None:
+        """A sync deletes whatever it doesn't have at its destination, so one
+        that contains, or is inside, another transfer's destination on the
+        same drive would delete that transfer's uploads. {hostname} is taken
+        as the agent's name; a dest is cut at {env:...} (unknown here) and
+        at time placeholders, so a check errs on the side of a clash."""
+        claims = []
+        for an, a in self.agents.items():
+            for tn, t in a.transfers.items():
+                u = self.units[t.unit]
+                values = {"hostname": an, "transfer": tn, "unit": t.unit}
+                dest = ph.fixed_prefix(t.dest, values, stop=ph.TIME | {"env"})
+                claims.append((an, tn, u.drive_id or f"pool:{u.pool}", dest, t.mode))
+        for i, (a1, t1, d1, p1, m1) in enumerate(claims):
+            for a2, t2, d2, p2, m2 in claims[i + 1 :]:
+                if d1 == d2 and "sync" in (m1, m2) and overlaps(p1, p2):
+                    raise ValueError(
+                        f"agent {a1}'s transfer {t1} ({m1} to /{p1}) and agent {a2}'s "
+                        f"transfer {t2} ({m2} to /{p2}) overlap on {d1}: a sync deletes "
+                        "what it doesn't have, so give each its own folder"
+                    )
+
+    def agent_pools(self, agent: str) -> list[str]:
+        """The pools an agent may lease: those of the units bound to it."""
+        a = self.agents[agent]
+        return sorted({p for u in a.units if (p := self.units[u].pool)})
+
+    def probe_drives(self, pool: str) -> list[str]:
+        """The drives a pool's probes may use, in order."""
+        probe = self.pools[pool].probe
+        if probe and probe.drive_id:
+            return [probe.drive_id]
+        drives = [u.drive_id for u in self.units.values() if u.pool == pool and u.drive_id]
+        return list(dict.fromkeys(drives))
+
+    def slice(self, agent: str) -> dict[str, Any]:
+        """What the agent needs, resolved: its bindings merged with their
+        units, its transfers, defaults, tuning and health, and the pools it
+        may lease. No key material. `version` changes exactly when it does."""
+        a = self.agents[agent]
+        units: dict[str, Any] = {}
+        for name, b in a.units.items():
+            u = self.units[name]
+            flat: dict[str, Any] = {
+                "backend": u.backend, "pool": u.pool, "drive_id": u.drive_id,
+                "options": u.options,
+                "mounts": [m.model_dump(mode="json", exclude_defaults=True) for m in b.mounts],
+                "serve": [sv.model_dump(mode="json", exclude_defaults=True) for sv in b.serve],
+                "uid": b.uid, "gid": b.gid, "cache_max_size": b.cache_max_size,
+                "mount_args": b.mount_args,
+            }  # fmt: skip
+            set_by = {}
+            for f in POLICY_FIELDS:
+                if getattr(b, f) is not None:
+                    flat[f], set_by[f] = getattr(b, f), "binding"
+                elif getattr(u, f) is not None:
+                    flat[f], set_by[f] = getattr(u, f), "unit"
+            units[name] = {"unit": {k: v for k, v in flat.items() if v is not None},
+                           "set_by": set_by}  # fmt: skip
+        defaults = self.defaults.model_dump(mode="json")
+        defaults.update({f: v for f in HOST_FIELDS if (v := getattr(a.defaults, f)) is not None})
+        out: dict[str, Any] = {
+            "schema": SLICE_SCHEMA,
+            "agent": agent,
+            "units": units,
+            "transfers": {
+                n: t.model_dump(mode="json", exclude_defaults=True) for n, t in a.transfers.items()
+            },
+            "pools": self.agent_pools(agent),
+            "defaults": defaults,
+            "tuning": {**self.tuning.model_dump(mode="json"), **a.tuning},
+            "health": self.health.model_dump(mode="json"),
+        }
+        canonical = json.dumps(out, sort_keys=True, separators=(",", ":"))
+        out["version"] = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        return out
+
     @classmethod
-    def load(cls, path: Path) -> CoordinatorConfig:
+    def load(cls, path: Path) -> ControllerConfig:
         with path.open() as f:
             data = yaml.safe_load(f) or {}
         return cls.model_validate(data)
+
+
+def effective_config(bootstrap: AgentBootstrap, slc: dict[str, Any]) -> Config:
+    """The flat config an agent runs: its own file plus its slice. Building
+    it runs every check that doesn't need the host itself."""
+    if slc.get("schema") != SLICE_SCHEMA:
+        raise ValueError(f"slice schema {slc.get('schema')!r} is not {SLICE_SCHEMA}: "
+                         "upgrade the agent or the controller so they match")  # fmt: skip
+    cfg = Config.model_validate({
+        "hostname": bootstrap.hostname,
+        "controller": bootstrap.controller.model_dump(mode="json"),
+        "paths": bootstrap.paths.model_dump(mode="json"),
+        "api": bootstrap.api.model_dump(mode="json"),
+        "rclone": bootstrap.rclone.model_dump(mode="json"),
+        "health": slc["health"],
+        "defaults": slc["defaults"],
+        "tuning": slc["tuning"],
+        "pools": {p: {"controller": True} for p in slc["pools"]},
+        "units": {n: u["unit"] for n, u in slc["units"].items()},
+        "transfers": slc["transfers"],
+    })  # fmt: skip
+    cfg._set_by = {n: u["set_by"] for n, u in slc["units"].items()}
+    return cfg
+
+
+# The controller checks each slice as an agent would, on a host it knows
+# nothing about: ferryman's default paths, no TCP API.
+_PLACEHOLDER_BOOTSTRAP = AgentBootstrap(
+    controller=ControllerRef(url="http://controller", token_file=Path("/dev/null"))
+)
+
+
+def _errors(e: ValidationError) -> str:
+    return "; ".join(
+        ".".join(str(x) for x in err["loc"]) + ": " + err["msg"].removeprefix("Value error, ")
+        if err["loc"] else err["msg"].removeprefix("Value error, ")
+        for err in e.errors()
+    )  # fmt: skip
