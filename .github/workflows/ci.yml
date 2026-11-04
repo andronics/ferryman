@@ -48,15 +48,17 @@ jobs:
 
       - name: Lint with ruff
         run: |
-          uv run ruff check src/ tests/
+          uv run ruff check src/ tests/ meta/media
 
       - name: Check code formatting
         run: |
-          uv run ruff format --check src/ tests/
+          uv run ruff format --check src/ tests/ meta/media
 
       - name: Type check with mypy
         run: |
           uv run mypy --strict
+          # The media centre's meta module: one stdlib script, checked on its own
+          uv run mypy --strict meta/media
 
       - name: Verify version
         run: |
