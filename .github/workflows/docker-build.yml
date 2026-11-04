@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - next                 # the next minor release, in progress: tag `next`
       - 'dev/**'
       - 'feat/**'
     tags:
@@ -16,7 +15,6 @@ on:
   pull_request:
     branches:
       - main
-      - next
     paths-ignore:
       - '**.md'
       - 'LICENSE'

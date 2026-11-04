@@ -115,7 +115,7 @@ docker compose up -d ferryman                      # an agent alone, on another 
 docker exec ferryman ferryman status
 ```
 
-Tags: `latest` and `X.Y.Z`/`X.Y` for releases, `edge` for main, `next` for the next release in progress.
+Tags: `latest` and `X.Y.Z`/`X.Y` for releases (cut from main by release-please), `edge` for main.
 
 On Kubernetes, [`contrib/k8s`](contrib/k8s) has Kustomize manifests (the agent as a privileged DaemonSet, the controller holding every node's config), tested on Talos: `kubectl apply -k contrib/k8s`. See [Deployment](https://github.com/andronics/ferryman/wiki/Deployment#talos--kubernetes).
 
