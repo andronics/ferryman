@@ -6,14 +6,18 @@ Reads the *arr apps, qBittorrent and LazyLibrarian over their HTTP APIs and answ
 POST, which only opens a session, and LazyLibrarian's read commands, sent as a POST body so its key
 stays out of URLs. Standard library only.
 
-Credentials come from `pass show services/<app>/<field>` at run time, are held in memory and sent
-in a header or a POST body; never in argv, the environment, output, a cache or a log.
+Credentials come from `tessera show services/<app>/<field>` (or, without tessera, `pass show`
+with gpg told never to prompt) at run time, are held in memory and sent in a header or a POST
+body; never in argv, the environment, output, a cache or a log. Before any read the module asks
+whether Stephen's key is locked, without decrypting; while it is, nothing is read and every app
+is "key locked".
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import shutil
@@ -34,6 +38,10 @@ PROG = f"meta {CENTRE}"
 WIDTH = 100
 PER_REQUEST_TIMEOUT = 5.0
 DEFAULT_BUDGET = 20.0
+LOCK_CHECK_TIMEOUT = 5.0
+KEY_LOCKED = "key locked"
+# gpg's options for a fallback `pass show`: fail instead of raising a pinentry prompt.
+NO_PROMPT_GPG_OPTS = "--pinentry-mode=error --batch"
 
 MANIFEST: dict[str, Any] = {
     "meta": 1,
@@ -91,6 +99,10 @@ class NoCredential(Exception):
     """A pass entry is missing; the message names the path only."""
 
 
+class KeyLocked(Exception):
+    """Stephen's key is locked, so the entry can't be decrypted without a prompt."""
+
+
 # ---------------------------------------------------------------- config and credentials
 
 
@@ -114,23 +126,115 @@ def url_host(app: App) -> str:
     return parts.netloc or url
 
 
-def credential(app: App, fld: str, deadline: float) -> str:
-    """Read services/<app>/<field> from pass into memory. Never printed."""
-    path = f"services/{app.name}/{fld}"
-    if shutil.which("pass") is None:
-        raise NoCredential(f"no credential at {path} (pass not found)")
+def _run(
+    argv: list[str], timeout: float, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """Run a helper with stdin closed (never a terminal, so never Stephen's pinentry); None when
+    it can't be run or doesn't answer in time."""
     try:
-        proc = subprocess.run(
-            ["pass", "show", path],
+        return subprocess.run(
+            argv,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=max(1.0, min(10.0, deadline - time.monotonic())),
+            timeout=timeout,
+            env=env,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        raise NoCredential(f"no credential at {path} (pass did not answer)") from None
-    value = proc.stdout.decode("utf-8", "replace").split("\n", 1)[0].strip()
-    if proc.returncode != 0 or not value:
+        return None
+
+
+def _gpg_lock_state(timeout: float) -> str:
+    """locked | unlocked | unknown, as tessera decides it, never decrypting: the store's .gpg-id
+    keys, their encryption subkeys' keygrips, then gpg-agent's KEYINFO, whose cached flag says
+    whether it holds the passphrase. A key with no passphrase is unlocked; no agent is locked."""
+    gpg, agent = shutil.which("gpg"), shutil.which("gpg-connect-agent")
+    store = os.environ.get("PASSWORD_STORE_DIR") or os.path.expanduser("~/.password-store")
+    if gpg is None or agent is None:
+        return "unknown"
+    try:
+        with open(os.path.join(store, ".gpg-id"), encoding="utf-8", errors="replace") as fh:
+            ids = [line.split("#", 1)[0].strip() for line in fh.read(65536).splitlines()]
+    except OSError:
+        return "unknown"
+    grips: list[str] = []
+    for key in (i for i in ids if i and not i.startswith("-")):
+        done = _run(
+            [gpg, "--batch", "--with-colons", "--with-keygrip", "--list-secret-keys", "--", key],
+            timeout,
+        )
+        if done is None or done.returncode != 0:
+            continue
+        usage = ""
+        for line in done.stdout.decode("utf-8", "replace").splitlines():
+            cols = line.split(":")
+            if cols[0] in ("sec", "ssb"):
+                usage = cols[11] if len(cols) > 11 else ""
+            elif cols[0] == "grp" and len(cols) > 9 and "e" in usage and cols[9]:
+                grips.append(cols[9].upper())
+    if not grips:
+        return "unknown"
+    for grip in grips:
+        done = _run([agent, "--no-autostart", f"KEYINFO {grip}", "/bye"], timeout)
+        if done is None:
+            return "unknown"
+        for line in done.stdout.decode("utf-8", "replace").splitlines():
+            t = line.split()
+            held = len(t) >= 8 and (t[6] == "1" or t[7] == "C")
+            if held and t[:2] == ["S", "KEYINFO"] and t[2].upper() == grip:
+                return "unlocked"
+    return "locked"
+
+
+def lock_state(deadline: float) -> str:
+    """locked | unlocked | unknown, never decrypting: `tessera status --json`'s lock when tessera
+    is here, else the same check made with gpg directly. Unknown goes on to a read, which can't
+    prompt either way (tessera refuses an actor while locked; pass runs gpg without pinentry)."""
+    timeout = max(1.0, min(LOCK_CHECK_TIMEOUT, deadline - time.monotonic()))
+    tessera = shutil.which("tessera")
+    if tessera is None:
+        return _gpg_lock_state(timeout)
+    done = _run([tessera, "status", "--json"], timeout)
+    if done is None:
+        return "unknown"
+    doc: Any = None
+    with contextlib.suppress(UnicodeDecodeError, json.JSONDecodeError):
+        doc = json.loads(done.stdout.decode("utf-8"))
+    lock = doc.get("lock") if isinstance(doc, dict) else None
+    return lock if lock in ("locked", "unlocked") else "unknown"
+
+
+def credential(app: App, fld: str, deadline: float) -> str:
+    """Read services/<app>/<field> into memory, never prompting. Never printed.
+
+    Through `tessera show` when tessera is here (it refuses with exit 1 while the key is locked,
+    5 for no such entry); else `pass show` with gpg told to fail rather than prompt."""
+    path = f"services/{app.name}/{fld}"
+    timeout = max(1.0, min(10.0, deadline - time.monotonic()))
+    tessera = shutil.which("tessera")
+    if tessera is not None:
+        done = _run([tessera, "show", path], timeout)
+        if done is None:
+            raise NoCredential(f"no credential at {path} (tessera did not answer)")
+        if done.returncode == 1:
+            raise KeyLocked(KEY_LOCKED)
+        if done.returncode == 5:
+            raise NoCredential(f"no credential at {path}")
+        if done.returncode != 0:
+            raise NoCredential(f"no credential at {path} (tessera exited {done.returncode})")
+    elif shutil.which("pass") is not None:
+        env = {**os.environ, "PASSWORD_STORE_GPG_OPTS": NO_PROMPT_GPG_OPTS}
+        done = _run(["pass", "show", path], timeout, env)
+        if done is None:
+            raise NoCredential(f"no credential at {path} (pass did not answer)")
+        if done.returncode != 0:
+            if b"is not in the password store" in done.stderr:
+                raise NoCredential(f"no credential at {path}")
+            raise KeyLocked(KEY_LOCKED)  # gpg failed rather than prompt
+    else:
+        raise NoCredential(f"no credential at {path} (neither tessera nor pass found)")
+    value = done.stdout.decode("utf-8", "replace").split("\n", 1)[0].strip()
+    if not value:
         raise NoCredential(f"no credential at {path}")
     return value
 
@@ -222,6 +326,7 @@ class Probe:
     health: list[dict[str, str]] = field(default_factory=list)
     queue: list[dict[str, Any]] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    locked: bool = False  # Stephen's key is locked: nothing was read or asked
 
 
 def _arr(p: Probe, base: str, deadline: float, want_queue: bool) -> None:
@@ -383,6 +488,9 @@ def probe(app: App, deadline: float, want_queue: bool = False) -> Probe:
     p = Probe(app)
     try:
         _PROBERS[app.kind](p, app_url(app), deadline, want_queue)
+    except KeyLocked:
+        p.state, p.detail, p.locked = "unknown", KEY_LOCKED, True
+        return p
     except NoCredential as e:
         p.state, p.detail = "unknown", str(e)
         return p
@@ -428,6 +536,9 @@ def probe_all(apps: list[App], want_queue: bool = False) -> list[Probe]:
         budget = DEFAULT_BUDGET
     start = time.monotonic()
     deadline = start + max(1.0, budget - 1.0)
+    if apps and lock_state(deadline) == "locked":
+        # No read at all while locked: a read could queue a request or, worse, prompt.
+        return [Probe(a, state="unknown", detail=KEY_LOCKED, locked=True) for a in apps]
     results: dict[str, Probe] = {}
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(apps)))
     futures = {pool.submit(probe, a, deadline, want_queue): a for a in apps}
@@ -496,6 +607,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"{reachable} of {len(probes)} apps reachable, {warnings} health warnings, "
         f"{queued} in the *arr queues"
     )
+    if probes and all(p.locked for p in probes):
+        summary = "key locked: no app checked until Stephen runs `tessera unlock`"
     code = exit_for(probes, states)
     if code == 4:
         warn("no media app answered")
@@ -590,22 +703,31 @@ def cmd_queue(args: argparse.Namespace) -> int:
     apps = [a for a in APPS.values() if enabled(a) and (a.has_queue or a.kind == "qbittorrent")]
     probes = probe_all(apps, want_queue=True)
     items: list[dict[str, Any]] = []
-    failed = 0
+    failed = locked = 0
     for p in probes:
+        if p.locked:
+            locked += 1
+            warn(f"{p.app.name}: {KEY_LOCKED}")
+            continue
         if not p.reachable or (p.state == "fail" and p.queue_count is None):
             failed += 1
             warn(f"{p.app.name}: {p.detail}")
             continue
         items.extend(p.queue)
     items.sort(key=lambda i: (i["source"], i["name"].lower()))
-    code = 1 if failed else 0
+    code = 1 if failed or locked else 0
     if probes and failed == len(probes):
         code = 4
     if want_json(args):
         emit_json(items)
         return code
     if not items:
-        out("nothing queued" if code != 4 else "no queue source answered")
+        if code == 4:
+            out("no queue source answered")
+        elif probes and locked == len(probes):
+            out(f"{KEY_LOCKED}: the queue is unknown until Stephen runs `tessera unlock`")
+        else:
+            out("nothing queued")
         return code
     out(f"{'SOURCE':<12} {'DONE':>5} {'STATE':<16} {'SIZE':>9}  NAME")
     for i in items:

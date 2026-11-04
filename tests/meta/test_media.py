@@ -1,8 +1,9 @@
 """Tests for meta/media, the media centre's module for `meta` (brain record 0019).
 
 No network: every app URL points at a fake HTTP server on 127.0.0.1 serving hand-written fixtures,
-and `pass` is a fake script on PATH. A small fake core checks the manifest against record 0019 §2
-and runs each verb the way the core does (§3).
+and `pass`, `tessera` and gpg are fake scripts on a PATH that holds nothing else, so no test
+ever reaches a real password store or a real key. A small fake core checks the manifest against
+record 0019 §2 and runs each verb the way the core does (§3).
 """
 
 from __future__ import annotations
@@ -162,22 +163,86 @@ def healthy(state: FakeApps) -> None:
 # ------------------------------------------------------------------ fake pass and running
 
 
-def fake_pass(bin_dir: Path, with_credentials: bool = True) -> None:
+def _script(bin_dir: Path, name: str, lines: list[str]) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    lines = ["#!/bin/sh", '[ "$1" = show ] || exit 2', 'case "$2" in']
+    script = bin_dir / name
+    script.write_text("\n".join(["#!/bin/sh", *lines]) + "\n")
+    script.chmod(0o755)
+
+
+def _entries(with_credentials: bool, missing: str) -> list[str]:
+    """A shell `case` on "$2" printing each fake entry; `missing` runs for any other path."""
+    lines = ['case "$2" in']
     if with_credentials:
         lines += [
             f"  services/qbittorrent/webui-username) echo '{FAKE_USER}' ;;",
             f"  services/qbittorrent/webui-password) echo '{FAKE_PASSWORD}' ;;",
             f"  services/*/api-key) echo '{FAKE_KEY}' ;;",
         ]
-    lines += [
-        '  *) echo "Error: $2 is not in the password store." >&2; exit 1 ;;',
+    return [*lines, f"  *) {missing} ;;", "esac"]
+
+
+def fake_pass(bin_dir: Path, with_credentials: bool = True, gpg_fails: bool = False) -> None:
+    """pass, logging each call with the gpg options it was given. gpg_fails: gpg refuses to
+    decrypt (as it does with --pinentry-mode=error while the key is locked)."""
+    lines = [
+        'echo "pass $* opts=$PASSWORD_STORE_GPG_OPTS" >> "$FAKE_LOG"',
+        '[ "$1" = show ] || exit 2',
+    ]
+    if gpg_fails:
+        lines += ['echo "gpg: decryption failed: No secret key" >&2', "exit 2"]
+    lines += _entries(
+        with_credentials, 'echo "Error: $2 is not in the password store." >&2; exit 1'
+    )
+    _script(bin_dir, "pass", lines)
+
+
+def fake_tessera(bin_dir: Path, lock: str, with_credentials: bool = True) -> None:
+    """tessera: `status --json` reports `lock` and exits 1, as the real one does with a warning;
+    `show` refuses with exit 1 (queued) while locked, 5 for no such entry. Every call logged."""
+    lines = [
+        'echo "tessera $*" >> "$FAKE_LOG"',
+        'case "$1" in',
+        f'  status) echo \'{{"state": "warn", "lock": "{lock}"}}\'; exit 1 ;;',
+        "  show) ;;",
+        "  *) exit 2 ;;",
         "esac",
     ]
-    script = bin_dir / "pass"
-    script.write_text("\n".join(lines) + "\n")
-    script.chmod(0o755)
+    if lock == "locked":
+        lines += ['echo "tessera: the store is locked; queued as r1" >&2', "exit 1"]
+    lines += _entries(with_credentials, 'echo "tessera: no such entry" >&2; exit 5')
+    _script(bin_dir, "tessera", lines)
+
+
+FAKE_GRIP = "0123456789ABCDEF0123456789ABCDEF01234567"
+
+
+def fake_gpg(bin_dir: Path, store: Path, cached: bool) -> None:
+    """gpg and gpg-connect-agent for the check without tessera: one key with an encryption
+    subkey, and an agent whose KEYINFO says whether it holds the passphrase."""
+    store.mkdir(parents=True, exist_ok=True)
+    (store / ".gpg-id").write_text("fake@example.test\n")
+    _script(
+        bin_dir,
+        "gpg",
+        [
+            'echo "gpg $*" >> "$FAKE_LOG"',
+            "echo 'sec:u:255:22:AAAAAAAAAAAAAAAA:1:::u:::scESC:::+:::23::0:'",
+            "echo 'grp:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:'",
+            "echo 'ssb:u:255:18:CCCCCCCCCCCCCCCC:1::::::e:::+:::23:'",
+            f"echo 'grp:::::::::{FAKE_GRIP}:'",
+        ],
+    )
+    flag = "1" if cached else "-"
+    _script(
+        bin_dir,
+        "gpg-connect-agent",
+        [
+            'echo "gpg-connect-agent $*" >> "$FAKE_LOG"',
+            f"echo 'S KEYINFO {FAKE_GRIP} D - - {flag} P - - -'",
+            "echo OK",
+        ],
+    )
 
 
 @dataclass
@@ -195,13 +260,31 @@ def run(
     with_credentials: bool = True,
     env_extra: dict[str, str] | None = None,
     timeout: float = 40,
+    tessera: str | None = None,
+    gpg_cached: bool | None = None,
+    decrypt_fails: bool = False,
 ) -> Run:
-    """Run the module as the core would: exec-style, stdin closed, the META_* environment set."""
+    """Run the module as the core would: exec-style, stdin closed, the META_* environment set.
+
+    PATH holds only the fakes: `pass` always; `tessera` reporting lock state `tessera` when given;
+    gpg with an agent holding the passphrase or not when `gpg_cached` is given. Without gpg the
+    lock state is unknown and the read goes on; `decrypt_fails` makes pass's gpg refuse.
+    Every fake logs its calls to tmp_path/calls.log."""
     bin_dir = tmp_path / "bin"
-    fake_pass(bin_dir, with_credentials)
+    if bin_dir.exists():
+        for old in bin_dir.iterdir():
+            old.unlink()
+    fake_pass(bin_dir, with_credentials, gpg_fails=decrypt_fails or gpg_cached is False)
+    if tessera is not None:
+        fake_tessera(bin_dir, tessera, with_credentials)
+    store = tmp_path / "store"
+    if gpg_cached is not None:
+        fake_gpg(bin_dir, store, gpg_cached)
     env = {
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PATH": str(bin_dir),
         "HOME": str(tmp_path),
+        "PASSWORD_STORE_DIR": str(store),
+        "FAKE_LOG": str(tmp_path / "calls.log"),
         "META": "1",
         "META_CENTRE": "media",
         "META_VERB": args[0] if args and not args[0].startswith("-") else "",
@@ -603,8 +686,125 @@ def test_source_and_output_have_no_secret_patterns(
 
 def test_credentials_never_in_argv_or_env() -> None:
     source = MODULE.read_text()
-    # pass is the only program run, and only with "show" and a path.
+    # One place runs programs; reads are only `tessera show <path>` or `pass show <path>`.
     assert re.findall(r"subprocess\.\w+\(", source) == ["subprocess.run("]
+    assert '[tessera, "show", path]' in source
     assert '["pass", "show", path]' in source
     assert "os.environ[" not in source and "putenv" not in source
     assert stat.S_IMODE(MODULE.stat().st_mode) == 0o755
+
+
+# ------------------------------------------------------------------ a locked key
+
+
+def calls(tmp_path: Path) -> list[str]:
+    log = tmp_path / "calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def reads(tmp_path: Path) -> list[str]:
+    return [c for c in calls(tmp_path) if c.startswith(("pass show", "tessera show"))]
+
+
+def assert_all_key_locked(r: Run) -> None:
+    lines = r.stdout.splitlines()
+    assert lines[0].startswith("unknown: key locked")
+    assert len(lines) == 1 + len(APP_NAMES)
+    for line in lines[1:]:
+        state, name, detail = line.split(None, 2)
+        assert (state, detail) == ("unknown", "key locked"), line
+        assert name in APP_NAMES
+
+
+def test_locked_key_reads_nothing(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    """tessera says locked: no `tessera show` or `pass show` at all, no app asked, every app
+    "key locked" as unknown, and exit 1, a result (record 0019), never 4 or a failure."""
+    state, base = apps
+    r = run(tmp_path, base, "status", tessera="locked")
+    assert r.code == 1, r.stderr
+    assert_all_key_locked(r)
+    assert "tessera status --json" in calls(tmp_path)
+    assert reads(tmp_path) == []
+    assert state.requests == []
+    assert r.stderr == ""
+    assert_plain(r)
+
+
+def test_locked_key_json(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    _, base = apps
+    r = run(tmp_path, base, "status", "--json", tessera="locked")
+    assert r.code == 1
+    doc = one_json(r)
+    assert doc["state"] == "unknown"
+    assert {c["name"] for c in doc["checks"]} == set(APP_NAMES)
+    assert all(c["state"] == "unknown" and c["detail"] == "key locked" for c in doc["checks"])
+    assert reads(tmp_path) == []
+
+
+def test_locked_key_show_and_queue(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    state, base = apps
+    r = run(tmp_path, base, "show", "sonarr", tessera="locked")
+    assert r.code == 0
+    assert "state: unknown" in r.stdout and "key locked" in r.stdout
+    q = run(tmp_path, base, "queue", tessera="locked")
+    assert q.code == 1  # a result: the queue is unknown, not a failure (4)
+    assert q.stdout.startswith("key locked:")
+    assert "meta media: sonarr: key locked" in q.stderr
+    assert_plain(q)
+    assert reads(tmp_path) == []
+    assert state.requests == []
+
+
+def test_locked_key_without_tessera_reads_nothing(
+    apps: tuple[FakeApps, str], tmp_path: Path
+) -> None:
+    """No tessera: the module asks gpg-agent itself, never decrypting, and reads nothing."""
+    state, base = apps
+    r = run(tmp_path, base, "status", gpg_cached=False)
+    assert r.code == 1
+    assert_all_key_locked(r)
+    assert any(c.startswith("gpg-connect-agent --no-autostart KEYINFO") for c in calls(tmp_path))
+    assert reads(tmp_path) == []
+    assert state.requests == []
+
+
+def test_unlocked_key_reads_through_tessera(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    state, base = apps
+    healthy(state)
+    r = run(tmp_path, base, "status", tessera="unlocked")
+    assert r.code == 0, r.stdout
+    got = reads(tmp_path)
+    assert got and all(c.startswith("tessera show services/") for c in got)
+    assert_no_secrets(r)
+
+
+def test_pass_fallback_never_prompts(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    """No tessera, lock state unlocked: pass runs with gpg told to fail rather than prompt."""
+    state, base = apps
+    healthy(state)
+    r = run(tmp_path, base, "status", gpg_cached=True)
+    assert r.code == 0, r.stdout
+    got = reads(tmp_path)
+    assert got
+    assert all(c.endswith("opts=--pinentry-mode=error --batch") for c in got)
+
+
+def test_refused_decrypt_is_key_locked(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    """The lock state can't be told (no gpg here) and gpg then refuses to decrypt: each app is
+    "key locked" and unknown, not a failure, and no app is asked."""
+    state, base = apps
+    r = run(tmp_path, base, "status", decrypt_fails=True)
+    assert r.code == 1
+    assert_all_key_locked(r)
+    assert reads(tmp_path)  # tried, since the state was unknown, and refused without a prompt
+    assert state.requests == []
+
+
+def test_tessera_missing_entry_is_no_credential(apps: tuple[FakeApps, str], tmp_path: Path) -> None:
+    state, base = apps
+    r = run(tmp_path, base, "status", tessera="unlocked", with_credentials=False)
+    assert r.code == 1
+    by_name = {line.split()[1]: line for line in r.stdout.splitlines()[1:]}
+    assert by_name["sonarr"].startswith("unknown")
+    assert "no credential at services/sonarr/api-key" in by_name["sonarr"]
+    assert state.requests == []
