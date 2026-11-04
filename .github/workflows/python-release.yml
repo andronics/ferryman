@@ -1,0 +1,79 @@
+# Versioning and CHANGELOG.md, from Conventional Commits. Modelled on
+# template-python's python-release.yml, which takes this file over when
+# ferryman moves onto the templates (docs/design/0001).
+#
+# Every push to main updates one open "Release PR" that bumps the version
+# (pyproject.toml, uv.lock, contrib/k8s's image tag) and writes the
+# CHANGELOG entry. A human reviews and merges it; that tags vX.Y.Z and
+# publishes the GitHub Release. The tag push then runs docker-build.yml,
+# which builds and publishes the release image.
+#
+# Token: PRs and tags made with GITHUB_TOKEN don't trigger other workflows,
+# so CI would not run on the Release PR and the tag would build no image.
+# The repository variable RELEASE_APP_CLIENT_ID and secret
+# RELEASE_APP_PRIVATE_KEY (the release GitHub App, with contents and
+# pull-requests write) make this run as the App instead.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - id: app-token
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # release-please bumps pyproject.toml but not uv.lock, which records the
+  # project's version too: refresh it on the Release PR so CI's lock check passes.
+  lock:
+    needs: release-please
+    if: needs.release-please.outputs.pr != '' && needs.release-please.outputs.release_created != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - id: app-token
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Refresh uv.lock
+        run: |
+          uv lock
+          if git diff --quiet -- uv.lock; then echo "uv.lock already current"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: refresh uv.lock for the release" -- uv.lock
+          git push

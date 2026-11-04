@@ -5,11 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **This file is maintained automatically by [`release.yml`](.github/workflows/release.yml)
-> from conventional commit messages (`feat:`, `fix:`, `refactor:`, `chore:`) at tag time.
-> Do not hand-edit entries — the release workflow doesn't check for an existing entry
-> before inserting its own, so a manual entry for a version gets duplicated when that
-> version is tagged.**
+> **This file is maintained by release-please ([`python-release.yml`](.github/workflows/python-release.yml))
+> from conventional commit messages (`feat:`, `fix:`, `perf:`, `refactor:`, `docs:`): each release's entry
+> is written on its Release PR. Don't hand-edit entries; change the Release PR before merging it.**
 
 ## [0.2.0] - 2026-10-26
 
