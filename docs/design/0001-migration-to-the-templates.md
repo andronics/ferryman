@@ -55,9 +55,10 @@ brain coordinator's recommendation, which decided them on 2026-11-04.
 
 ## Decision
 
-**A. `next` lands first, as 0.3.0.** Merge `next` into main and release it as 0.3.0 with today's release
-process (`scripts/bump-version.sh`, tag push, `release.yml`), deploy 0.3 to nfs-01 (decision B), and only
-then apply the templates on top. The templated release is a separate, later change.
+**A. `next` lands first, as 0.3.0.** Merge `next` into main and release it as 0.3.0 through
+release-please, brought to ferryman ahead of the templates (see the ruling under Consequences), deploy 0.3
+to nfs-01 (decision B), and only then apply the templates on top. The templated release is a separate,
+later change.
 
 **B. The controller runs on nfs-01, beside the agent.** A second, sandboxed unit,
 `ferryman-controller.service` (as shipped in `contrib/systemd/`: `User=ferryman`,
@@ -98,10 +99,10 @@ bindings, channels, rules) stays on Pydantic, with unknown keys still errors.
 **G. The Drive tool stays out.** A separate personal Drive tool, out of scope: it is not folded into
 ferryman and is not part of this migration. It may get its own repository later if it is kept.
 
-**H. Release numbering.** After the migration, release-please (run by the release App) numbers releases
-by its default from the seeded version: with 0.3.0 shipped first, the templated release is 0.4.0, not
-1.0.0. `.release-please-manifest.json` is seeded at the then-current version; `release.yml` and
-`scripts/bump-version.sh` are removed in the templating change.
+**H. Release numbering.** release-please (run by the release App) numbers releases by its default from
+the seeded version: with 0.3.0 shipped first, the templated release is 0.4.0, not 1.0.0.
+`.release-please-manifest.json` is seeded at 0.2.0, and `release.yml` and `scripts/bump-version.sh` are
+removed, when release-please comes to ferryman before 0.3.0 (see the ruling under Consequences).
 
 **I. Metric names are kept.** Every `ferryman_*` metric name and label as released in 0.3.0 is kept
 (for example `ferryman_unit_ready`, `ferryman_unit_mount_up`, `ferryman_transfer_last_success`,
@@ -137,13 +138,17 @@ keep working; the port onto interpose is checked against a golden capture of `/m
 
 Rollout, in order:
 
-1. Release 0.3.0 from `next` with today's release process.
+1. Release 0.3.0 from `next` through release-please.
 2. Deploy 0.3 on nfs-01: the controller as `ferryman-controller.service` and the agent moved from its 0.1
    config by `ferryman migrate`. Production needs the controller before the agent can leave 0.1.
 3. Apply the templates on an integration branch, with the agent's socket API, probes, `/metrics`, the
    controller's `/v2` and UI, and the CLI checked against golden captures, then a side-by-side check on a
    scratch host (never nfs-01).
 4. Release the templated version (0.4.0, decision H) through release-please, and deploy it to nfs-01.
+
+Ruling, 2026-11-04 (the brain coordinator): 0.3.0 is cut by release-please (Tagwarden), brought to
+ferryman before the templates, instead of the bump script and a hand-pushed tag, because coordinators and
+agents don't push to main or create tags. `next` lands as one `feat!` squash commit.
 
 Each change on nfs-01 (steps 2 and 4) goes ahead only on these conditions:
 
